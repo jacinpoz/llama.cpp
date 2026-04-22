@@ -3874,7 +3874,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
 #if defined(GGML_VULKAN_COOPMAT_INT_GLSLC_SUPPORT)
         if (device->coopmat_int_support) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q8_0].f32acc->s,
-                "matmul_q8_0_cm_int_cm1", matmul_q8_0_cm_int_cm1_len, matmul_q8_0_cm_int_cm1_data,
+                "matmul_q8_0_cm_int_cm1_fp32", matmul_q8_0_cm_int_cm1_fp32_len, matmul_q8_0_cm_int_cm1_fp32_data,
                 "main", 3, sizeof(vk_mat_mat_push_constants), {16, 16, 1}, {32}, 1);
             device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q8_0].f32acc->l =
                 device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q8_0].f32acc->s;

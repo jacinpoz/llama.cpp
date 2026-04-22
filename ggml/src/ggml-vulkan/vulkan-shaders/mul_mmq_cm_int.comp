@@ -20,7 +20,6 @@
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 
-#define DATA_A_Q8_0
 #include "types.glsl"
 
 // Work group: one subgroup (wave32 on RDNA3)
