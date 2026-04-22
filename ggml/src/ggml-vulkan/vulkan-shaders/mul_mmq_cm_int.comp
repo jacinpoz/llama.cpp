@@ -58,17 +58,21 @@ layout (push_constant) uniform parameter
 } p;
 
 // Shared memory layout:
-//   shmem_a       [BM * BK]          = 2048 bytes  (row-major int8)
-//   shmem_b       [BN * BK]          = 2048 bytes  (col-major int8)
-//   shmem_scale_a [BM]               =  128 bytes  (float16 per A row)
-//   shmem_scale_b [BN]               =  128 bytes  (float16 per B col)
-//   shmem_tmp     [NUM_TILES*TM*TN]  = 16384 bytes (int32 batch scratch)
-// Total: ~20.7 KB (well within 48 KB)
+//   shmem_a       [BM * BK]  = 2048 bytes  (row-major int8)
+//   shmem_b       [BN * BK]  = 2048 bytes  (col-major int8)
+//   shmem_scale_a [BM]       =  128 bytes  (float16 per A row)
+//   shmem_scale_b [BN]       =  128 bytes  (float16 per B col)
+//   shmem_tmp     [TM * TN]  = 1024 bytes  (one-tile int32 scratch, reused per tile)
+// Total: ~5.4 KB — matches F16 coopmat path, ~11 WGs/CU occupancy on RDNA3.
+//
+// Per-tile processing: coopMatStore → memoryBarrierShared() (self-read, no inter-thread
+// sync needed) → scale+accumulate. Tiles are processed sequentially — only one barrier()
+// per K block (the load barrier at the top), not two.
 shared int8_t    shmem_a[BM * BK];
 shared int8_t    shmem_b[BN * BK];
 shared float16_t shmem_scale_a[BM];
 shared float16_t shmem_scale_b[BN];
-shared int32_t   shmem_tmp[NUM_TILES * TM * TN];
+shared int32_t   shmem_tmp[TM * TN];
 
 void main() {
     const uint ic        = gl_WorkGroupID.y;
@@ -174,21 +178,17 @@ void main() {
             }
         }
 
-        // ── Batch-store all 16 int32 tiles, then scale+accumulate ─────────────
-        // Stores are sequential (no barrier between them).
-        // Tile t stored at shmem_tmp[t * TM*TN], stride TM, col-major.
-        [[unroll]] for (uint t = 0u; t < NUM_TILES; t++) {
-            coopMatStore(cm_c[t], shmem_tmp, t * TM * TN, TM,
-                         gl_CooperativeMatrixLayoutColumnMajor);
-        }
-
-        barrier();
-
-        // Each thread reads ELEMS_PER_TILE elements per tile (wave64: 4 elems/tile).
-        // shmem_tmp col-major layout: flat idx f → row = f%TM, col = f/TM.
+        // ── Per-tile store + scale + accumulate ──────────────────────────────
+        // shmem_tmp is one tile (TM*TN int32 = 1024 bytes), reused each iteration.
+        // Each thread only reads back the elements it just wrote (col-major layout,
+        // wave64: thread l owns flat indices l*4 .. l*4+3), so memoryBarrierShared()
+        // suffices — no inter-thread sync needed, no full barrier().
         [[unroll]] for (uint t = 0u; t < NUM_TILES; t++) {
             const uint j = t / cms_per_row;   // tile column index (0..3)
             const uint i = t % cms_per_row;   // tile row index (0..3)
+            coopMatStore(cm_c[t], shmem_tmp, 0u, TM,
+                         gl_CooperativeMatrixLayoutColumnMajor);
+            memoryBarrierShared();
             [[unroll]] for (uint e = 0u; e < ELEMS_PER_TILE; e++) {
                 const uint f   = gl_LocalInvocationIndex * ELEMS_PER_TILE + e;
                 const uint row = f % TM;
@@ -196,11 +196,10 @@ void main() {
                 const float scale = float(shmem_scale_a[i * TM + row]) *
                                     float(shmem_scale_b[j * TN + col]);
                 sums[t * ELEMS_PER_TILE + e] +=
-                    float(shmem_tmp[t * TM * TN + f]) * scale;
+                    float(shmem_tmp[f]) * scale;
             }
         }
-
-        barrier();
+        // No trailing barrier() — the load barrier at the top of the next K block covers it.
 
         pos_a_ib++;
         pos_b_ib++;
