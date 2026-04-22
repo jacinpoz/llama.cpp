@@ -656,10 +656,10 @@ struct vk_device_struct {
     uint32_t coopmat_n;
     uint32_t coopmat_k;
 
-    bool coopmat_int_support;
-    uint32_t coopmat_int_m;
-    uint32_t coopmat_int_n;
-    uint32_t coopmat_int_k;
+    bool coopmat_int_support {};
+    uint32_t coopmat_int_m {};
+    uint32_t coopmat_int_n {};
+    uint32_t coopmat_int_k {};
 
     bool coopmat2;
 
