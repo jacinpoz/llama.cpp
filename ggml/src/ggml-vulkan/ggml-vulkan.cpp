@@ -3875,7 +3875,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
         if (device->coopmat_int_support) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q8_0].f32acc->s,
                 "matmul_q8_0_cm_int_cm1_fp32", matmul_q8_0_cm_int_cm1_fp32_len, matmul_q8_0_cm_int_cm1_fp32_data,
-                "main", 3, sizeof(vk_mat_mat_push_constants), {16, 16, 1}, {32}, 1);
+                "main", 3, sizeof(vk_mat_mat_push_constants), {64, 64, 1}, {64}, 1);
             device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q8_0].f32acc->l =
                 device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q8_0].f32acc->s;
             device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q8_0].f32acc->m =
@@ -7559,7 +7559,14 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
-    bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
+    // Enable Q8_1 quantization of Y for: DP4A (standard MMQ) or int8 coopmat (cm_int, Q8_0 weights only)
+#if defined(GGML_VULKAN_COOPMAT_INT_GLSLC_SUPPORT)
+    static const bool disable_cm_int = (getenv("GGML_VK_DISABLE_COOPMAT_INT") != nullptr);
+    const bool cm_int_viable = !disable_cm_int && ctx->device->coopmat_int_support && src0->type == GGML_TYPE_Q8_0;
+#else
+    const bool cm_int_viable = false;
+#endif
+    bool quantize_y = (ctx->device->integer_dot_product || cm_int_viable) && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && !y_non_contig && (ne11 * ne10) % 4 == 0;
 
     // Check for mmq first
     vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;

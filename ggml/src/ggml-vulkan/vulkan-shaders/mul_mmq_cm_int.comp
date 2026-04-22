@@ -1,13 +1,12 @@
-// Int8 cooperative matrix matmul for quantized types.
-// Phase 1: Q8_0 (model weights) x Q8_1 (activations) → float output.
+// Int8 cooperative matrix matmul: Q8_0 (weights) × Q8_1 (activations) → float output.
+// RDNA3 gfx1100: 16×16×16 int8 coopmat, wave64 subgroup.
 //
-// Tile dimensions are fixed for RDNA3 gfx1100 (16×16×16 int8 coopmat).
-// Buffer layout and push-constant fields are identical to mul_mmq.comp
-// so that the same dispatch logic and pipeline creation paths can be reused.
+// Design: BM=64, BN=64 output tile per work group (4×4 = 16 coopmat tiles).
+// Per K block: int32 coopmat accumulate → scale → add to float sums.
+// Scales are applied per K block (required since Q8_0/Q8_1 are block-quantized).
+// All 16 coopmat tiles are stored to shmem_tmp in one batch (1 barrier after all stores).
 //
-// One work group = one subgroup (BLOCK_SIZE = subgroup size) covering
-// one BM×BN = 16×16 output tile. Each thread accumulates 8 float values
-// across all K blocks (BM*BN/BLOCK_SIZE = 256/32 = 8).
+// Buffer layout and push-constant fields identical to mul_mmq.comp.
 
 #version 450
 
@@ -22,53 +21,54 @@
 
 #include "types.glsl"
 
-// Work group: one subgroup (wave32 on RDNA3)
+// One work group = one subgroup (wave64 on RDNA3)
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
-layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+layout (constant_id = 0) const uint BLOCK_SIZE = 64;
 
-// Tile dimensions — fixed for RDNA3 16×16×16 int8 coopmat.
-// BK must match Q8_0/Q8_1 block width (32 elements).
-#define BM 16   // coopmat M tile = one coopmat per work group
-#define BN 16   // coopmat N tile
-#define BK 32   // Q8_0/Q8_1 block size in K dimension
-#define TK 16   // K tile per coopmat pass = BK/2
+// Fundamental coopmat tile dims (RDNA3 int8 coopmat: 16×16×16)
+#define TM 16
+#define TN 16
+#define TK 16
+
+// Work group output tile: 4×4 coopmat tiles = 64×64 elements
+#define BM          64
+#define BN          64
+#define BK          32      // Q8_0/Q8_1 block size in K
+#define cms_per_row 4       // = BM / TM
+#define cms_per_col 4       // = BN / TN
+#define NUM_TILES   16      // = cms_per_row * cms_per_col
+// Elements per thread per tile at wave64: TM*TN/BLOCK_SIZE = 256/64 = 4
+#define ELEMS_PER_TILE 4
+#define TOTAL_ELEMS (NUM_TILES * ELEMS_PER_TILE)   // = 64 float sums per thread
 
 // Buffer bindings (identical to mul_mmq.comp)
 layout (binding = 0) readonly buffer A_PACKED16 { block_q8_0_packed16 data_a_packed16[]; };
-layout (binding = 1) readonly buffer B { block_q8_1_x4_packed128 data_b[]; };
-layout (binding = 2) writeonly buffer D { float data_d[]; };
+layout (binding = 1) readonly buffer B           { block_q8_1_x4_packed128 data_b[]; };
+layout (binding = 2) writeonly buffer D          { float data_d[]; };
 
-// Push constants (non-MUL_MAT_ID path, identical to mul_mmq.comp)
+// Push constants (= vk_mat_mat_push_constants, 17 × uint32 = 68 bytes)
 layout (push_constant) uniform parameter
 {
-    uint M;
-    uint N;
-    uint K;
-    uint stride_a;
-    uint stride_b;
-    uint stride_d;
-
-    uint batch_stride_a;
-    uint batch_stride_b;
-    uint batch_stride_d;
-
-    uint base_work_group_z;
-    uint num_batches;
-    uint k_split;
-    uint ne02;
-    uint ne12;
-    uint broadcast2;
-    uint broadcast3;
+    uint M;  uint N;  uint K;
+    uint stride_a;  uint stride_b;  uint stride_d;
+    uint batch_stride_a;  uint batch_stride_b;  uint batch_stride_d;
+    uint base_work_group_z;  uint num_batches;  uint k_split;
+    uint ne02;  uint ne12;  uint broadcast2;  uint broadcast3;
     uint padded_N;
 } p;
 
-// Shared memory: int8 tiles for A and B, float16 scales, int32 coopmat result scratch.
-// Total: 512 + 512 + 32 + 32 + 1024 = 2112 bytes — well within 48+ KB limit.
-shared int8_t    shmem_a[BM * BK];          // A tile: [row][k] row-major
-shared int8_t    shmem_b[BN * BK];          // B tile: [col][k] (loaded col-major for coopmat)
-shared float16_t shmem_scale_a[BM];         // Q8_0 scale per A-tile row
-shared float16_t shmem_scale_b[BN];         // Q8_1 d-scale per B-tile col
-shared int32_t   shmem_tmp[BM * BN];        // int32 coopmat result scratch (col-major, stride=BM)
+// Shared memory layout:
+//   shmem_a       [BM * BK]          = 2048 bytes  (row-major int8)
+//   shmem_b       [BN * BK]          = 2048 bytes  (col-major int8)
+//   shmem_scale_a [BM]               =  128 bytes  (float16 per A row)
+//   shmem_scale_b [BN]               =  128 bytes  (float16 per B col)
+//   shmem_tmp     [NUM_TILES*TM*TN]  = 16384 bytes (int32 batch scratch)
+// Total: ~20.7 KB (well within 48 KB)
+shared int8_t    shmem_a[BM * BK];
+shared int8_t    shmem_b[BN * BK];
+shared float16_t shmem_scale_a[BM];
+shared float16_t shmem_scale_b[BN];
+shared int32_t   shmem_tmp[NUM_TILES * TM * TN];
 
 void main() {
     const uint ic        = gl_WorkGroupID.y;
@@ -80,118 +80,124 @@ void main() {
     const uint i02 = i12 / p.broadcast2;
     const uint batch_idx_a = i03 * p.ne02 + i02;
 
-    const uint blocks_m = (p.M + BM - 1) / BM;
+    const uint blocks_m = (p.M + BM - 1u) / BM;
     const uint ir = gl_WorkGroupID.x % blocks_m;
     const uint ik = gl_WorkGroupID.x / blocks_m;
 
     const uint start_k = ik * p.k_split;
-    const uint end_k   = min(p.K, (ik + 1) * p.k_split);
+    const uint end_k   = min(p.K, (ik + 1u) * p.k_split);
 
-    // Base Q8_0 block index for row (ir*BM) at K=start_k.
-    // Row r's block index = pos_a_ib + r * (stride_a / BK).
+    // Base Q8_0 block index: one block per row per K-block step.
     uint pos_a_ib = batch_idx_a * (p.batch_stride_a / BK) +
                     (ir * BM * p.stride_a + start_k) / BK;
 
-    // Base Q8_1 block index for col (ic*BN) at K=start_k.
-    // Col n's block index = pos_b_ib + n * (stride_b / BK).
+    // Base Q8_1 block index: one block per col per K-block step.
     uint pos_b_ib = (batch_idx * p.batch_stride_b +
                      ic * BN * p.stride_b + start_k) / BK;
 
-    // Coopmat declarations (RDNA3: 16×16×16 int8 → int32)
-    coopmat<int8_t,  gl_ScopeSubgroup, BM, TK, gl_MatrixUseA>           cm_a;
-    coopmat<int8_t,  gl_ScopeSubgroup, TK, BN, gl_MatrixUseB>           cm_b;
-    coopmat<int32_t, gl_ScopeSubgroup, BM, BN, gl_MatrixUseAccumulator> cm_c_block;
+    // Per-thread float accumulators: NUM_TILES tiles × ELEMS_PER_TILE elements.
+    float sums[TOTAL_ELEMS];
+    [[unroll]] for (uint i = 0u; i < TOTAL_ELEMS; i++) sums[i] = 0.0f;
 
-    // Float accumulator: BM*BN/BLOCK_SIZE = 16*16/32 = 8 values per thread.
-    // Thread t handles elements with flat index t*8..t*8+7 in shmem_tmp (col-major, stride=BM).
-    float sums[8];
-    [[unroll]] for (uint i = 0u; i < 8u; i++) sums[i] = 0.0f;
+    // Per-K-block int32 coopmat accumulators.
+    coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> cm_c[NUM_TILES];
+    // A tiles pre-loaded per TK pass (4 row-tiles).
+    coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA> cm_a[cms_per_row];
+    coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB> cm_b;
 
     for (uint block = start_k; block < end_k; block += BK) {
-        // ── Load A tile ────────────────────────────────────────────────────────
-        // BM=16 rows of Q8_0 into shmem_a[BM*BK].
-        // Each Q8_0 block: float16 d + int16[16] (each int16 = 2 packed int8).
-        // 16 rows × 16 words = 256 int16 loads; with BLOCK_SIZE=32: 8 iterations.
-        [[unroll]] for (uint i = gl_LocalInvocationIndex; i < BM * (BK / 2); i += BLOCK_SIZE) {
-            const uint row  = i / (BK / 2u);   // 0..BM-1
-            const uint word = i % (BK / 2u);   // 0..15 (int16 word in block)
-            const uint ib = pos_a_ib + row * (p.stride_a / BK);
-
+        // ── Load A tile: BM rows of Q8_0 → shmem_a[BM*BK] (row-major int8) ──
+        // BM*(BK/2) = 64*16 = 1024 int16 words; BLOCK_SIZE=64 → 16 words/thread (one loop iter).
+        [[unroll]] for (uint i = gl_LocalInvocationIndex; i < BM * (BK / 2u); i += BLOCK_SIZE) {
+            const uint row  = i / (BK / 2u);
+            const uint word = i % (BK / 2u);
+            const uint ib   = pos_a_ib + row * (p.stride_a / BK);
             const int16_t packed = data_a_packed16[ib].qs[word];
             shmem_a[row * BK + word * 2u    ] = int8_t(packed);
             shmem_a[row * BK + word * 2u + 1] = int8_t(packed >> 8);
-
             if (word == 0u) {
                 shmem_scale_a[row] = data_a_packed16[ib].d;
             }
         }
 
-        // ── Load B tile ────────────────────────────────────────────────────────
-        // BN=16 cols of Q8_1 into shmem_b[BN*BK] (col-major: shmem_b[col*BK + k]).
-        // Q8_1 blocks are packed in groups of 4 (block_q8_1_x4_packed128).
-        // BN*2=32 iterations; with BLOCK_SIZE=32: 1 iteration per thread.
+        // ── Load B tile: BN cols of Q8_1 → shmem_b[BN*BK] (col-major int8) ──
+        // BN*2 = 128 half-block iters; BLOCK_SIZE=64 → 2 iters/thread.
         [[unroll]] for (uint i = gl_LocalInvocationIndex; i < BN * 2u; i += BLOCK_SIZE) {
-            const uint col = i / 2u;    // 0..BN-1
-            const uint iqs = i % 2u;    // 0 or 1: which ivec4 pair in the block
-
+            const uint col      = i / 2u;
+            const uint iqs      = i % 2u;
             const uint ib       = pos_b_ib + col * (p.stride_b / BK);
             const uint ib_outer = ib / 4u;
             const uint ib_inner = ib % 4u;
-
             if (iqs == 0u) {
                 shmem_scale_b[col] = data_b[ib_outer].ds[ib_inner].x;
             }
-
-            // Each ivec4 contains 4 packed int32s → 16 int8 values.
             const ivec4 vals = data_b[ib_outer].qs[ib_inner * 2u + iqs];
             const i8vec4 v0 = i8vec4(unpack8(uint(vals.x)));
             const i8vec4 v1 = i8vec4(unpack8(uint(vals.y)));
             const i8vec4 v2 = i8vec4(unpack8(uint(vals.z)));
             const i8vec4 v3 = i8vec4(unpack8(uint(vals.w)));
-
-            const uint shmem_base = col * BK + iqs * 16u;
-            shmem_b[shmem_base      ] = v0.x;  shmem_b[shmem_base +  1] = v0.y;
-            shmem_b[shmem_base +  2] = v0.z;  shmem_b[shmem_base +  3] = v0.w;
-            shmem_b[shmem_base +  4] = v1.x;  shmem_b[shmem_base +  5] = v1.y;
-            shmem_b[shmem_base +  6] = v1.z;  shmem_b[shmem_base +  7] = v1.w;
-            shmem_b[shmem_base +  8] = v2.x;  shmem_b[shmem_base +  9] = v2.y;
-            shmem_b[shmem_base + 10] = v2.z;  shmem_b[shmem_base + 11] = v2.w;
-            shmem_b[shmem_base + 12] = v3.x;  shmem_b[shmem_base + 13] = v3.y;
-            shmem_b[shmem_base + 14] = v3.z;  shmem_b[shmem_base + 15] = v3.w;
+            const uint base = col * BK + iqs * 16u;
+            shmem_b[base     ] = v0.x;  shmem_b[base +  1] = v0.y;
+            shmem_b[base +  2] = v0.z;  shmem_b[base +  3] = v0.w;
+            shmem_b[base +  4] = v1.x;  shmem_b[base +  5] = v1.y;
+            shmem_b[base +  6] = v1.z;  shmem_b[base +  7] = v1.w;
+            shmem_b[base +  8] = v2.x;  shmem_b[base +  9] = v2.y;
+            shmem_b[base + 10] = v2.z;  shmem_b[base + 11] = v2.w;
+            shmem_b[base + 12] = v3.x;  shmem_b[base + 13] = v3.y;
+            shmem_b[base + 14] = v3.z;  shmem_b[base + 15] = v3.w;
         }
 
         barrier();
 
-        // ── Int8 coopmat: 2 passes of TK=16 to cover BK=32 ───────────────────
-        // A is row-major in shmem_a: A[m][k] at shmem_a[m*BK + k]
-        //   → coopMatLoad with stride=BK, offset=0 (first half) or TK (second half)
-        // B is col-major in shmem_b: B[k][n] at shmem_b[n*BK + k]
-        //   → coopMatLoad with stride=BK, offset=0 or TK (column-major means n*BK+k)
+        // ── Int8 coopmat: 2 TK passes × 4×4 tile grid ────────────────────────
+        // Initialize per-block int32 accumulators.
+        [[unroll]] for (uint t = 0u; t < NUM_TILES; t++) {
+            cm_c[t] = coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0);
+        }
 
-        cm_c_block = coopmat<int32_t, gl_ScopeSubgroup, BM, BN, gl_MatrixUseAccumulator>(0);
+        // shmem_a[row][k]: A[row_in_tile * TM .. +TM-1][k] at offset (i*TM)*BK + tk
+        //   → coopMatLoad(cm_a[i], shmem_a, i*TM*BK + tk, BK, RowMajor)
+        // shmem_b[col][k]: B[col_in_tile * TN .. +TN-1][k] at offset (j*TN)*BK + tk
+        //   → coopMatLoad(cm_b, shmem_b, j*TN*BK + tk, BK, ColMajor)
+        [[unroll]] for (uint tk = 0u; tk < BK; tk += TK) {
+            [[unroll]] for (uint i = 0u; i < cms_per_row; i++) {
+                coopMatLoad(cm_a[i], shmem_a, i * TM * BK + tk, BK,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0u; j < cms_per_col; j++) {
+                coopMatLoad(cm_b, shmem_b, j * TN * BK + tk, BK,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint i = 0u; i < cms_per_row; i++) {
+                    cm_c[j * cms_per_row + i] =
+                        coopMatMulAdd(cm_a[i], cm_b, cm_c[j * cms_per_row + i]);
+                }
+            }
+        }
 
-        coopMatLoad(cm_a, shmem_a,  0u, BK, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(cm_b, shmem_b,  0u, BK, gl_CooperativeMatrixLayoutColumnMajor);
-        cm_c_block = coopMatMulAdd(cm_a, cm_b, cm_c_block);
-
-        coopMatLoad(cm_a, shmem_a, TK,  BK, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(cm_b, shmem_b, TK,  BK, gl_CooperativeMatrixLayoutColumnMajor);
-        cm_c_block = coopMatMulAdd(cm_a, cm_b, cm_c_block);
-
-        // Store int32 result column-major (stride=BM): shmem_tmp[n*BM + m] = C[m][n]
-        coopMatStore(cm_c_block, shmem_tmp, 0u, BM, gl_CooperativeMatrixLayoutColumnMajor);
+        // ── Batch-store all 16 int32 tiles, then scale+accumulate ─────────────
+        // Stores are sequential (no barrier between them).
+        // Tile t stored at shmem_tmp[t * TM*TN], stride TM, col-major.
+        [[unroll]] for (uint t = 0u; t < NUM_TILES; t++) {
+            coopMatStore(cm_c[t], shmem_tmp, t * TM * TN, TM,
+                         gl_CooperativeMatrixLayoutColumnMajor);
+        }
 
         barrier();
 
-        // ── Scale int32 results and accumulate into float sums ────────────────
-        // Thread t owns elements t*8 .. t*8+7 in shmem_tmp.
-        // Column-major (stride=BM=16): flat index f → row=f%BM, col=f/BM.
-        [[unroll]] for (uint e = 0u; e < 8u; e++) {
-            const uint elem_idx = gl_LocalInvocationIndex * 8u + e;
-            const uint row = elem_idx % BM;
-            const uint col = elem_idx / BM;
-            const float scale = float(shmem_scale_a[row]) * float(shmem_scale_b[col]);
-            sums[e] += float(shmem_tmp[elem_idx]) * scale;
+        // Each thread reads ELEMS_PER_TILE elements per tile (wave64: 4 elems/tile).
+        // shmem_tmp col-major layout: flat idx f → row = f%TM, col = f/TM.
+        [[unroll]] for (uint t = 0u; t < NUM_TILES; t++) {
+            const uint j = t / cms_per_row;   // tile column index (0..3)
+            const uint i = t % cms_per_row;   // tile row index (0..3)
+            [[unroll]] for (uint e = 0u; e < ELEMS_PER_TILE; e++) {
+                const uint f   = gl_LocalInvocationIndex * ELEMS_PER_TILE + e;
+                const uint row = f % TM;
+                const uint col = f / TM;
+                const float scale = float(shmem_scale_a[i * TM + row]) *
+                                    float(shmem_scale_b[j * TN + col]);
+                sums[t * ELEMS_PER_TILE + e] +=
+                    float(shmem_tmp[t * TM * TN + f]) * scale;
+            }
         }
 
         barrier();
@@ -200,19 +206,25 @@ void main() {
         pos_b_ib++;
     }
 
-    // ── Write output ──────────────────────────────────────────────────────────
-    // D layout (same as mul_mmq.comp): data_d[batch_off + col*stride_d + row]
+    // ── Write float output ────────────────────────────────────────────────────
     const uint dr      = ir * BM;
     const uint dc      = ic * BN;
     const uint offsets = batch_idx * p.batch_stride_d +
                          ik * p.batch_stride_d * p.num_batches;
 
-    [[unroll]] for (uint e = 0u; e < 8u; e++) {
-        const uint elem_idx = gl_LocalInvocationIndex * 8u + e;
-        const uint row = elem_idx % BM;
-        const uint col = elem_idx / BM;
-        if (dr + row < p.M && dc + col < p.N) {
-            data_d[offsets + (dc + col) * p.stride_d + dr + row] = sums[e];
+    [[unroll]] for (uint t = 0u; t < NUM_TILES; t++) {
+        const uint j = t / cms_per_row;
+        const uint i = t % cms_per_row;
+        [[unroll]] for (uint e = 0u; e < ELEMS_PER_TILE; e++) {
+            const uint f          = gl_LocalInvocationIndex * ELEMS_PER_TILE + e;
+            const uint row        = f % TM;
+            const uint col        = f / TM;
+            const uint global_row = dr + i * TM + row;
+            const uint global_col = dc + j * TN + col;
+            if (global_row < p.M && global_col < p.N) {
+                data_d[offsets + global_col * p.stride_d + global_row] =
+                    sums[t * ELEMS_PER_TILE + e];
+            }
         }
     }
 }
