@@ -86,6 +86,24 @@ if (Vulkan_FOUND)
         "GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT"
     )
 
+    # Test int8 cooperative matrix support (requires coopmat + int8 type combination).
+    # Uses a compile-success check since the error isn't a named "extension not supported".
+    if (GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+        execute_process(
+            COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.2
+                    "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders/feature-tests/coopmat_int.comp"
+            RESULT_VARIABLE COOPMAT_INT_RESULT
+            ERROR_QUIET OUTPUT_QUIET
+        )
+        if (COOPMAT_INT_RESULT EQUAL 0)
+            message(STATUS "int8 cooperative matrix supported by glslc")
+            add_compile_definitions(GGML_VULKAN_COOPMAT_INT_GLSLC_SUPPORT)
+            list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_COOPMAT_INT_GLSLC_SUPPORT=ON)
+        else()
+            message(STATUS "int8 cooperative matrix NOT supported by glslc")
+        endif()
+    endif()
+
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
     target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
