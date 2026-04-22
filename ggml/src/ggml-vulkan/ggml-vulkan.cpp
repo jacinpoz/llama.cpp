@@ -685,6 +685,7 @@ struct vk_device_struct {
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_COUNT];
+    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_COUNT];
 
     vk_matmul_pipeline pipeline_matmul_id_f32 {};
     vk_matmul_pipeline pipeline_matmul_id_bf16 {};
@@ -3870,6 +3871,18 @@ static void ggml_vk_load_shaders(vk_device& device) {
         }
 #endif
 
+#if defined(GGML_VULKAN_COOPMAT_INT_GLSLC_SUPPORT)
+        if (device->coopmat_int_support) {
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q8_0].f32acc->s,
+                "matmul_q8_0_cm_int_cm1", matmul_q8_0_cm_int_cm1_len, matmul_q8_0_cm_int_cm1_data,
+                "main", 3, sizeof(vk_mat_mat_push_constants), {16, 16, 1}, {32}, 1);
+            device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q8_0].f32acc->l =
+                device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q8_0].f32acc->s;
+            device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q8_0].f32acc->m =
+                device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q8_0].f32acc->s;
+        }
+#endif
+
         if (device->subgroup_ballot && device->subgroup_require_full_support && subgroup_min_size_16) {
             CREATE_MM(GGML_TYPE_F32, pipeline_matmul_id_f32, matmul_id_subgroup_f32_f32, , wg_denoms, warptile_id, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size_16);
             CREATE_MM2(GGML_TYPE_F16, pipeline_matmul_id_f16, matmul_id_subgroup_f16, wg_denoms, warptile_id, vk_mat_mat_id_push_constants, mul_mat_id_param_count, _id, mul_mat_subgroup_size_16);
@@ -6162,7 +6175,16 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         }
     }
 
-    // MMQ
+    // MMQ — int8 coopmat path preferred over DP4A when available for Q8_0
+#if defined(GGML_VULKAN_COOPMAT_INT_GLSLC_SUPPORT)
+    if (src1_type == GGML_TYPE_Q8_1 && src0_type == GGML_TYPE_Q8_0 && ctx->device->coopmat_int_support) {
+        vk_matmul_pipeline cm_int_p = ctx->device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q8_0].f32acc;
+        if (!cm_int_p->is_empty()) {
+            return cm_int_p;
+        }
+    }
+#endif
+
     if (src1_type == GGML_TYPE_Q8_1) {
         vk_matmul_pipeline pipelines = ctx->device->pipeline_dequant_mul_mat_mat_q8_1[src0_type].f32acc;
 

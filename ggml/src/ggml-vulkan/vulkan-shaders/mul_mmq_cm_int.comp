@@ -60,6 +60,7 @@ layout (push_constant) uniform parameter
     uint ne12;
     uint broadcast2;
     uint broadcast3;
+    uint padded_N;
 } p;
 
 // Shared memory: int8 tiles for A and B, float16 scales, int32 coopmat result scratch.
