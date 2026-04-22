@@ -594,6 +594,19 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
             string_to_spv(shader_name + "_" + tname + "_q8_1", "mul_mmq.comp", merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"},}), fp16, coopmat, coopmat2, f16acc);
         }
 #endif
+
+#if defined(GGML_VULKAN_COOPMAT_INT_GLSLC_SUPPORT)
+        // Int8 coopmat mmq: Q8_0 x Q8_1 → float, using hardware int8 coopmat.
+        // Phase 1: Q8_0 only (weights already int8, no dequant before coopmat).
+        // Only generate for fp32 path (!fp16) to avoid duplicate names.
+        // Generate once: no coopmat/fp16 variant, coopmat=true disables spirv-opt.
+        // Suffix: _cm1 (from coopmat=true in string_to_spv name transform).
+        if (!fp16 && !f16acc && !coopmat && !coopmat2 && tname == "q8_0") {
+            string_to_spv(shader_name + "_" + tname + "_cm_int", "mul_mmq_cm_int.comp",
+                          merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}}),
+                          false, true, false, false);
+        }
+#endif
     }
 }
 
