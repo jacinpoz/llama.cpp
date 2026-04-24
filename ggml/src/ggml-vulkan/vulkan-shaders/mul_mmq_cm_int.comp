@@ -37,16 +37,21 @@ layout (constant_id = 0) const uint BLOCK_SIZE = 64;
 #define TN 16
 #define TK 16
 
-// Work group output tile: 4×4 coopmat tiles = 64×64 elements
-#define BM          64
-#define BN          64
+// Work group output tile: BM×BN output elements, tiled by TM×TN coopmat tiles.
+// BM and BN can be overridden at compile time via -DBM=128 -DBN=64 for tile-sweep experiments.
+#ifndef BM
+#define BM 64
+#endif
+#ifndef BN
+#define BN 64
+#endif
 #define BK          32      // inner K step size; matches Q8_0 block size
-#define cms_per_row 4       // = BM / TM
-#define cms_per_col 4       // = BN / TN
-#define NUM_TILES   16      // = cms_per_row * cms_per_col
-// Elements per thread per tile at wave64: TM*TN/BLOCK_SIZE = 256/64 = 4
-#define ELEMS_PER_TILE 4
-#define TOTAL_ELEMS (NUM_TILES * ELEMS_PER_TILE)   // = 64 float sums per thread
+#define cms_per_row (BM / TM)
+#define cms_per_col (BN / TN)
+#define NUM_TILES   (cms_per_row * cms_per_col)
+// Elements per thread per tile: TM*TN/BLOCK_SIZE (= 4 for wave64/BM=64, 8 for wave32)
+#define ELEMS_PER_TILE (TM * TN / BLOCK_SIZE)
+#define TOTAL_ELEMS (NUM_TILES * ELEMS_PER_TILE)
 
 // ── Buffer bindings ────────────────────────────────────────────────────────────
 #if defined(DATA_A_Q8_0)

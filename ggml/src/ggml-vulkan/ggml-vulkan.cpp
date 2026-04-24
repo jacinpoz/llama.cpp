@@ -688,6 +688,8 @@ struct vk_device_struct {
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_COUNT];
     // wave32 variant: same SPIR-V, BLOCK_SIZE=32, required_subgroup_size=32
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_cm_int_wave32[GGML_TYPE_COUNT];
+    // bm128 tile variant: BM=128 for tile-sweep benchmarking
+    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_cm_int_bm128[GGML_TYPE_COUNT];
 
     vk_matmul_pipeline pipeline_matmul_id_f32 {};
     vk_matmul_pipeline pipeline_matmul_id_bf16 {};
@@ -3922,6 +3924,23 @@ static void ggml_vk_load_shaders(vk_device& device) {
                 create_wave32(device->pipeline_dequant_mul_mat_mat_cm_int_wave32[GGML_TYPE_Q4_K].f32acc->s,
                     "matmul_q4_k_cm_int_w32", matmul_q4_k_cm_int_cm1_fp32_len, matmul_q4_k_cm_int_cm1_fp32_data);
             }
+
+            // BM=128 tile variants for benchmarking (more A rows per WG, fewer barriers per M).
+            // wg_denoms[0]=128 since each WG now covers 128 M rows.
+            const auto create_bm128 = [&](vk_pipeline& pl, const char *name,
+                                           size_t spv_len, const void *spv_data) {
+                ggml_vk_create_pipeline(device, pl, name, spv_len, spv_data,
+                    "main", 3, sizeof(vk_mat_mat_push_constants),
+                    {128, 64, 1}, {64}, 1);
+                pl->l = pl;
+                pl->m = pl;
+            };
+            create_bm128(device->pipeline_dequant_mul_mat_mat_cm_int_bm128[GGML_TYPE_Q8_0].f32acc->s,
+                "matmul_q8_0_cm_int_bm128", matmul_q8_0_cm_int_bm128_cm1_fp32_len, matmul_q8_0_cm_int_bm128_cm1_fp32_data);
+            create_bm128(device->pipeline_dequant_mul_mat_mat_cm_int_bm128[GGML_TYPE_IQ4_XS].f32acc->s,
+                "matmul_iq4_xs_cm_int_bm128", matmul_iq4_xs_cm_int_bm128_cm1_fp32_len, matmul_iq4_xs_cm_int_bm128_cm1_fp32_data);
+            create_bm128(device->pipeline_dequant_mul_mat_mat_cm_int_bm128[GGML_TYPE_Q4_K].f32acc->s,
+                "matmul_q4_k_cm_int_bm128", matmul_q4_k_cm_int_bm128_cm1_fp32_len, matmul_q4_k_cm_int_bm128_cm1_fp32_data);
         }
 #endif
 
@@ -6228,6 +6247,14 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
             vk_matmul_pipeline w32 = ctx->device->pipeline_dequant_mul_mat_mat_cm_int_wave32[src0_type].f32acc;
             if (w32 && !w32->is_empty()) {
                 return w32;
+            }
+        }
+        // BM=128 tile variant: wider M tile, fewer workgroups for large M.
+        static const bool use_bm128 = (getenv("GGML_VK_CM_INT_BM128") != nullptr);
+        if (use_bm128) {
+            vk_matmul_pipeline bm128 = ctx->device->pipeline_dequant_mul_mat_mat_cm_int_bm128[src0_type].f32acc;
+            if (bm128 && !bm128->is_empty()) {
+                return bm128;
             }
         }
         vk_matmul_pipeline cm_int_p = ctx->device->pipeline_dequant_mul_mat_mat_cm_int[src0_type].f32acc;
