@@ -686,6 +686,8 @@ struct vk_device_struct {
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_f16[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_q8_1[GGML_TYPE_COUNT];
     vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_COUNT];
+    // wave32 variant: same SPIR-V, BLOCK_SIZE=32, required_subgroup_size=32
+    vk_matmul_pipeline2 pipeline_dequant_mul_mat_mat_cm_int_wave32[GGML_TYPE_COUNT];
 
     vk_matmul_pipeline pipeline_matmul_id_f32 {};
     vk_matmul_pipeline pipeline_matmul_id_bf16 {};
@@ -3899,6 +3901,27 @@ static void ggml_vk_load_shaders(vk_device& device) {
                 device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q4_K].f32acc->s;
             device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q4_K].f32acc->m =
                 device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q4_K].f32acc->s;
+
+            // Wave32 variants (RDNA3 native wave32; doubles CU occupancy vs wave64).
+            // Uses the same SPIR-V as wave64 — BLOCK_SIZE=32 via spec constant.
+            // Only create if device supports required_subgroup_size=32.
+            if (device->subgroup_size_control &&
+                device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32) {
+                const auto create_wave32 = [&](vk_pipeline& pl, const char *name,
+                                                size_t spv_len, const void *spv_data) {
+                    ggml_vk_create_pipeline(device, pl, name, spv_len, spv_data,
+                        "main", 3, sizeof(vk_mat_mat_push_constants),
+                        {64, 64, 1}, {32}, 1, false, true, 32);
+                    pl->l = pl;
+                    pl->m = pl;
+                };
+                create_wave32(device->pipeline_dequant_mul_mat_mat_cm_int_wave32[GGML_TYPE_Q8_0].f32acc->s,
+                    "matmul_q8_0_cm_int_w32", matmul_q8_0_cm_int_cm1_fp32_len, matmul_q8_0_cm_int_cm1_fp32_data);
+                create_wave32(device->pipeline_dequant_mul_mat_mat_cm_int_wave32[GGML_TYPE_IQ4_XS].f32acc->s,
+                    "matmul_iq4_xs_cm_int_w32", matmul_iq4_xs_cm_int_cm1_fp32_len, matmul_iq4_xs_cm_int_cm1_fp32_data);
+                create_wave32(device->pipeline_dequant_mul_mat_mat_cm_int_wave32[GGML_TYPE_Q4_K].f32acc->s,
+                    "matmul_q4_k_cm_int_w32", matmul_q4_k_cm_int_cm1_fp32_len, matmul_q4_k_cm_int_cm1_fp32_data);
+            }
         }
 #endif
 
@@ -6199,6 +6222,14 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
     if (src1_type == GGML_TYPE_Q8_1 && ctx->device->coopmat_int_support &&
         (src0_type == GGML_TYPE_Q8_0 || src0_type == GGML_TYPE_IQ4_XS ||
          src0_type == GGML_TYPE_Q4_K)) {
+        // Wave32 variant: RDNA3 native wave32 doubles CU occupancy vs wave64.
+        static const bool use_wave32 = (getenv("GGML_VK_CM_INT_WAVE32") != nullptr);
+        if (use_wave32) {
+            vk_matmul_pipeline w32 = ctx->device->pipeline_dequant_mul_mat_mat_cm_int_wave32[src0_type].f32acc;
+            if (w32 && !w32->is_empty()) {
+                return w32;
+            }
+        }
         vk_matmul_pipeline cm_int_p = ctx->device->pipeline_dequant_mul_mat_mat_cm_int[src0_type].f32acc;
         if (!cm_int_p->is_empty()) {
             return cm_int_p;
