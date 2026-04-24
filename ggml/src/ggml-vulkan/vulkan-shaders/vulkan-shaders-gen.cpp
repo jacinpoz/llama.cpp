@@ -604,7 +604,7 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
         if (!fp16 && !f16acc && !coopmat && !coopmat2 &&
             (tname == "q8_0" || tname == "iq4_xs" || tname == "q4_k")) {
             const std::map<std::string, std::string> cm_int_base =
-                merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}});
+                merge_maps(merge_maps(base_dict, float_type_dict), {{data_a_key, "1"}, {"D_TYPE", "float"}});
             // Default 64×64 tile
             string_to_spv(shader_name + "_" + tname + "_cm_int",
                           "mul_mmq_cm_int.comp", cm_int_base, false, true, false, false);

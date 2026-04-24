@@ -1735,6 +1735,8 @@ const int8_t kvalues_iq4nl_const[16] = {
     int8_t(1), int8_t(13), int8_t(25), int8_t(38), int8_t(53), int8_t(69), int8_t(89), int8_t(113)
 };
 
+// CM_INT_SHADER uses its own int8_t table; skip the shared float version to avoid redeclaration.
+#if !defined(CM_INT_SHADER)
 shared FLOAT_TYPE kvalues_iq4nl[16];
 
 #define NEEDS_INIT_IQ_SHMEM
@@ -1746,6 +1748,7 @@ void init_iq_shmem(uvec3 wgsize)
     }
     barrier();
 }
+#endif
 #endif
 
 #if defined(DATA_A_MXFP4) || defined(DATA_A_NVFP4)

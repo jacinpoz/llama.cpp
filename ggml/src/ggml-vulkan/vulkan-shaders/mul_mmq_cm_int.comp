@@ -26,6 +26,9 @@
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 
+// Tell types.glsl not to declare the shared float kvalues_iq4nl array — cm_int
+// uses its own int8_t version defined below to avoid a type-mismatch redeclaration.
+#define CM_INT_SHADER 1
 #include "types.glsl"
 
 // One work group = one subgroup (wave64 on RDNA3)

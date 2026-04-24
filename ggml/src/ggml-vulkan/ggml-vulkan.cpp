@@ -3909,37 +3909,37 @@ static void ggml_vk_load_shaders(vk_device& device) {
             // Only create if device supports required_subgroup_size=32.
             if (device->subgroup_size_control &&
                 device->subgroup_min_size <= 32 && device->subgroup_max_size >= 32) {
-                const auto create_wave32 = [&](vk_pipeline& pl, const char *name,
+                const auto create_wave32 = [&](vk_matmul_pipeline2& mp, const char *name,
                                                 size_t spv_len, const void *spv_data) {
-                    ggml_vk_create_pipeline(device, pl, name, spv_len, spv_data,
+                    ggml_vk_create_pipeline(device, mp.f32acc->s, name, spv_len, spv_data,
                         "main", 3, sizeof(vk_mat_mat_push_constants),
                         {64, 64, 1}, {32}, 1, false, true, 32);
-                    pl->l = pl;
-                    pl->m = pl;
+                    mp.f32acc->l = mp.f32acc->s;
+                    mp.f32acc->m = mp.f32acc->s;
                 };
-                create_wave32(device->pipeline_dequant_mul_mat_mat_cm_int_wave32[GGML_TYPE_Q8_0].f32acc->s,
+                create_wave32(device->pipeline_dequant_mul_mat_mat_cm_int_wave32[GGML_TYPE_Q8_0],
                     "matmul_q8_0_cm_int_w32", matmul_q8_0_cm_int_cm1_fp32_len, matmul_q8_0_cm_int_cm1_fp32_data);
-                create_wave32(device->pipeline_dequant_mul_mat_mat_cm_int_wave32[GGML_TYPE_IQ4_XS].f32acc->s,
+                create_wave32(device->pipeline_dequant_mul_mat_mat_cm_int_wave32[GGML_TYPE_IQ4_XS],
                     "matmul_iq4_xs_cm_int_w32", matmul_iq4_xs_cm_int_cm1_fp32_len, matmul_iq4_xs_cm_int_cm1_fp32_data);
-                create_wave32(device->pipeline_dequant_mul_mat_mat_cm_int_wave32[GGML_TYPE_Q4_K].f32acc->s,
+                create_wave32(device->pipeline_dequant_mul_mat_mat_cm_int_wave32[GGML_TYPE_Q4_K],
                     "matmul_q4_k_cm_int_w32", matmul_q4_k_cm_int_cm1_fp32_len, matmul_q4_k_cm_int_cm1_fp32_data);
             }
 
             // BM=128 tile variants for benchmarking (more A rows per WG, fewer barriers per M).
             // wg_denoms[0]=128 since each WG now covers 128 M rows.
-            const auto create_bm128 = [&](vk_pipeline& pl, const char *name,
+            const auto create_bm128 = [&](vk_matmul_pipeline2& mp, const char *name,
                                            size_t spv_len, const void *spv_data) {
-                ggml_vk_create_pipeline(device, pl, name, spv_len, spv_data,
+                ggml_vk_create_pipeline(device, mp.f32acc->s, name, spv_len, spv_data,
                     "main", 3, sizeof(vk_mat_mat_push_constants),
                     {128, 64, 1}, {64}, 1);
-                pl->l = pl;
-                pl->m = pl;
+                mp.f32acc->l = mp.f32acc->s;
+                mp.f32acc->m = mp.f32acc->s;
             };
-            create_bm128(device->pipeline_dequant_mul_mat_mat_cm_int_bm128[GGML_TYPE_Q8_0].f32acc->s,
+            create_bm128(device->pipeline_dequant_mul_mat_mat_cm_int_bm128[GGML_TYPE_Q8_0],
                 "matmul_q8_0_cm_int_bm128", matmul_q8_0_cm_int_bm128_cm1_fp32_len, matmul_q8_0_cm_int_bm128_cm1_fp32_data);
-            create_bm128(device->pipeline_dequant_mul_mat_mat_cm_int_bm128[GGML_TYPE_IQ4_XS].f32acc->s,
+            create_bm128(device->pipeline_dequant_mul_mat_mat_cm_int_bm128[GGML_TYPE_IQ4_XS],
                 "matmul_iq4_xs_cm_int_bm128", matmul_iq4_xs_cm_int_bm128_cm1_fp32_len, matmul_iq4_xs_cm_int_bm128_cm1_fp32_data);
-            create_bm128(device->pipeline_dequant_mul_mat_mat_cm_int_bm128[GGML_TYPE_Q4_K].f32acc->s,
+            create_bm128(device->pipeline_dequant_mul_mat_mat_cm_int_bm128[GGML_TYPE_Q4_K],
                 "matmul_q4_k_cm_int_bm128", matmul_q4_k_cm_int_bm128_cm1_fp32_len, matmul_q4_k_cm_int_bm128_cm1_fp32_data);
         }
 #endif
