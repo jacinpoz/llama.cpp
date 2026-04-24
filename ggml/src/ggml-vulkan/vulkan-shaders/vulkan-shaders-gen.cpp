@@ -597,12 +597,12 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 
 #if defined(GGML_VULKAN_COOPMAT_INT_GLSLC_SUPPORT)
         // Int8 coopmat mmq: quantized weights × Q8_1 activations → float.
-        // Supported weight types: Q8_0 (direct int8), IQ4_XS (dequant-in-LDS via table).
+        // Supported weight types: Q8_0 (direct int8), IQ4_XS and Q4_K (dequant-in-LDS).
         // Only generate for fp32 path (!fp16) to avoid duplicate names.
         // Generate once: no coopmat/fp16 variant, coopmat=true disables spirv-opt.
         // Suffix: _cm1 (from coopmat=true in string_to_spv name transform).
         if (!fp16 && !f16acc && !coopmat && !coopmat2 &&
-            (tname == "q8_0" || tname == "iq4_xs")) {
+            (tname == "q8_0" || tname == "iq4_xs" || tname == "q4_k")) {
             string_to_spv(shader_name + "_" + tname + "_cm_int", "mul_mmq_cm_int.comp",
                           merge_maps(base_dict, {{data_a_key, "1"}, {"D_TYPE", "float"}}),
                           false, true, false, false);

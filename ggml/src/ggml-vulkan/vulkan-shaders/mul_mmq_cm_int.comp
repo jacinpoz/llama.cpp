@@ -3,7 +3,9 @@
 //
 // Supported weight types (DATA_A_* define):
 //   DATA_A_Q8_0   — direct int8 weights; no dequant in LDS needed
-//   DATA_A_IQ4_XS — 4-bit asymmetric quant; dequant to int8 via kvalues_iq4nl table in LDS
+//   DATA_A_IQ4_XS — 4-bit symmetric quant; dequant to int8 via kvalues_iq4nl table in LDS
+//   DATA_A_Q4_K   — 4-bit asymmetric quant; dequant to centered int8; needs activation-sum
+//                   correction term for min offset (uses Q8_1 ds.y per BK block)
 //
 // Design: BM=64, BN=64 output tile per work group (4×4 = 16 coopmat tiles).
 // Per K block: load A and B tiles to LDS → int32 coopMatMulAdd → coopMatStore to shmem_tmp
@@ -51,6 +53,8 @@ layout (constant_id = 0) const uint BLOCK_SIZE = 64;
 layout (binding = 0) readonly buffer A_PACKED16 { block_q8_0_packed16 data_a_packed16[]; };
 #elif defined(DATA_A_IQ4_XS)
 layout (binding = 0) readonly buffer A_IQ4XS    { block_iq4_xs_packed32 data_a_iq4xs[]; };
+#elif defined(DATA_A_Q4_K)
+layout (binding = 0) readonly buffer A_Q4K      { block_q4_K_packed32 data_a_q4k[]; };
 #endif
 
 layout (binding = 1) readonly buffer B { block_q8_1_x4_packed128 data_b[]; };
@@ -83,19 +87,34 @@ const int8_t kvalues_iq4nl[16] = int8_t[16](
 #define SUB_PER_SUPER 8u
 #endif
 
+// ── Q4_K constants ─────────────────────────────────────────────────────────────
+#if defined(DATA_A_Q4_K)
+// Q4_K: 256 elements per super-block; 8 sub-blocks × 32 elements; BK=32 → 8 BK per super-block.
+#define QUANT_K_Q4K   256u
+#define SUB_PER_SUPER 8u
+#endif
+
 // ── Shared memory ──────────────────────────────────────────────────────────────
-// Layout:
+// Layout (base, all types):
 //   shmem_a       [BM * BK]  = 2048 bytes  (row-major int8 weights)
 //   shmem_b       [BN * BK]  = 2048 bytes  (col-major int8 activations)
 //   shmem_scale_a [BM]       =  128 bytes  (float16 per A row, per K block)
 //   shmem_scale_b [BN]       =  128 bytes  (float16 per B col, per K block)
 //   shmem_tmp     [TM * TN]  = 1024 bytes  (one-tile int32 scratch, reused per tile)
-// Total: ~5.4 KB — ~11 WGs/CU occupancy on RDNA3 64 KB LDS.
+// Base total: ~5.4 KB
+//
+// Q4_K additions (+256 bytes):
+//   shmem_min_a   [BM]       =  128 bytes  (float16 dmin*mns per A row; min correction scale)
+//   shmem_bsum    [BN]       =  128 bytes  (float16 Q8_1 ds.y = d_B*sum(qs_B) per B col)
 shared int8_t    shmem_a[BM * BK];
 shared int8_t    shmem_b[BN * BK];
 shared float16_t shmem_scale_a[BM];
 shared float16_t shmem_scale_b[BN];
 shared int32_t   shmem_tmp[TM * TN];
+#if defined(DATA_A_Q4_K)
+shared float16_t shmem_min_a[BM];
+shared float16_t shmem_bsum[BN];
+#endif
 
 void main() {
     const uint ic        = gl_WorkGroupID.y;
@@ -126,6 +145,12 @@ void main() {
                        (ir * BM * p.stride_a + start_k) / QUANT_K_IQ4XS;
     // stride in super-blocks per A row (= K / 256)
     const uint stride_a_super = p.stride_a / QUANT_K_IQ4XS;
+#elif defined(DATA_A_Q4_K)
+    // Q4_K: 256 elements per super-block. pos_a_super is the super-block index for row 0.
+    uint pos_a_super = batch_idx_a * (p.batch_stride_a / QUANT_K_Q4K) +
+                       (ir * BM * p.stride_a + start_k) / QUANT_K_Q4K;
+    // stride in super-blocks per A row (= K / 256)
+    const uint stride_a_super = p.stride_a / QUANT_K_Q4K;
 #endif
 
     // ── B-matrix base position ─────────────────────────────────────────────────
@@ -193,6 +218,65 @@ void main() {
                 shmem_scale_a[row] = float16_t(float(data_a_iq4xs[ib].d) * float(scale6));
             }
         }
+#elif defined(DATA_A_Q4_K)
+        // Q4_K: determine which sub-block within the 256-element super-block we're in.
+        // sub_block ∈ [0..7], cycles every 8 BK steps.
+        const uint sub_block = (block - start_k) / BK % SUB_PER_SUPER;
+
+        // Q4_K nibble layout: qs[32*(sb/2) + e] holds two nibbles:
+        //   low  (shift=0): element e of even sub-blocks (sb=0,2,4,6)
+        //   high (shift=4): element e of odd  sub-blocks (sb=1,3,5,7)
+        // pair_idx covers 2 consecutive elements; both bytes are in the same uint32.
+        const uint nibble_shift = (sub_block & 1u) * 4u;
+        const uint qs_byte_base = 32u * (sub_block / 2u);
+
+        [[unroll]] for (uint i = gl_LocalInvocationIndex; i < BM * (BK / 2u); i += BLOCK_SIZE) {
+            const uint row      = i / (BK / 2u);
+            const uint pair_idx = i % (BK / 2u);
+
+            const uint ib = pos_a_super + row * stride_a_super;
+
+            // Load 2 bytes from qs[] — pair_idx*2 and pair_idx*2+1.
+            // Both bytes always fall in the same uint32 (pair_idx*2 is always even → offset 0 or 2).
+            const uint byte0     = qs_byte_base + pair_idx * 2u;
+            const uint word_idx  = byte0 / 4u;
+            const uint byte_off  = (byte0 % 4u) * 8u;  // 0 or 16
+            const uint word_val  = data_a_q4k[ib].qs[word_idx];
+            const uint raw0      = (word_val >> byte_off) & 0xFFu;
+            const uint raw1      = (word_val >> (byte_off + 8u)) & 0xFFu;
+
+            // Centered int8: nibble ∈ [0..15] → int8 ∈ [-8..7]
+            shmem_a[row * BK + pair_idx * 2u    ] = int8_t(int((raw0 >> nibble_shift) & 0xFu) - 8);
+            shmem_a[row * BK + pair_idx * 2u + 1] = int8_t(int((raw1 >> nibble_shift) & 0xFu) - 8);
+
+            if (pair_idx == 0u) {
+                // Extract 6-bit scale (sc) and 6-bit min (mns) for this sub-block.
+                // Encoding (from ggml-quants: scales[12] / uint32 scales[3]):
+                //   if is < 4: sc = scales[is] & 0x3F, mns = scales[is+4] & 0x3F
+                //   if is >= 4: sc = (scales[is+4]&0xF)|((scales[is-4]&0xC0)>>2)
+                //               mns= (scales[is+4]>>4) |((scales[is]   &0xC0)>>2)
+                const uint is = sub_block;
+                uint sc, mns;
+                if (is < 4u) {
+                    // Helper: byte b from packed scales[3]
+                    const uint b0 = (data_a_q4k[ib].scales[is / 4u]       >> ((is % 4u) * 8u)) & 0xFFu;
+                    const uint b4 = (data_a_q4k[ib].scales[(is + 4u) / 4u] >> (((is + 4u) % 4u) * 8u)) & 0xFFu;
+                    sc  = b0 & 0x3Fu;
+                    mns = b4 & 0x3Fu;
+                } else {
+                    const uint is4 = is - 4u;
+                    const uint bp4  = (data_a_q4k[ib].scales[(is + 4u) / 4u] >> (((is + 4u) % 4u) * 8u)) & 0xFFu;
+                    const uint bim4 = (data_a_q4k[ib].scales[is4 / 4u]        >> ((is4 % 4u) * 8u)) & 0xFFu;
+                    const uint bi   = (data_a_q4k[ib].scales[is / 4u]          >> ((is % 4u) * 8u)) & 0xFFu;
+                    sc  = (bp4 & 0xFu) | ((bim4 & 0xC0u) >> 2u);
+                    mns = (bp4 >> 4u)   | ((bi   & 0xC0u) >> 2u);
+                }
+                const float d    = float(data_a_q4k[ib].dm.x);
+                const float dmin = float(data_a_q4k[ib].dm.y);
+                shmem_scale_a[row] = float16_t(d    * float(sc));
+                shmem_min_a[row]   = float16_t(dmin * float(mns));
+            }
+        }
 #endif
 
         // ── Load B tile: BN cols of Q8_1 → shmem_b[BN*BK] (col-major int8) ──
@@ -205,6 +289,10 @@ void main() {
             const uint ib_inner = ib % 4u;
             if (iqs == 0u) {
                 shmem_scale_b[col] = data_b[ib_outer].ds[ib_inner].x;
+#if defined(DATA_A_Q4_K)
+                // Q4_K needs the Q8_1 activation sum (ds.y = d_B * sum(qs_B)) for min correction.
+                shmem_bsum[col] = data_b[ib_outer].ds[ib_inner].y;
+#endif
             }
             const ivec4 vals = data_b[ib_outer].qs[ib_inner * 2u + iqs];
             const i8vec4 v0 = i8vec4(unpack8(uint(vals.x)));
@@ -254,13 +342,27 @@ void main() {
                          gl_CooperativeMatrixLayoutColumnMajor);
             memoryBarrierShared();
             [[unroll]] for (uint e = 0u; e < ELEMS_PER_TILE; e++) {
-                const uint f   = gl_LocalInvocationIndex * ELEMS_PER_TILE + e;
-                const uint row = f % TM;
-                const uint col = f / TM;
-                const float scale = float(shmem_scale_a[i * TM + row]) *
-                                    float(shmem_scale_b[j * TN + col]);
+                const uint f       = gl_LocalInvocationIndex * ELEMS_PER_TILE + e;
+                const uint row     = f % TM;
+                const uint col     = f / TM;
+                const uint row_idx = i * TM + row;
+                const uint col_idx = j * TN + col;
+#if defined(DATA_A_Q8_0) || defined(DATA_A_IQ4_XS)
+                const float scale = float(shmem_scale_a[row_idx]) *
+                                    float(shmem_scale_b[col_idx]);
+                sums[t * ELEMS_PER_TILE + e] += float(shmem_tmp[f]) * scale;
+#elif defined(DATA_A_Q4_K)
+                // Q4_K epilogue: coopmat result + min correction.
+                // output = d_sc_a * d_b * dot(int8_q, b) + (8*d_sc_a - d_min_a) * (d_b*sum(b))
+                // where: bsum = shmem_bsum[col_idx] = d_b * sum(qs_B)
+                const float d_sc_a  = float(shmem_scale_a[row_idx]);
+                const float d_min_a = float(shmem_min_a[row_idx]);
+                const float d_b     = float(shmem_scale_b[col_idx]);
+                const float bsum    = float(shmem_bsum[col_idx]);
                 sums[t * ELEMS_PER_TILE + e] +=
-                    float(shmem_tmp[f]) * scale;
+                    float(shmem_tmp[f]) * d_sc_a * d_b
+                    + (8.0f * d_sc_a - d_min_a) * bsum;
+#endif
             }
         }
         // No trailing barrier() — the load barrier at the top of the next K block covers it.
@@ -268,7 +370,7 @@ void main() {
         // ── Advance position counters ──────────────────────────────────────────
 #if defined(DATA_A_Q8_0)
         pos_a_ib++;
-#elif defined(DATA_A_IQ4_XS)
+#elif defined(DATA_A_IQ4_XS) || defined(DATA_A_Q4_K)
         // Advance super-block index every SUB_PER_SUPER=8 BK steps (= one 256-element block).
         if (sub_block == SUB_PER_SUPER - 1u) pos_a_super++;
 #endif

@@ -3882,7 +3882,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
             device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q8_0].f32acc->m =
                 device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q8_0].f32acc->s;
 
-            // IQ4_XS × Q8_1 — 4-bit weights, dequant to int8 via table in LDS
+            // IQ4_XS × Q8_1 — 4-bit symmetric quant, dequant to int8 via table in LDS
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_IQ4_XS].f32acc->s,
                 "matmul_iq4_xs_cm_int_cm1_fp32", matmul_iq4_xs_cm_int_cm1_fp32_len, matmul_iq4_xs_cm_int_cm1_fp32_data,
                 "main", 3, sizeof(vk_mat_mat_push_constants), {64, 64, 1}, {64}, 1);
@@ -3890,6 +3890,15 @@ static void ggml_vk_load_shaders(vk_device& device) {
                 device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_IQ4_XS].f32acc->s;
             device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_IQ4_XS].f32acc->m =
                 device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_IQ4_XS].f32acc->s;
+
+            // Q4_K × Q8_1 — 4-bit asymmetric quant, centered int8 + min correction via Q8_1 ds.y
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q4_K].f32acc->s,
+                "matmul_q4_k_cm_int_cm1_fp32", matmul_q4_k_cm_int_cm1_fp32_len, matmul_q4_k_cm_int_cm1_fp32_data,
+                "main", 3, sizeof(vk_mat_mat_push_constants), {64, 64, 1}, {64}, 1);
+            device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q4_K].f32acc->l =
+                device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q4_K].f32acc->s;
+            device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q4_K].f32acc->m =
+                device->pipeline_dequant_mul_mat_mat_cm_int[GGML_TYPE_Q4_K].f32acc->s;
         }
 #endif
 
@@ -6185,10 +6194,11 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         }
     }
 
-    // MMQ — int8 coopmat path preferred over DP4A when available (Q8_0 and IQ4_XS)
+    // MMQ — int8 coopmat path preferred over DP4A when available (Q8_0, IQ4_XS, Q4_K)
 #if defined(GGML_VULKAN_COOPMAT_INT_GLSLC_SUPPORT)
     if (src1_type == GGML_TYPE_Q8_1 && ctx->device->coopmat_int_support &&
-        (src0_type == GGML_TYPE_Q8_0 || src0_type == GGML_TYPE_IQ4_XS)) {
+        (src0_type == GGML_TYPE_Q8_0 || src0_type == GGML_TYPE_IQ4_XS ||
+         src0_type == GGML_TYPE_Q4_K)) {
         vk_matmul_pipeline cm_int_p = ctx->device->pipeline_dequant_mul_mat_mat_cm_int[src0_type].f32acc;
         if (!cm_int_p->is_empty()) {
             return cm_int_p;
@@ -7570,11 +7580,13 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
-    // Enable Q8_1 quantization of Y for: DP4A (standard MMQ) or int8 coopmat (cm_int, Q8_0/IQ4_XS weights)
+    // Enable Q8_1 quantization of Y for: DP4A (standard MMQ) or int8 coopmat (cm_int)
+    // cm_int supports: Q8_0 (direct int8), IQ4_XS (table dequant), Q4_K (centered + min correction)
 #if defined(GGML_VULKAN_COOPMAT_INT_GLSLC_SUPPORT)
     static const bool disable_cm_int = (getenv("GGML_VK_DISABLE_COOPMAT_INT") != nullptr);
     const bool cm_int_viable = !disable_cm_int && ctx->device->coopmat_int_support &&
-        (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_IQ4_XS);
+        (src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_IQ4_XS ||
+         src0->type == GGML_TYPE_Q4_K);
 #else
     const bool cm_int_viable = false;
 #endif
