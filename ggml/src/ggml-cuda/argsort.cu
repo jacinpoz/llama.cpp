@@ -188,11 +188,18 @@ static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int n
         for (int j = k / 2; j > 0; j /= 2) {
             int ixj = col ^ j;
             if (ixj > col) {
+                // Break ties by index so the sort is deterministic (the CUB path is a stable radix
+                // sort, and the fused MoE router's iterative argmax also breaks ties by the smaller
+                // expert index; the plain bitonic network without this step is not stable, so an
+                // address-dependent fusion decision used to change the routed top-k).
+                const bool eq = dst_row[col] < ncols && dst_row[ixj] < ncols &&
+                                x_row[dst_row[col]] == x_row[dst_row[ixj]];
                 if ((col & k) == 0) {
                     if (dst_row[col] >= ncols ||
                         (dst_row[ixj] < ncols && (order == GGML_SORT_ORDER_ASC ?
                             x_row[dst_row[col]] > x_row[dst_row[ixj]] :
-                            x_row[dst_row[col]] < x_row[dst_row[ixj]]))
+                            x_row[dst_row[col]] < x_row[dst_row[ixj]])) ||
+                        (eq && dst_row[col] > dst_row[ixj])
                     ) {
                         ggml_cuda_swap(dst_row[col], dst_row[ixj]);
                     }
@@ -200,7 +207,8 @@ static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int n
                     if (dst_row[ixj] >= ncols ||
                         (dst_row[col] < ncols && (order == GGML_SORT_ORDER_ASC ?
                             x_row[dst_row[col]] < x_row[dst_row[ixj]] :
-                            x_row[dst_row[col]] > x_row[dst_row[ixj]]))
+                            x_row[dst_row[col]] > x_row[dst_row[ixj]])) ||
+                        (eq && dst_row[col] < dst_row[ixj])
                     ) {
                         ggml_cuda_swap(dst_row[col], dst_row[ixj]);
                     }
