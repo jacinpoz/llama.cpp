@@ -1216,7 +1216,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list;
         switch (info.layer) {
             case LLM_TENSOR_LAYER_INPUT:
-                buft_list = buft_list_input;
+                // the per-layer token embedding is a huge table that the model gathers on the host
+                // (qwen4exp/gemma build_inp_ple), so it must stay host-resident even when the rest
+                // of the input layer is offloaded with LLAMA_DEVICE_INPUT=1; give it the CPU list.
+                buft_list = tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD ? buft_list_cpu : buft_list_input;
                 break;
             case LLM_TENSOR_LAYER_OUTPUT:
                 buft_list = buft_list_output;
@@ -1267,8 +1270,21 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         // avoid using a host buffer when using mmap
+        // EXCEPTION: a MoE expert weight (`MUL_MAT_ID`) that lands on a host buffer type is exactly the
+        // weight the scheduler's op-offload H2D-uploads every ubatch.  Downgrading it to the mmap'd CPU
+        // buffer makes those uploads read the pageable model mapping, which on ROCm 7.14 stalls the host
+        // for the whole copy and makes the meta backend's 2-D spliced upload fault in `hipMemcpy2DAsync`
+        // (`__amd_rocclr_copyBufferRectAligned`).  Keeping it pinned costs the expert set in
+        // non-swappable RAM but makes the uploads safe and asynchronous (35B-A3B `-sm tensor -ncmoe`
+        // pp8192: ~2.7k t/s pageable vs ~5.1k t/s pinned).  LLAMA_MMAP_HOST_EXPERTS=0 restores the
+        // mmap downgrade.
+        static const bool host_experts = [] {
+            const char * e = getenv("LLAMA_MMAP_HOST_EXPERTS");
+            return e == nullptr || atoi(e) != 0;
+        }();
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev) &&
+                !(host_experts && op == GGML_OP_MUL_MAT_ID)) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");

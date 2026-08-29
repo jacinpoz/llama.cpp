@@ -783,6 +783,11 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// Ring depth for the op-offload H2D staging prototype (issue #50 WIP).  This is the compile-time
+// maximum; the effective depth is GGML_SCHED_STAGE_SLOTS (default 6), clamped to this.
+#define GGML_SCHED_STAGE_SLOTS 16
+#define GGML_SCHED_STAGE_SLOTS_DEFAULT 8
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -830,6 +835,25 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+
+    // Op-offload H2D staging ring (issue #50 WIP): overlap host->device weight uploads with compute.
+    // GGML_SCHED_STAGE=1 enables it; a stage-capable backend is required.  stage_consumed is the
+    // per-split list of staged inputs produced by sched_stage_issue and drained by the input loop.
+    bool stage_enabled;
+    int  stage_slot_next;
+    int  stage_n_slots;
+    int  stage_consumed_n;
+    int  stage_mode; // 0 = stage then D2D into the split input, 1 = point the split input at the slot
+    bool stage_split_ok; // this split passed the enable + width gates (a backend-owned `stage_input` reads it)
+    struct {
+        struct ggml_tensor * dst;
+        size_t size;
+        int    slot;
+        int    backend_id;
+        void * orig; // dst->data to restore (redirect mode)
+    } stage_consumed[GGML_SCHED_STAGE_SLOTS];
+    struct ggml_backend_event * stage_done_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_STAGE_SLOTS];
+    struct ggml_backend_event * stage_free_ev[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_STAGE_SLOTS];
 
     int debug;
 
@@ -1034,6 +1058,18 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
     }
 }
 
+// the graph input a tensor ultimately refers to, following view chains, or NULL if it is not (a
+// view of) a graph input.  The recurrent-state copy, for one, is only ever read through views.
+static struct ggml_tensor * ggml_backend_sched_graph_input(struct ggml_tensor * t) {
+    while (t != NULL) {
+        if (t->flags & GGML_TENSOR_FLAG_INPUT) {
+            return t;
+        }
+        t = t->view_src;
+    }
+    return NULL;
+}
+
 static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
     ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
     ggml_backend_buffer_type_t buft = NULL;
@@ -1050,6 +1086,21 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
         if (tensor_backend_id != -1) {
             buft = sched->bufts[tensor_backend_id];
         }
+    }
+
+    if (buft != NULL && ggml_backend_buft_is_host(buft) && sched->n_copies <= 1 &&
+            ggml_backend_sched_graph_input(t) != NULL) {
+        // A graph input that lives in host memory is written by the host thread.  On a device
+        // that accepts host buffers (an APU with info.devices[].integrated set), the scheduler
+        // would otherwise let the compute backend read it in place: the next ubatch's
+        // set_inputs then races the in-flight compute and a torn value can turn an index into an
+        // out-of-bounds store (k_set_rows MEMORY_APERTURE_VIOLATION on gfx1151, and the #15034
+        // corrupted output before that).  Force the split-input copy so the device reads a
+        // stream-ordered device buffer.  Weights are unaffected: they are never
+        // GGML_TENSOR_FLAG_INPUT, so zero-copy host weights (the input embeddings) keep working.
+        // The view chain is resolved because an input can be reached only through a view - the
+        // recurrent-state copy, for one, is.
+        return false;
     }
 
     return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
@@ -1643,6 +1694,175 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+static ggml_backend_event_t sched_stage_ev(ggml_backend_sched_t sched, int backend_id, int slot, bool done) {
+    struct ggml_backend_event ** pev = done
+        ? &sched->stage_done_ev[backend_id][slot]
+        : &sched->stage_free_ev[backend_id][slot];
+    if (*pev == NULL) {
+        *pev = ggml_backend_event_new(sched->backends[backend_id]->device);
+    }
+    return *pev;
+}
+
+static bool sched_stage_is_host_weight(const struct ggml_tensor * input) {
+    return input->buffer != NULL &&
+           ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+           ggml_backend_buffer_is_host(input->buffer);
+}
+
+// Adaptive gate (issue #50 WIP): whole-tensor staging bypasses the used-expert pruning, so it only
+// wins when the batch is wide enough that pruning would not prune much.  The crossover width is
+// **link-dependent** (measured: ~2048 tokens at ~14.5 GB/s PCIe5 x4, ~700 at ~25 GB/s PCIe4 x16), so
+// the default threshold is calibrated from the backend's measured H2D bandwidth.  An explicit
+// GGML_SCHED_STAGE_MIN_TOKENS overrides it (0 = stage for every batch).
+static int64_t sched_stage_min_tokens(ggml_backend_sched_t sched) {
+    const char * e = getenv("GGML_SCHED_STAGE_MIN_TOKENS");
+    if (e != nullptr) {
+        return (int64_t) atoll(e);
+    }
+    static int64_t calibrated = -1;
+    if (calibrated < 0) {
+        float bw = 0.0f;
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (sched->backends[b]->iface.stage_h2d_gbps != NULL) {
+                bw = sched->backends[b]->iface.stage_h2d_gbps(sched->backends[b]);
+                break;
+            }
+        }
+        // Two measured crossover points (issue #50 WIP): ~14.5 GB/s (PCIe5 x4) crosses between 1024
+        // and 2048 tokens, ~25 GB/s (PCIe4 x16) below 1024.  Anchor at 1536 for 14.5 GB/s and take a
+        // first-order slope; GGML_SCHED_STAGE_MIN_TOKENS overrides it.
+        const double t = 1536.0 - 132.0*(double(bw) - 14.5);
+        // Floor the gate above the widest verify batch (16), so a decode/verify batch can never stage
+        // whole expert tensors even on a link fast enough to push the crossover to 0.  An unknown link
+        // (bw <= 0) falls to the same conservative floor, since t is then large anyway.
+        calibrated = (int64_t) (t > 64.0 ? t : 64.0);
+        GGML_LOG_INFO("%s: H2D staging calibration: %.1f GB/s -> min_tokens=%lld\n",
+                      __func__, double(bw), (long long) calibrated);
+        if (getenv("GGML_SCHED_STAGE") != nullptr) {
+            // ggml's INFO level maps to TRACE verbosity, which is below llama.cpp's default threshold,
+            // so a field log would not show which gate this host actually chose (only the messages
+            // emitted before llama_log_set installs the filter get through by default).  An explicit
+            // GGML_SCHED_STAGE=1 means the user asked for staging and wants to see the decision, so
+            // that case also gets a notice at the level that survives by default.  If staging ever
+            // becomes default-on this stays silent unless the variable is set.
+            GGML_LOG_WARN("%s: H2D staging: %.1f GB/s link -> whole-weight uploads staged from %lld tokens\n",
+                          __func__, double(bw), (long long) calibrated);
+        }
+    }
+    return calibrated;
+}
+
+static int64_t sched_stage_batch_tokens(const struct ggml_backend_sched_split * split) {
+    if (split->graph.n_nodes == 0) {
+        return 0;
+    }
+    const struct ggml_tensor * node = split->graph.nodes[0];
+    if (node->op == GGML_OP_MUL_MAT_ID && node->src[2] != NULL) {
+        // MUL_MAT_ID: src[2] is the router's expert ids, ne[1] is the token count
+        return node->src[2]->ne[1];
+    }
+    if (node->src[1] != NULL) {
+        return node->src[1]->ne[1];
+    }
+    return 0;
+}
+
+// Issue this split's offloaded host-weight uploads into the staging ring on the copy stream, before
+// the split's compute is enqueued.  The upload then overlaps the previous split's compute (the copy
+// stream is independent).  The input loop below drains stage_consumed with a device-to-device copy
+// into the actual split input after waiting on the per-slot upload event.
+// Restore any split input a redirect-mode issue pointed at a ring slot.  The restore must happen
+// after the previous split's graph_compute has been called -- the kernels copy the pointer value at
+// launch -- and the top of the next issue is exactly that point.
+static void sched_stage_restore(ggml_backend_sched_t sched) {
+    for (int k = 0; k < sched->stage_consumed_n; k++) {
+        if (sched->stage_consumed[k].orig != NULL) {
+            sched->stage_consumed[k].dst->data = sched->stage_consumed[k].orig;
+            sched->stage_consumed[k].orig       = NULL;
+        }
+    }
+}
+
+static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split) {
+    sched_stage_restore(sched);
+    sched->stage_consumed_n = 0;
+    sched->stage_split_ok = false;
+    if (!sched->stage_enabled || split->n_inputs == 0) {
+        return;
+    }
+    if (sched_stage_min_tokens(sched) > 0 && sched_stage_batch_tokens(split) < sched_stage_min_tokens(sched)) {
+        return;
+    }
+    // The split passed the enable and width gates.  A backend that owns its own staging (the meta
+    // backend under -sm tensor) is driven from the input loop through `stage_input`; the ring below
+    // needs a stage-capable backend plus one slot per *host-weight* input.  Count only the host-weight
+    // inputs: a merged routed-MoE split carries one big expert weight plus dozens of tiny view/ids
+    // inputs (measured 31 inputs on qwen4exp), so comparing the raw `n_inputs` to the ring slots
+    // skipped staging for the whole split and left its 450 MiB weight to the serial host path.
+    sched->stage_split_ok = true;
+    int n_host_inputs = 0;
+    for (int i = 0; i < split->n_inputs; i++) {
+        if (sched_stage_is_host_weight(split->inputs[i])) {
+            n_host_inputs++;
+        }
+    }
+    if (n_host_inputs == 0 || n_host_inputs > sched->stage_n_slots) {
+        return;
+    }
+    ggml_backend_t backend = sched->backends[split->backend_id];
+    if (backend->iface.stage_buffer == NULL) {
+        return;
+    }
+
+    for (int i = 0; i < split->n_inputs; i++) {
+        struct ggml_tensor * input = split->inputs[i];
+        if (!sched_stage_is_host_weight(input)) {
+            continue;
+        }
+        struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+        const size_t size = ggml_nbytes(input);
+        const int slot = sched->stage_slot_next;
+        sched->stage_slot_next = (sched->stage_slot_next + 1) % sched->stage_n_slots;
+
+        ggml_backend_event_t free_ev = sched_stage_ev(sched, split->backend_id, slot, false);
+        ggml_backend_event_t done_ev = sched_stage_ev(sched, split->backend_id, slot, true);
+
+        backend->iface.stage_wait(backend, free_ev);
+        void * buf = backend->iface.stage_buffer(backend, slot, size);
+        if (buf == NULL) {
+            // The ring cannot hold this upload within GGML_SCHED_STAGE_MAX_MB.  A partially staged
+            // ubatch is not a graceful degradation: any input left on the pruned path takes the ids
+            // readback and a full device synchronize, which serializes the whole pipeline (measured
+            // 3047 vs 5745 t/s at ub 8192).  Disable staging for the rest of the run instead, so the
+            // fallback is the plain serial path, and warn once.
+            if (sched->stage_enabled) {
+                GGML_LOG_WARN("%s: H2D staging disabled: a %zu-byte upload does not fit GGML_SCHED_STAGE_MAX_MB\n",
+                              __func__, size);
+            }
+            sched->stage_enabled = false;
+            continue;
+        }
+        backend->iface.stage_upload(backend, buf, input->data, size, done_ev);
+
+        sched->stage_consumed[sched->stage_consumed_n].dst        = input_cpy;
+        sched->stage_consumed[sched->stage_consumed_n].size       = size;
+        sched->stage_consumed[sched->stage_consumed_n].slot       = slot;
+        sched->stage_consumed[sched->stage_consumed_n].backend_id = split->backend_id;
+        sched->stage_consumed[sched->stage_consumed_n].orig       = NULL;
+        if (sched->stage_mode == 1) {
+            // point the consuming op at the slot directly: the slot bytes then move once (H2D) instead
+            // of twice (H2D + D2D).  Safe because the graph never captures (prefill is multi-token) and
+            // the pointer is restored before the next split issues.
+            sched->stage_consumed[sched->stage_consumed_n].orig = input_cpy->data;
+            input_cpy->data = buf;
+        }
+        sched->stage_consumed_n++;
+    }
+    GGML_LOG_DEBUG("%s: batch_tokens=%lld n_inputs=%d staged=%d\n",
+                   __func__, (long long) sched_stage_batch_tokens(split), split->n_inputs, sched->stage_consumed_n);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1657,6 +1877,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        sched_stage_issue(sched, split);
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1683,6 +1905,55 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
+                // staged input (issue #50 WIP): wait on the ring slot's upload event, D2D it into the
+                // real split input, then free the slot.  Both the D2D and the compute are on the main
+                // stream, so this stays ordered after the previous split's compute.
+                {
+                    int stage_k = -1;
+                    for (int k = 0; k < sched->stage_consumed_n; k++) {
+                        if (sched->stage_consumed[k].dst == input_cpy) {
+                            stage_k = k;
+                            break;
+                        }
+                    }
+                    if (stage_k >= 0) {
+                        const int    b    = sched->stage_consumed[stage_k].backend_id;
+                        const int    slot = sched->stage_consumed[stage_k].slot;
+                        const size_t size = sched->stage_consumed[stage_k].size;
+                        ggml_backend_event_t done_ev = sched_stage_ev(sched, b, slot, true);
+                        ggml_backend_event_wait(split_backend, done_ev);
+                        if (sched->stage_mode == 0) {
+                            // stage-then-D2D mode: copy the slot into the real split input, then free it
+                            ggml_backend_event_t free_ev = sched_stage_ev(sched, b, slot, false);
+                            void * buf = split_backend->iface.stage_buffer(split_backend, slot, size);
+                            split_backend->iface.stage_d2d(split_backend, input_cpy->data, buf, size);
+                            ggml_backend_event_record(free_ev, split_backend);
+                        }
+                        // redirect mode: input_cpy->data already points at the slot; the slot is freed
+                        // after the split's compute below
+                        continue;
+                    }
+                }
+
+                // backend-owned staging (issue #50 WIP, `stage_input`): a backend whose consumers do
+                // not read this tensor's `data` (the meta backend, where the upload is spliced across
+                // devices) stages the input itself and takes over the ordering.  `callback_eval`
+                // splits one split into several compute calls, which this hand-off does not model.
+                if (sched->stage_split_ok && sched->callback_eval == NULL &&
+                    split_backend->iface.stage_input != NULL && sched_stage_is_host_weight(input) &&
+                    split_backend->iface.stage_input(split_backend, input, input_cpy)) {
+                    continue;
+                }
+
+                // tripwire (issue #50 WIP): a split input that redirect mode pointed at a ring slot must
+                // be consumed by the staged branch above, never by one of the copy paths below.  Catching
+                // it here turns a future silent stale-slot read into an abort (reporters' suggestion,
+                // PR #51).
+                for (int k = 0; k < sched->stage_consumed_n; k++) {
+                    GGML_ASSERT(sched->stage_consumed[k].dst != input_cpy &&
+                                "H2D staging: a redirected split input reached a copy path");
+                }
+
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -1780,6 +2051,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     copy_experts(first_id, last_id);
                 } else {
+                    // A host-resident split input (a graph input or a small CPU-resident
+                    // intermediate: `inp_pos`, `attn_inp_k_idxs`, ...) is re-copied on every split of a
+                    // merged routed-MoE band (hundreds per pass).  The plain fallback below blocks the
+                    // host on `ggml_backend_event_synchronize` for the whole previous split; enqueue the
+                    // 1-D H2D on the split backend's compute stream after an in-stream event wait instead.
+                    // A simple device backend (event_wait set) takes this; the meta backend's
+                    // `set_tensor_async` only understands a whole split tensor, so it keeps the copy below.
+                    const bool host_src = input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer);
+                    const bool dev_dst  = input_cpy->buffer != NULL && !ggml_backend_buffer_is_host(input_cpy->buffer);
+                    if (host_src && dev_dst && split_backend->iface.set_tensor_async != NULL &&
+                        split_backend->iface.event_wait != NULL) {
+                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                            ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                        } else {
+                            ggml_backend_synchronize(split_backend);
+                        }
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input_cpy));
+                    } else
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -1837,6 +2126,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
+        }
+
+        // redirect mode: the split's kernels have been launched, so the slots they read are reusable
+        if (sched->stage_mode == 1) {
+            for (int k = 0; k < sched->stage_consumed_n; k++) {
+                ggml_backend_event_t free_ev = sched_stage_ev(sched, sched->stage_consumed[k].backend_id, sched->stage_consumed[k].slot, false);
+                ggml_backend_event_record(free_ev, split_backend);
+            }
         }
 
         prev_backend_id = split_backend_id;
@@ -1902,7 +2199,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
-        if (sched->n_copies > 1) {
+        // The per-backend events make the wait before a split's inputs are overwritten an in-stream
+        // event wait instead of a FULL device synchronize (which also serialises op-offloaded weight
+        // uploads behind the previous split's compute).  Ported from the reporter's PR #51.  Defaulted
+        // ON (2026-09-30, r26): with a single graph copy the full synchronize ran thousands of times
+        // per offloaded prefill pass (measured 5.2 s at `-ub 8192`, and 861 -> 1072 t/s once the
+        // events are created).  `GGML_SCHED_EVENTS=0` opts out.
+        static const bool sched_events = getenv("GGML_SCHED_EVENTS") == NULL || atoi(getenv("GGML_SCHED_EVENTS")) != 0;
+        if (sched->n_copies > 1 || sched_events) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
@@ -1911,6 +2215,34 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
+    {
+        const char * stage_env = getenv("GGML_SCHED_STAGE");
+        sched->stage_enabled = stage_env != NULL && atoi(stage_env) != 0;
+        const char * mode_env = getenv("GGML_SCHED_STAGE_MODE");
+        sched->stage_mode = mode_env != NULL ? atoi(mode_env) : 1;
+        const char * slots_env = getenv("GGML_SCHED_STAGE_SLOTS");
+        sched->stage_n_slots = slots_env != NULL ? atoi(slots_env) : GGML_SCHED_STAGE_SLOTS_DEFAULT;
+        if (sched->stage_n_slots < 1) {
+            sched->stage_n_slots = 1;
+        }
+        if (sched->stage_n_slots > GGML_SCHED_STAGE_SLOTS) {
+            sched->stage_n_slots = GGML_SCHED_STAGE_SLOTS;
+        }
+        if (sched->stage_enabled) {
+            bool stage_capable = false;
+            for (int b = 0; b < sched->n_backends; b++) {
+                if (sched->backends[b]->iface.stage_buffer != NULL ||
+                    sched->backends[b]->iface.stage_input  != NULL) {
+                    stage_capable = true;
+                    break;
+                }
+            }
+            if (!stage_capable) {
+                GGML_LOG_WARN("%s: GGML_SCHED_STAGE=1 but no backend supports it; staging inactive\n",
+                              __func__);
+            }
+        }
+    }
 
     ggml_backend_sched_reset(sched);
 
@@ -1924,6 +2256,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
+        }
+        for (int s = 0; s < GGML_SCHED_STAGE_SLOTS; s++) {
+            ggml_backend_event_free(sched->stage_done_ev[b][s]);
+            ggml_backend_event_free(sched->stage_free_ev[b][s]);
         }
     }
     ggml_gallocr_free(sched->galloc);

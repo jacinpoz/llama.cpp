@@ -1532,9 +1532,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // assign the input layer.  Default: the upstream host placement.  On a discrete multi-GPU box
+    // the input embedding then lives in host memory and the scheduler peels a CPU split off every
+    // graph; the 0029 single-thread heuristic keeps that split from spinning the OpenMP pool, and
+    // on gfx1201 it measures faster than the alternatives (see the OP-1 structural record).
+    // LLAMA_DEVICE_INPUT=1 places the input layer on the output layer's device instead, so the
+    // token-embedding GET_ROWS runs inside the GPU graph (on a tensor-split build, on the Meta
+    // device) and there is no CPU split at all.  It is opt-in because the Meta-split GPU gather is
+    // ~2.6% slower for MTP than the single-threaded CPU gather; the huge per-layer token embedding
+    // stays host-resident either way (see create_tensor).
+    static const bool dev_input_on = getenv("LLAMA_DEVICE_INPUT") != nullptr;
+    if (dev_input_on) {
+        pimpl->dev_input = get_layer_buft_list(n_layer_all);
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);

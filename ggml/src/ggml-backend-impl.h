@@ -151,6 +151,33 @@ extern "C" {
         // wait for an event on on a different stream
         void (*event_wait)  (ggml_backend_t backend, ggml_backend_event_t event);
 
+        // (optional) op-offload H2D staging (issue #50 WIP): overlap a whole-tensor host->device
+        // weight upload with the previous split's compute.  `stage_buffer` returns a device buffer of
+        // at least `size` bytes for ring `slot` (NULL on allocation failure); `stage_upload` issues the
+        // host->device copy into `dst` on the backend's auxiliary copy stream and records `ev` there;
+        // `stage_wait` makes that copy stream wait for `ev` (recorded on the main stream); `stage_d2d`
+        // copies the staged bytes to their destination on the main stream.  A backend that does not
+        // implement these leaves all four NULL and the scheduler keeps the in-order copy path.
+        void * (*stage_buffer)(ggml_backend_t backend, int slot, size_t size);
+        void   (*stage_upload)(ggml_backend_t backend, void * dst, const void * data, size_t size, ggml_backend_event_t ev);
+        void   (*stage_wait)  (ggml_backend_t backend, ggml_backend_event_t ev);
+        void   (*stage_d2d)   (ggml_backend_t backend, void * dst, const void * src, size_t size);
+        // (optional) measured H2D bandwidth in GB/s (one-off calibration, cached); 0 if unknown.  The
+        // scheduler uses it to pick the staging gate (a narrow link needs a wider batch).
+        float  (*stage_h2d_gbps)(ggml_backend_t backend);
+
+        // (optional) op-offload H2D staging owned by the split's backend.  The four hooks above
+        // assume one destination and a device event on the split backend's device; under `-sm tensor`
+        // neither exists -- one logical upload is spliced across N devices, and the split's consumers
+        // read per-device "simple" tensors rather than the split tensor's `data`, so a redirect of
+        // that pointer can never reach the op.  Such a backend stages the input itself instead: it is
+        // called with the source `input` (a host weight) and the split input `input_cpy`, lands each
+        // device's chunk in that device's own ring, and returns true; the scheduler then skips its own
+        // copy path for this input.  Only consulted when the staging gate is open (the backend must
+        // implement `stage_h2d_gbps` so the gate is calibrated, and must advertise this hook so the
+        // scheduler does not report staging as unsupported).
+        bool   (*stage_input)(ggml_backend_t backend, struct ggml_tensor * input, struct ggml_tensor * input_cpy);
+
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
     };

@@ -306,7 +306,24 @@ static ggml_cuda_device_info ggml_cuda_init() {
 
         info.default_tensor_split[id] = total_vram;
         total_vram += device_vram;
+        // Fork divergence from PR #24233 (restored prop.integrated on HIP builds): the CUDA
+        // host-buffer path (zero-copy UMA weights) it enables on APUs corrupts full-model
+        // results under async execution on this box (PPL 5.9243 -> 8.51+ without
+        // HIP_LAUNCH_BLOCKING).  Upstream reverted #24233 in #28604 (2026-09-08), making
+        // forced-integrated-false the upstream default again.
+        //
+        // Re-tested 2026-09-23 (closing-the-gap host-buffer investigation): the corruption was
+        // the scheduler reading a host-resident graph input in place; see the host-input guard
+        // in ggml_backend_sched_buffer_supported().  With that guard the real flag is stable on
+        // this box, and it is what lets an APU gather the input embeddings on the GPU (no CPU
+        // backend dispatch) while the embedding weights stay in zero-copy host memory.
+        // GGML_FORCE_NO_INTEGRATED=1 restores the previous default for A/B and bisection.
+#if defined(GGML_USE_HIP)
+        static const bool force_no_integrated = getenv("GGML_FORCE_NO_INTEGRATED") != nullptr;
+        info.devices[id].integrated = force_no_integrated ? false : prop.integrated;
+#else
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
+#endif
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
@@ -703,6 +720,8 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+    h2d_stage_free();
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -4923,6 +4942,77 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 }
 
+static void * ggml_backend_cuda_stage_buffer(ggml_backend_t backend, int slot, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    return cuda_ctx->h2d_stage_buffer(slot, size);
+}
+
+static void ggml_backend_cuda_stage_upload(ggml_backend_t backend, void * dst, const void * data, size_t size, ggml_backend_event_t ev) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    cudaStream_t s = cuda_ctx->copy_stream();
+    CUDA_CHECK(cudaMemcpyAsync(dst, data, size, cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaEventRecord((cudaEvent_t) ev->context, s));
+}
+
+static void ggml_backend_cuda_stage_wait(ggml_backend_t backend, ggml_backend_event_t ev) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->copy_stream(), (cudaEvent_t) ev->context, 0));
+}
+
+static void ggml_backend_cuda_stage_d2d(ggml_backend_t backend, void * dst, const void * src, size_t size) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
+}
+
+static float ggml_backend_cuda_stage_h2d_gbps(ggml_backend_t backend) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    // One-off H2D bandwidth calibration (issue #50 WIP), cached per device.  Sized past the Infinity
+    // Cache (a 64 MiB probe reads ~25 GB/s on a x4 link because the L3 serves it).  Timed with a
+    // synchronous copy so it needs no event API (this toolchain does not alias cudaEventCreate /
+    // cudaEventElapsedTime).
+    static float bw[GGML_CUDA_MAX_DEVICES];
+    static bool  done[GGML_CUDA_MAX_DEVICES] = {};
+    const int dev = cuda_ctx->device;
+    if (done[dev]) {
+        return bw[dev];
+    }
+    done[dev] = true;
+    bw[dev] = 0.0f;
+
+    const size_t sz = 512u << 20;
+    void * h = malloc(sz);
+    void * d = nullptr;
+    if (h == nullptr || cudaMalloc(&d, sz) != cudaSuccess) {
+        (void) cudaGetLastError(); // clear the sticky error
+        if (d != nullptr) CUDA_CHECK(cudaFree(d));
+        free(h);
+        return bw[dev];
+    }
+    memset(h, 1, sz);
+    CUDA_CHECK(cudaMemcpy(d, h, sz, cudaMemcpyHostToDevice)); // warmup + fault the pages
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    const int64_t t0 = ggml_time_us();
+    for (int i = 0; i < 3; ++i) {
+        CUDA_CHECK(cudaMemcpy(d, h, sz, cudaMemcpyHostToDevice));
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const int64_t t1 = ggml_time_us();
+
+    const double sec = double(t1 - t0) / 1e6;
+    bw[dev] = sec > 0.0 ? float(3.0*double(sz)/1e9 / sec) : 0.0f;
+    GGML_LOG_INFO("%s: H2D bandwidth calibration: %.1f GB/s (%zu MiB x3 in %.2f ms)\n", __func__, double(bw[dev]), sz >> 20, 1000.0*sec);
+    CUDA_CHECK(cudaFree(d));
+    free(h);
+    return bw[dev];
+}
+
 static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .get_name                = */ ggml_backend_cuda_get_name,
     /* .free                    = */ ggml_backend_cuda_free,
@@ -4939,6 +5029,12 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .graph_compute           = */ ggml_backend_cuda_graph_compute,
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
+    /* .stage_buffer            = */ ggml_backend_cuda_stage_buffer,
+    /* .stage_upload            = */ ggml_backend_cuda_stage_upload,
+    /* .stage_wait              = */ ggml_backend_cuda_stage_wait,
+    /* .stage_d2d               = */ ggml_backend_cuda_stage_d2d,
+    /* .stage_h2d_gbps          = */ ggml_backend_cuda_stage_h2d_gbps,
+    /* .stage_input             = */ nullptr, // the CUDA backend stages into a single ring: stage_buffer
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
 };
 
