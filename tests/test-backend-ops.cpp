@@ -9027,6 +9027,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    // iq4_nl is a 32-value sub-block type: exercise row widths that are not a whole number of
+    // QK_K super-blocks (the qwen4exp indexer key row is 128) - the sub-block get_rows path.
+    for (int n : {32, 128, 160, 224}) {
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, n, 5, 4, 1, 1, false, false));
+    }
     for (ggml_type type : all_types) {
         for (int b : {1, 7}) {
             for (bool v : {false, true}) {
