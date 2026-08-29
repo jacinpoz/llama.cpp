@@ -96,6 +96,18 @@ llama_context::llama_context(
 
     const auto & hparams = model.hparams;
 
+    // Only a tensor split distributes a single attention op across devices; tell the HIP FA chooser
+    // so it can pick a per-GPU-bandwidth-friendly kernel config instead of the whole-card one.
+    {
+        int n_cuda_dev = 0;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            if (ggml_backend_dev_is_cuda(ggml_backend_dev_get(i))) {
+                n_cuda_dev++;
+            }
+        }
+        ggml_set_fa_tensor_parallel(model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && n_cuda_dev > 1);
+    }
+
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
