@@ -917,6 +917,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     llama_batch batch;        // noise tokens
     llama_batch batch_inject; // target features for KV cache injection
 
+    // Llama-Frankenstein F1 (GGML_LF_DFLASH_DEV=1, single sequence): the target keeps its extracted layer inputs
+    // on the device and the injection batch carries the target rows as token ids, so the features never leave the GPU
+    bool        lf_dev = false;
+    llama_batch batch_inject_tok = {};
+
     std::vector<common_sampler_ptr> smpls;
 
     // backend sampler chain per seq, attached to ctx_dft
@@ -1051,6 +1056,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
+        {
+            const char * lf_env = getenv("GGML_LF_DFLASH_DEV");
+            lf_dev = lf_env != nullptr && atoi(lf_env) != 0 && n_seq == 1;
+            if (lf_dev) {
+                llama_lf_set_layer_inp_dev(ctx_tgt, true);
+                batch_inject_tok = llama_batch_init(llama_n_ubatch(ctx_dft), 0, n_seq);
+                if (is_mrope) {
+                    free(batch_inject_tok.pos);
+                    batch_inject_tok.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * llama_n_batch(ctx_dft));
+                }
+                LOG_INF("%s: F1: target features stay on the device (GGML_LF_DFLASH_DEV)\n", __func__);
+            } else if (lf_env != nullptr && atoi(lf_env) != 0) {
+                LOG_WRN("%s: F1 needs a single sequence (n_seq = %d), using the host path\n", __func__, (int) n_seq);
+            }
+        }
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
@@ -1071,6 +1092,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         llama_batch_free(batch);
         llama_batch_free(batch_inject);
+        if (lf_dev) {
+            llama_batch_free(batch_inject_tok);
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -1128,11 +1152,48 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // F1: the target wrote its layer inputs to device buffers on its own stream; the draft reads them on its
+        // stream, and the target must not overwrite them before the draft is done
+        const bool use_dev = lf_dev && has_tokens;
+        if (use_dev) {
+            llama_synchronize(ctx_tgt);
+        }
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+
+            if (use_dev) {
+                for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+                    const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+                    batch_inject_tok.n_tokens = n_chunk;
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const int32_t   row = i_batch_beg[seq_id] + offset + i;
+                        const llama_pos p   = batch_in.pos[row];
+                        batch_inject_tok.token[i] = row; // row of the target batch (see llama_lf_set_dev_inject)
+                        batch_inject_tok.pos[i]   = p;
+                        if (is_mrope) {
+                            batch_inject_tok.pos[1 * n_chunk + i] = p;
+                            batch_inject_tok.pos[2 * n_chunk + i] = p;
+                            batch_inject_tok.pos[3 * n_chunk + i] = 0;
+                        }
+                        batch_inject_tok.n_seq_id[i]  = 1;
+                        batch_inject_tok.seq_id[i][0] = seq_id;
+                        batch_inject_tok.logits[i]    = false;
+                    }
+                    llama_lf_set_dev_inject(ctx_dft, true);
+                    const int32_t rc = llama_decode(ctx_dft, batch_inject_tok);
+                    llama_lf_set_dev_inject(ctx_dft, false);
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (F1, n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
+                }
+                continue;
+            }
 
             // an M-RoPE image pins all its rows to one position, so a windowed draft
             // cache cannot free cells for it - skip it, the draft can jump over the gap
@@ -1178,6 +1239,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     return false;
                 }
             }
+        }
+
+        if (use_dev) {
+            llama_lf_signal_features_consumed(ctx_dft);
         }
 
         return true;

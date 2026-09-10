@@ -40,6 +40,8 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool auto_fa;
+    bool kq_mask_derived;      // V3: derive the kq mask in the FA kernel instead of materializing it
+    bool auto_kq_mask_derived; // the derived kq mask still has to be confirmed by the backend probe
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;
@@ -55,9 +57,17 @@ struct llama_cparams {
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
+
+    ggml_type type_k;          // KV cache types, as handed to the memory module (the qwen4exp
+    ggml_type type_v;          // QSA arm selection needs to know what the sparse kernel can read)
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+
+    // Llama-Frankenstein F1: keep the extracted layer inputs on the device (target context) and let a draft
+    // context read them there (lf_dev_inject is set only while such a draft KV injection is being decoded)
+    bool lf_layer_inp_dev = false;
+    bool lf_dev_inject    = false;
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;

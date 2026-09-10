@@ -143,6 +143,20 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
 #endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
 }
 
+// Non-temporal (streaming) load for pure-streaming kernels: it keeps the access out of the L2/MALL
+// that the surrounding weight GEMMs need (see the WIP mmb-general notes).  __builtin_nontemporal_load
+// only accepts pointers to builtin scalar/vector types, so wrapper types (__half, bfloat16, float4,
+// ...) fall back to a normal access -- a templated kernel therefore takes the hint on its f32 path
+// only, which is the path these activations use.
+template <typename T>
+static __device__ __forceinline__ T ggml_cuda_nt_load(const T * p) {
+    if constexpr (std::is_same<T, float>::value) {
+        return __builtin_nontemporal_load(p);
+    } else {
+        return *p;
+    }
+}
+
 #ifdef __CUDA_ARCH_LIST__
 constexpr bool ggml_cuda_has_arch_impl(int) {
     return false;
@@ -1667,6 +1681,55 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context concurrent_stream_context;
 
+    // Issue #30 TODO 21: F16 staging scratch for a native-capable (q8_0/q4_0/bf16) K/V operand at
+    // prefill.  A prefill stages (the conversion is amortised over many query rows, and the F16
+    // tiles then feed the cp_async pipeline) while decode/verify reads the raw cache, so this
+    // buffer is only ever touched by a multi-token graph -- which is never CUDA-graph captured (see
+    // the prefill skip in ggml_backend_cuda_graph_compute).  It is therefore safe to allocate it
+    // here instead of reserving it in the compute graph, where the reserve sizes it for n_ctx (up
+    // to ~800 MiB per GPU at a 200k context) even though the real scratch tracks the prefix length.
+    // One arena per stream (concurrent streams can be staging at the same time), bounding the
+    // retained memory to ~1.25x the largest request: the generic pool retains every distinct size,
+    // and this request grows with the prefix, so a long prefill would leave ~150 buffers cached.
+    // The growth policy is not a performance lever (exact-fit realloc measured the same).
+    char * fattn_stage[GGML_CUDA_MAX_STREAMS]      = {};
+    size_t fattn_stage_size[GGML_CUDA_MAX_STREAMS] = {};
+    bool   fattn_stage_oom_warned                  = false;
+
+    // Try to make the per-stream staging arena hold at least `size` bytes.  Returns the arena
+    // (possibly larger than requested) on success, or nullptr when the device has no room for the
+    // transient: the previous arena is kept so a later, smaller request can still be served.
+    //
+    // A nullptr must not abort the compute: the arena is a deep-prefill *speed* buffer, not a
+    // correctness requirement (the caller falls back to reading the raw K/V cache, which is what
+    // decode/verify does anyway).  The allocation is deliberately not part of the compute-graph
+    // reserve -- the reserve sizes it for n_ctx -- so a llama-server --fit run can legitimately have
+    // less free memory at the first deep prefill than the fit projected; failing here must degrade
+    // to the native read, not kill the run.
+    void * fattn_stage_try_get(int stream_no, size_t size) {
+        GGML_ASSERT(stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS);
+        if (size > fattn_stage_size[stream_no]) {
+            const size_t new_size = std::max<size_t>(size_t(1) << 24, size + size/4); // 16 MiB floor, 25% growth
+            char * new_arena = nullptr;
+            if (cudaMalloc(&new_arena, new_size) != cudaSuccess) {
+                (void) cudaGetLastError(); // clear the sticky error
+                if (!fattn_stage_oom_warned) {
+                    fattn_stage_oom_warned = true;
+                    GGML_LOG_WARN("%s: not enough free device memory for a %zu MiB FA prefill staging "
+                                  "buffer, reading the K/V cache natively instead (prefill may be slower)\n",
+                                  __func__, new_size >> 20);
+                }
+                return nullptr;
+            }
+            if (fattn_stage[stream_no] != nullptr) {
+                CUDA_CHECK(cudaFree(fattn_stage[stream_no]));
+            }
+            fattn_stage[stream_no]      = new_arena;
+            fattn_stage_size[stream_no] = new_size;
+        }
+        return fattn_stage[stream_no];
+    }
+
     // Op-offload H2D staging ring (issue #50 WIP).  Whole-tensor host->device uploads of offloaded
     // weights are issued on a dedicated copy stream (stream 1) into a small ring of device slots, so
     // the upload of one split overlaps the compute of the previous one.  stage_buffer grows a slot on
@@ -1720,8 +1783,85 @@ struct ggml_backend_cuda_context {
                 h2d_stage[s]      = nullptr;
                 h2d_stage_size[s] = 0;
             }
+            if (h2d_pin[s] != nullptr) {
+                CUDA_CHECK(cudaFreeHost(h2d_pin[s]));
+                h2d_pin[s]      = nullptr;
+                h2d_pin_size[s] = 0;
+            }
+            if (h2d_pin_ev[s] != nullptr) {
+                CUDA_CHECK(cudaEventDestroy(h2d_pin_ev[s]));
+                h2d_pin_ev[s] = nullptr;
+            }
+        }
+        if (h2d_scratch_ptr != nullptr) {
+            CUDA_CHECK(cudaFree(h2d_scratch_ptr));
+            h2d_scratch_ptr  = nullptr;
+            h2d_scratch_size = 0;
         }
         h2d_stage_total = 0;
+    }
+
+    // Pinned host staging for a *gathered* upload (wip/tensor-split-expert-split): a split device's
+    // slice is strided in the source weight, so it is gathered on the host into a pinned slot and then
+    // 1-D H2D'd on the copy stream.  A pageable buffer would make that copy block the host (so it could
+    // not be queued); the per-slot event guards reuse until the copy that read it has completed.
+    void * h2d_pin[H2D_STAGE_SLOTS]         = {};
+    size_t h2d_pin_size[H2D_STAGE_SLOTS]    = {};
+    cudaEvent_t h2d_pin_ev[H2D_STAGE_SLOTS] = {};
+
+    void * h2d_pin_buffer(int slot, size_t size) {
+        GGML_ASSERT(slot >= 0 && slot < H2D_STAGE_SLOTS);
+        if (size > h2d_pin_size[slot]) {
+            if (h2d_pin[slot] != nullptr) {
+                CUDA_CHECK(cudaFreeHost(h2d_pin[slot]));
+                h2d_pin[slot]      = nullptr;
+                h2d_pin_size[slot] = 0;
+            }
+            void * p = nullptr;
+            if (cudaMallocHost(&p, size) != cudaSuccess) {
+                (void) cudaGetLastError(); // clear the sticky error
+                return nullptr;
+            }
+            h2d_pin[slot]      = p;
+            h2d_pin_size[slot] = size;
+        }
+        if (h2d_pin_ev[slot] == nullptr) {
+            if (cudaEventCreateWithFlags(&h2d_pin_ev[slot], cudaEventDisableTiming) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return nullptr;
+            }
+        }
+        return h2d_pin[slot];
+    }
+
+    // wip/tensor-split-expert-split: one per-device scratch for the *whole range* H2D that a
+    // fine-grained split gather stages through.  `ffn_down_exps` splits on the innermost dim, so its
+    // device slice is 500k+ blocks of a few hundred bytes (a per-block host gather is hundreds of
+    // thousands of `memcpy` calls); instead H2D the contiguous range once and let a device D2D copy do
+    // the compaction.  Bounded (256 MiB) so it can never turn a load into an OOM; a range that does not
+    // fit falls back to the plain spliced path.
+    void * h2d_scratch_ptr  = nullptr;
+    size_t h2d_scratch_size = 0;
+    void * h2d_scratch(size_t size) {
+        if (h2d_scratch_ptr != nullptr && size <= h2d_scratch_size) {
+            return h2d_scratch_ptr;
+        }
+        if (size > 256ull*1024*1024) {
+            return nullptr;
+        }
+        if (h2d_scratch_ptr != nullptr) {
+            CUDA_CHECK(cudaFree(h2d_scratch_ptr));
+            h2d_scratch_ptr  = nullptr;
+            h2d_scratch_size = 0;
+        }
+        void * p = nullptr;
+        if (cudaMalloc(&p, size) != cudaSuccess) {
+            (void) cudaGetLastError(); // clear the sticky error
+            return nullptr;
+        }
+        h2d_scratch_ptr  = p;
+        h2d_scratch_size = size;
+        return h2d_scratch_ptr;
     }
 
     cudaStream_t copy_stream() { return stream(device, 1); }

@@ -23,6 +23,11 @@
 #include <unordered_map>
 #include <vector>
 
+// getenv() is cheap on Linux but takes a lock and rescans the environment block on Windows.  These
+// debug / A-B gates sit on per-graph and per-split paths, so resolve each one once per call site:
+// the static inside the immediately-invoked lambda is unique to each macro expansion.
+#define GGML_ENV_STR(name) ([]() -> const char * { static const char * v = getenv(name); return v; }())
+
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
@@ -262,7 +267,18 @@ size_t ggml_backend_get_max_size(ggml_backend_t backend) {
     return ggml_backend_buft_get_max_size(ggml_backend_get_default_buffer_type(backend));
 }
 
+// TEMP INSTRUMENT (exp10b): host wall time spent in the expert-upload path.  If the host blocks here
+// the copies are serialized on the host thread, which is what makes the two-device case 2x.
+static int64_t g_set_us = 0, g_set_n = 0, g_get_us = 0, g_get_n = 0, g_inp_us = 0, g_inp_n = 0;
+static bool    g_up_reg = false;
+static void g_up_dump(void) {
+    fprintf(stderr, "SCHEDUPLOAD set_async=%lld calls %.1fms (%.3f ms/call) | get_async=%lld calls %.1fms | input_loop=%lld %.1fms\n",
+        (long long) g_set_n, g_set_us/1000.0, g_set_n ? g_set_us/1000.0/g_set_n : 0.0,
+        (long long) g_get_n, g_get_us/1000.0, (long long) g_inp_n, g_inp_us/1000.0);
+}
 void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (GGML_ENV_STR("GGML_SCHED_SYNCDBG") && !g_up_reg) { g_up_reg = true; atexit(g_up_dump); }
+    const int64_t t_up = GGML_ENV_STR("GGML_SCHED_SYNCDBG") ? ggml_time_us() : 0;
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
@@ -274,9 +290,11 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
     } else {
         backend->iface.set_tensor_async(backend, tensor, data, offset, size);
     }
+    if (t_up) { g_set_us += ggml_time_us() - t_up; g_set_n++; }
 }
 
 void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    const int64_t t_up = GGML_ENV_STR("GGML_SCHED_SYNCDBG") ? ggml_time_us() : 0;
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
@@ -288,6 +306,7 @@ void ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_ten
     } else {
         backend->iface.get_tensor_async(backend, tensor, data, offset, size);
     }
+    if (t_up) { g_get_us += ggml_time_us() - t_up; g_get_n++; }
 }
 
 void ggml_backend_tensor_set_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
@@ -343,6 +362,11 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+
+    // TEMP INSTRUMENT (wip/tensor-split-expert-split): count host->device uploads per buffer.
+    if (GGML_ENV_STR("GGML_SET_BYTES") != nullptr && size >= (1u << 20)) {
+        fprintf(stderr, "SETBYTES %s %s offset=%zu size=%zu\n", ggml_backend_buffer_name(buf), tensor->name, offset, size);
+    }
 
     buf->iface.set_tensor(buf, tensor, data, offset, size);
 }
@@ -422,13 +446,30 @@ void ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size
     buf->iface.memset_tensor(buf, tensor, value, offset, size);
 }
 
+// TEMP INSTRUMENT (exp10, wip/tensor-split-expert-split): full pipeline drains are the expert-upload
+// path's serializer -- count and time every synchronize.  GGML_SCHED_SYNCDBG=1.
+static int64_t g_sync_us = 0, g_sync_n = 0;
+static bool    g_sync_reg = false;
+static void g_sync_dump(void) {
+    fprintf(stderr, "SCHEDSYNC calls=%lld total=%.1fms per_call=%.2fms\n",
+            (long long) g_sync_n, g_sync_us/1000.0, g_sync_n ? g_sync_us/1000.0/g_sync_n : 0.0);
+    g_up_dump();
+}
+
 void ggml_backend_synchronize(ggml_backend_t backend) {
     GGML_ASSERT(backend);
     if (backend->iface.synchronize == NULL) {
         return;
     }
-
+    if (GGML_ENV_STR("GGML_SCHED_SYNCDBG") == nullptr) {
+        backend->iface.synchronize(backend);
+        return;
+    }
+    if (!g_sync_reg) { g_sync_reg = true; atexit(g_sync_dump); }
+    const int64_t t_ = ggml_time_us();
     backend->iface.synchronize(backend);
+    g_sync_us += ggml_time_us() - t_;
+    g_sync_n += 1;
 }
 
 ggml_backend_graph_plan_t ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -553,11 +594,23 @@ void ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backen
     backend->iface.event_record(backend, event);
 }
 
+static int64_t g_ev_us = 0, g_ev_n = 0;
+static void g_ev_dump(void) {
+    fprintf(stderr, "SCHEDEVENT event_sync=%lld calls %.1fms (%.3f ms/call)\n",
+        (long long) g_ev_n, g_ev_us/1000.0, g_ev_n ? g_ev_us/1000.0/g_ev_n : 0.0);
+}
 void ggml_backend_event_synchronize(ggml_backend_event_t event) {
     GGML_ASSERT(event);
     GGML_ASSERT(event->device->iface.event_synchronize);
 
+    if (GGML_ENV_STR("GGML_SCHED_SYNCDBG") == nullptr) {
+        event->device->iface.event_synchronize(event->device, event);
+        return;
+    }
+    const int64_t t_ = ggml_time_us();
     event->device->iface.event_synchronize(event->device, event);
+    if (g_ev_n == 0) atexit(g_ev_dump);
+    g_ev_us += ggml_time_us() - t_; g_ev_n += 1;
 }
 
 void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -1513,6 +1566,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
         },
         /* .user_data     = */ &alloc_deps,
+        /* .has_eval_callback = */ sched->callback_eval != nullptr,
+        /* .full_graph    = */ graph,
+        /* .marks_only    = */ false,
+        /* .allocs_only   = */ false,
     };
 
     for (int i = 0; i < sched->n_splits; i++) {
@@ -1759,7 +1816,7 @@ static bool sched_stage_is_host_weight(const struct ggml_tensor * input) {
 // the default threshold is calibrated from the backend's measured H2D bandwidth.  An explicit
 // GGML_SCHED_STAGE_MIN_TOKENS overrides it (0 = stage for every batch).
 static int64_t sched_stage_min_tokens(ggml_backend_sched_t sched) {
-    const char * e = getenv("GGML_SCHED_STAGE_MIN_TOKENS");
+    const char * e = GGML_ENV_STR("GGML_SCHED_STAGE_MIN_TOKENS");
     if (e != nullptr) {
         return (int64_t) atoll(e);
     }
@@ -1782,7 +1839,7 @@ static int64_t sched_stage_min_tokens(ggml_backend_sched_t sched) {
         calibrated = (int64_t) (t > 64.0 ? t : 64.0);
         GGML_LOG_INFO("%s: H2D staging calibration: %.1f GB/s -> min_tokens=%lld\n",
                       __func__, double(bw), (long long) calibrated);
-        if (getenv("GGML_SCHED_STAGE") != nullptr) {
+        if (GGML_ENV_STR("GGML_SCHED_STAGE") != nullptr) {
             // ggml's INFO level maps to TRACE verbosity, which is below llama.cpp's default threshold,
             // so a field log would not show which gate this host actually chose (only the messages
             // emitted before llama_log_set installs the filter get through by default).  An explicit
@@ -1934,6 +1991,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // copy the input tensors to the split backend
+        const int64_t t_inp = GGML_ENV_STR("GGML_SCHED_SYNCDBG") ? ggml_time_us() : 0;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -1998,14 +2056,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 // wait for the split backend to finish using the input before overwriting it
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
+                // exp37: the meta backend has no event_record/event_wait, so `sched->events[meta]` is
+                // null and this falls through to the else -- a FULL host synchronize of both devices
+                // before every expert upload.  That is what keeps the host from running ahead, so the
+                // gather+H2D for split N+1 cannot overlap split N's compute.  GGML_META_NOSYNC=1 skips
+                // it (unsafe: a WAR hazard on a reused input buffer) purely to measure the ceiling.
+                if (GGML_ENV_STR("GGML_META_NOSYNC") == nullptr) {
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                 ggml_tensor * node = split->graph.nodes[0];
+                if (GGML_ENV_STR("GGML_SCHED_BUFTDBG") != nullptr) {
+                    static int n = 0;
+                    if (n++ < 4) fprintf(stderr, "BUFTDBG %s buft=%s is_host=%d nbytes=%zu\n",
+                        input->name, ggml_backend_buffer_name(input->buffer),
+                        (int) ggml_backend_buffer_is_host(input->buffer), ggml_nbytes(input));
+                }
                 if (split->graph.n_nodes > 0 &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) && (
@@ -2127,6 +2198,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (t_inp) { g_inp_us += ggml_time_us() - t_inp; g_inp_n++; }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -2198,14 +2271,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
 
-    const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
+    const char * GGML_SCHED_DEBUG = GGML_ENV_STR("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
 
     sched->debug_realloc = 0;
 #ifdef GGML_SCHED_NO_REALLOC
     sched->debug_realloc = 1;
 #endif
-    const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
+    const char * GGML_SCHED_DEBUG_REALLOC = GGML_ENV_STR("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
@@ -2248,7 +2321,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
         // ON (2026-09-30, r26): with a single graph copy the full synchronize ran thousands of times
         // per offloaded prefill pass (measured 5.2 s at `-ub 8192`, and 861 -> 1072 t/s once the
         // events are created).  `GGML_SCHED_EVENTS=0` opts out.
-        static const bool sched_events = getenv("GGML_SCHED_EVENTS") == NULL || atoi(getenv("GGML_SCHED_EVENTS")) != 0;
+        static const bool sched_events = GGML_ENV_STR("GGML_SCHED_EVENTS") == NULL || atoi(GGML_ENV_STR("GGML_SCHED_EVENTS")) != 0;
         if (sched->n_copies > 1 || sched_events) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
@@ -2259,11 +2332,18 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
     {
-        const char * stage_env = getenv("GGML_SCHED_STAGE");
-        sched->stage_enabled = stage_env != NULL && atoi(stage_env) != 0;
-        const char * mode_env = getenv("GGML_SCHED_STAGE_MODE");
+        // Op-offload H2D staging (issue #50) is ON by default: it is what overlaps a host-resident
+        // weight upload with the previous split's compute, and on `-sm tensor -ncmoe` it is worth
+        // +64 % at pp8192 (3271 -> 5364).  GGML_SCHED_STAGE=0 opts out (the pre-staging behaviour);
+        // the adaptive width gate (`sched_stage_min_tokens`) still decides per split, so a narrow
+        // decode/verify batch never stages a whole expert tensor.  A backend that does not implement
+        // staging is unaffected (see the capability check below).
+        const char * stage_env = GGML_ENV_STR("GGML_SCHED_STAGE");
+        const bool stage_forced = stage_env != NULL && atoi(stage_env) != 0;
+        sched->stage_enabled = stage_env == NULL || atoi(stage_env) != 0;
+        const char * mode_env = GGML_ENV_STR("GGML_SCHED_STAGE_MODE");
         sched->stage_mode = mode_env != NULL ? atoi(mode_env) : 1;
-        const char * slots_env = getenv("GGML_SCHED_STAGE_SLOTS");
+        const char * slots_env = GGML_ENV_STR("GGML_SCHED_STAGE_SLOTS");
         sched->stage_n_slots = slots_env != NULL ? atoi(slots_env) : GGML_SCHED_STAGE_SLOTS_DEFAULT;
         if (sched->stage_n_slots < 1) {
             sched->stage_n_slots = 1;
@@ -2281,8 +2361,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
                 }
             }
             if (!stage_capable) {
-                GGML_LOG_WARN("%s: GGML_SCHED_STAGE=1 but no backend supports it; staging inactive\n",
-                              __func__);
+                if (stage_forced) {
+                    GGML_LOG_WARN("%s: GGML_SCHED_STAGE=1 but no backend supports it; staging inactive\n",
+                                  __func__);
+                }
+                sched->stage_enabled = false;
             }
         }
     }

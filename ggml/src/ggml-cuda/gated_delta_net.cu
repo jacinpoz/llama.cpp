@@ -330,7 +330,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // async fault inside a launched kernel is NOT caught here and surfaces at the next sync point.
     if (!kda && n_tokens > 1 &&
         (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
-        const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
+        static const char * env = getenv("GGML_CUDA_GDN_CHUNKED");
         if (env == nullptr || strcmp(env, "0") != 0) {
             // Minimum batch size that may take the whole-batch chunked path.  A constant for
             // K <= 16 (see above); the floors at K and n_rs_batch keep deeper drafts and every
@@ -343,7 +343,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
 #if defined(GGML_USE_HIP) && defined(__HIP_PLATFORM_AMD__)
                 const int cc_c = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
                 const bool bf16_rdna_c = GGML_CUDA_CC_IS_RDNA4(cc_c) || GGML_CUDA_CC_IS_RDNA3(cc_c);
-                const char * envb_c = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
+                static const char * envb_c = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
                 const bool want_bf16_c = bf16_rdna_c && S_v == 128 &&
                     (envb_c == nullptr || strcmp(envb_c, "0") != 0);
                 if (want_bf16_c) {

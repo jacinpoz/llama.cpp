@@ -1134,11 +1134,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[l]];
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * l));
 
-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-            const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+            const int grid0 = apply_ksigns(grid_pos.x, signs, 0);
 
-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-            const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+            const int grid1 = apply_ksigns(grid_pos.y, signs, 4);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*sram_stride + 8*kqsx + (2*l + 0)] = grid0;
@@ -1197,11 +1195,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l] & 0x1FF];
             const uint32_t signs = unpack_ksigns(q2[l] >> 9);
 
-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-            const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+            const int grid_l = apply_ksigns(grid_pos.x, signs, 0);
 
-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-            const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+            const int grid_h = apply_ksigns(grid_pos.y, signs, 4);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*sram_stride + 8*kqsx + (2*l + 0)] = grid_l;
@@ -1331,11 +1327,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             const int2 grid_pos = make_int2(iq3xxs_grid[q3[2*l+0]], iq3xxs_grid[q3[2*l+1]]);
             const uint32_t signs = unpack_ksigns(aux32 >> (7*l));
 
-            const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-            const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+            const int grid_l = apply_ksigns(grid_pos.x, signs, 0);
 
-            const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-            const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+            const int grid_h = apply_ksigns(grid_pos.y, signs, 4);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
             x_qs[i*sram_stride + 8*kqsx + (2*l + 0)] = grid_l;

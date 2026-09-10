@@ -8618,6 +8618,21 @@ void ggml_compute_forward_top_k(
     }
 }
 
+// V3 derived kq mask (see ggml_flash_attn_ext_add_kq_derived): the mask tensor is absent and each
+// cell's value is derived from the cell's position and the token's visibility window.  Reference
+// semantics - the packed mask holds exactly these values.
+static inline float kq_derived_mask_value(
+        const struct ggml_tensor * cell_pos,
+        const struct ggml_tensor * tok_lo,
+        const struct ggml_tensor * tok_hi,
+        int64_t cell, int64_t tok) {
+    const int32_t p  = ((const int32_t *) cell_pos->data)[cell];
+    const int32_t lo = ((const int32_t *) tok_lo  ->data)[tok];
+    const int32_t hi = ((const int32_t *) tok_hi  ->data)[tok];
+
+    return p >= lo && p <= hi ? 0.0f : -INFINITY;
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8631,6 +8646,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+
+    const ggml_tensor * cell_pos = dst->src[5];
+    const ggml_tensor * tok_lo   = dst->src[6];
+    const ggml_tensor * tok_hi   = dst->src[7];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8743,7 +8762,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) :
+                    (cell_pos ? slope*kq_derived_mask_value(cell_pos, tok_lo, tok_hi, ic, iq1) : 0.0f);
             if (mv == -INFINITY) {
                 continue;
             }
@@ -8865,6 +8885,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+
+    const ggml_tensor * cell_pos = dst->src[5];
+    const ggml_tensor * tok_lo   = dst->src[6];
+    const ggml_tensor * tok_hi   = dst->src[7];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9003,12 +9027,14 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             const int kv_tile = (int)std::min((int64_t)KV_TILE_SZ, nek1 - ic);
 
             // skip the tile entirely if all the masks are -inf
-            if (mask) {
+            if (mask || cell_pos) {
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
-                    const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+                    const ggml_fp16_t * mp_row = mask ? (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
                     for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                        mask32[tq * KV_TILE_SZ + tk] = mp_row
+                            ? slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk])
+                            : slope * kq_derived_mask_value(cell_pos, tok_lo, tok_hi, ic + tk, iq1 + tq);
                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
                             can_skip = false;
                         }
@@ -9384,6 +9410,12 @@ static void ggml_compute_forward_flash_attn_qsa_f32(
     const ggml_tensor * v    = dst->src[2];
     const ggml_tensor * idx  = dst->src[3];
     const ggml_tensor * mask = dst->src[4];
+
+    // the derived-visibility form (cell_vis/q_vis, src5/src6) carries no mask tensor; the CUDA
+    // kernel computes the per-cell value inline.  This reference does not implement it.
+    if (dst->src[5] != nullptr) {
+        GGML_ABORT("flash_attn_qsa: the derived cell visibility requires the CUDA backend");
+    }
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -12639,10 +12671,15 @@ static void ggml_compute_forward_indexer_topk_impl(
     const ggml_tensor * score    = dst->src[0];
     const ggml_tensor * cell_blk = dst->src[1];
     const ggml_tensor * additive = dst->src[2];
+    const ggml_tensor * cell_pos = dst->src[3];
+    const ggml_tensor * q_pos    = dst->src[4];
+    const ggml_tensor * blk_idx  = dst->src[5];
+    const ggml_tensor * blk_tail = dst->src[6];
+    const ggml_tensor * blk_cells = dst->src[7];
 
     GGML_ASSERT(score->type    == GGML_TYPE_F32);
     GGML_ASSERT(cell_blk->type == GGML_TYPE_I32);
-    GGML_ASSERT(additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32);
+    GGML_ASSERT(additive == nullptr || additive->type == GGML_TYPE_F16 || additive->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type      == GGML_TYPE_I32);
 
     const int k = ggml_get_op_params_i32(dst, 0);
@@ -12652,18 +12689,45 @@ static void ggml_compute_forward_indexer_topk_impl(
     const int64_t n_stream = score->ne[2];
     const int64_t n_kv     = cell_blk->ne[0];
 
+    // [QSA_SCORE_BOUNDS] a trimmed score holds only the visible prefix, so cells of trimmed
+    // blocks (cell_blk[c] >= n_blocks) must not index it.  Under the bound's single-sequence
+    // precondition the cache is contiguous, so those cells are exactly c >= n_blocks*r.
+    const int64_t r_cells = (blk_cells != nullptr && n_blocks > 0) ? blk_cells->ne[0]/n_blocks : 0;
+    const int64_t n_cells = r_cells > 0 ? std::min<int64_t>(n_kv, n_blocks*r_cells) : n_kv;
+
     const float  * score_d   = (const float  *) score->data;
     const int    * cell_d    = (const int    *) cell_blk->data;
     int          * dst_d     = (int          *) dst->data;
 
-    std::vector<float> vals(n_kv);
+    std::vector<float> vals(n_cells);
 
     // cell_blk is [n_kv, n_stream]: stream s rows at c + s*n_kv, s = row/n_tps
     const int64_t s0 = 0;
     GGML_UNUSED(s0);
     const auto cell_value = [&](int64_t c, int64_t row) -> float {
-        const int b = cell_d[c + (row / n_tps)*n_kv];
-        const float sc = score_d[b + row*n_blocks];
+        const int64_t s = row / n_tps;
+        const int64_t t = row % n_tps;
+        const int b = cell_d[c + s*n_kv];
+        float sc = score_d[b + row*n_blocks];
+
+        // derived per-block bias: src5 folds in the block bookkeeping, src6 the tail start
+        if (blk_idx != nullptr) {
+            const int    * blk_d = (const int *) blk_idx->data;
+            const int    * tail_d = (const int *) blk_tail->data;
+            const int bi = blk_d[b + s*n_blocks];
+
+            sc += bi < 0 ? -INFINITY : (bi >= tail_d[t + s*n_tps] ? 1e9f : 0.0f);
+        }
+
+        // derived visibility: same predicate as set_input_kq_mask_impl
+        if (cell_pos != nullptr) {
+            const int    * pos_d = (const int *) cell_pos->data;
+            const int    * q_d   = (const int *) q_pos->data;
+            const int cp = pos_d[c + s*n_kv];
+
+            return sc + (cp >= 0 && cp <= q_d[t + s*n_tps] ? 0.0f : -INFINITY);
+        }
+
         if (additive->type == GGML_TYPE_F32) {
             const float * add_d = (const float *) additive->data;
             return sc + add_d[c + row*n_kv];
@@ -12675,24 +12739,24 @@ static void ggml_compute_forward_indexer_topk_impl(
     // dst is [k, n_tps, 1, n_stream]; cell_blk is [n_kv, n_stream], so the
     // stream stride of cell_blk matches a dst row stride of k cells
     for (int64_t row = 0; row < n_tps*n_stream; ++row) {
-        for (int64_t c = 0; c < n_kv; ++c) {
+        for (int64_t c = 0; c < n_cells; ++c) {
             vals[c] = cell_value(c, row);
         }
 
         // the k-th largest value is the selection threshold
-        const int64_t kn = std::min<int64_t>(k, n_kv);
+        const int64_t kn = std::min<int64_t>(k, n_cells);
         std::nth_element(vals.begin(), vals.begin() + kn - 1, vals.end(),
                 [](float a, float b) { return a > b; });
         const float thr = vals[kn - 1];
 
         int * row_dst = dst_d + row*k;
         int pos = 0;
-        for (int64_t c = 0; c < n_kv && pos < kn; ++c) {
+        for (int64_t c = 0; c < n_cells && pos < kn; ++c) {
             if (cell_value(c, row) > thr) {
                 row_dst[pos++] = (int) c;
             }
         }
-        for (int64_t c = 0; c < n_kv && pos < kn; ++c) {
+        for (int64_t c = 0; c < n_cells && pos < kn; ++c) {
             if (cell_value(c, row) == thr) {
                 row_dst[pos++] = (int) c;
             }

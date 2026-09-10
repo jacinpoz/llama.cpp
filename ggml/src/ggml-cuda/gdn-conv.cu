@@ -11,7 +11,9 @@
 // single-device graphs only.  GGML_CUDA_CONV_FUSION_MULTI=1 forces it back on (A/B / fix validation)
 // and GGML_CUDA_DISABLE_CONV_FUSION=1 is the explicit off switch.
 static bool gdn_conv_enabled() {
-    if (getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr) return false;
+    // Cache the switches: this runs once per conv launch, and getenv() is expensive on Windows.
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_CONV_FUSION") != nullptr;
+    if (disabled) return false;
     static const bool multi_ok = getenv("GGML_CUDA_CONV_FUSION_MULTI") != nullptr;
     return multi_ok || ggml_backend_cuda_get_device_count() <= 1;
 }
