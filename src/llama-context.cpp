@@ -101,7 +101,9 @@ llama_context::llama_context(
     {
         int n_cuda_dev = 0;
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            if (ggml_backend_dev_is_cuda(ggml_backend_dev_get(i))) {
+            ggml_backend_dev_t dev  = ggml_backend_dev_get(i);
+            std::string        name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+            if (name == "CUDA" || name == "ROCm" || name == "MUSA") {
                 n_cuda_dev++;
             }
         }
