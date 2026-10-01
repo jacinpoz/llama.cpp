@@ -383,8 +383,9 @@ gdn_bf16_kkt_cuda(
 
         // ---- store: one row of the inverse is 64 bf16, contiguous in HBM --------------------
         {
-            unsigned short * op = A_sc + ((int64_t) (c * GDN_BF16_BT) * H + hv) * GDN_BF16_BT
-                                      + (int64_t) nq * (GDN_BF16_BT * GDN_BF16_BT * H);
+            const int64_t n_chunks = gridDim.x;
+            unsigned short * op = A_sc + (int64_t) nq * (n_chunks * H * GDN_BF16_BT * GDN_BF16_BT)
+                                      + ((int64_t) (c * GDN_BF16_BT) * H + hv) * GDN_BF16_BT;
             const size_t orow = (size_t) H * GDN_BF16_BT;
             for (int r = tid / 8; r < rows; r += GDN_BF16_KKT_NTHR / 8) {
                 const int c8 = (tid & 7) * 8;
@@ -533,8 +534,8 @@ gdn_bf16_scan_cuda(
     for (int ci = 0; ci < nchunk; ++ci) {
         const int c0 = ci * GDN_BF16_BT, nval = min(GDN_BF16_BT, (int) n_tokens - c0);
         const int lim = nval - 1;
-        const unsigned short * ag = A_sc + ((int64_t) c0 * H + h) * GDN_BF16_BT
-                                        + (int64_t) nq * (GDN_BF16_BT * GDN_BF16_BT * H);
+        const unsigned short * ag = A_sc + (int64_t) nq * ((int64_t) nchunk * H * GDN_BF16_BT * GDN_BF16_BT)
+                                        + ((int64_t) c0 * H + h) * GDN_BF16_BT;
         const size_t ars = (size_t) H * GDN_BF16_BT;
         const float * qg = q + (int64_t) iq3 * sq3 + (int64_t) c0 * sq2 + hq * sq1;
         const size_t qrs = (size_t) sq2;   // token stride of q (permuted-safe)
