@@ -1377,10 +1377,10 @@ struct test_case {
         return false;
     }
 
-    test_status_t eval(ggml_backend_t backend1,
-                       ggml_backend_t backend2,
-                       const char *   op_names_filter,
-                       printer *      output_printer) {
+    virtual test_status_t eval(ggml_backend_t backend1,
+                               ggml_backend_t backend2,
+                               const char *   op_names_filter,
+                               printer *      output_printer) {
         mode = MODE_TEST;
 
         ggml_init_params params = {
@@ -1540,6 +1540,9 @@ struct test_case {
                 if (ff) { fwrite(f1.data(), sizeof(float), f1.size(), ff); fclose(ff); }
             }
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            if (strstr(ggml_op_desc(t1), "GATED_DELTA_NET") != nullptr || getenv("PRINT_NMSE") != nullptr) {
+                printf(" [NMSE=%.6e/tol=%.1e] ", err, ud->tc->max_err(ud->backend1));
+            }
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 // GDN bf16 debug: dump the first mismatches with indices + a diff histogram
@@ -4785,7 +4788,7 @@ struct test_gated_delta_net : public test_case {
             const char * envb = getenv("GGML_CUDA_GDN_CHUNKED_BF16");
             if ((env == nullptr || strcmp(env, "0") != 0) &&
                 (envb == nullptr || strcmp(envb, "0") != 0)) {
-                return 5e-2;
+                return 2.5e-5;
             }
         }
         return test_case::max_nmse_err();
@@ -4841,6 +4844,217 @@ struct test_gated_delta_net : public test_case {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+// GGML_OP_GATED_DELTA_NET Batch Invariance Test:
+// Compares batched GPU execution (n_seqs = N) against N independent single-sequence (n_seqs = 1) executions
+// on the SAME GPU backend. When sequence isolation is maintained, the operations are identical, yielding
+// bit-exact results (NMSE = 0.0000e+00). Multi-sequence state corruption (e.g. cross-sequence A_sc clobbering)
+// causes immediate mismatch.
+struct test_gated_delta_net_batch_invariance : public test_case {
+    const ggml_type type;
+
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int     v_repeat;
+
+    std::string vars() override {
+        return "invariance," + VARS_TO_STR5(type, head_count, head_size, n_seq_tokens, n_seqs);
+    }
+
+    double max_nmse_err() override {
+        return 1e-12;
+    }
+
+    test_gated_delta_net_batch_invariance(ggml_type type = GGML_TYPE_F32,
+            int64_t head_count = 16, int64_t head_size = 128, int64_t n_seq_tokens = 128, int64_t n_seqs = 2,
+            int v_repeat = 1)
+        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+          v_repeat(v_repeat) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type, head_size, head_count * v_repeat, n_seq_tokens, n_seqs);
+        ggml_tensor * g = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, head_size, head_size, head_count * v_repeat, n_seqs);
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+        return ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1, 1);
+    }
+
+    test_status_t eval(ggml_backend_t backend1,
+                       ggml_backend_t backend2,
+                       const char *   op_names_filter,
+                       printer *      output_printer) override {
+        GGML_UNUSED(backend2);
+        mode = MODE_TEST;
+
+        ggml_init_params params = {
+            /* .mem_size = */ ggml_tensor_overhead() * 128 + ggml_graph_overhead(),
+            /* .mem_base = */ NULL,
+            /* .no_alloc = */ true,
+        };
+
+        ggml_context_ptr ctx(ggml_init(params));
+        GGML_ASSERT(ctx);
+
+        ggml_tensor * out = build_graph(ctx.get());
+        current_op_name = op_desc(out);
+
+        if (!matches_filter(out, op_names_filter)) {
+            return test_status_t::SKIPPED;
+        }
+
+        // Check if backend1 supports the op
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != NULL; t = ggml_get_next_tensor(ctx.get(), t)) {
+            if (!ggml_backend_supports_op(backend1, t)) {
+                test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test",
+                                   false, false, "not supported");
+                print_test_result_locked(output_printer, result);
+                return test_status_t::NOT_SUPPORTED;
+            }
+        }
+
+        const size_t qk_len  = (size_t)head_size * head_count * n_seq_tokens * n_seqs;
+        const size_t v_len   = (size_t)head_size * (head_count * v_repeat) * n_seq_tokens * n_seqs;
+        const size_t g_len   = (size_t)1 * (head_count * v_repeat) * n_seq_tokens * n_seqs;
+        const size_t b_len   = (size_t)1 * (head_count * v_repeat) * n_seq_tokens * n_seqs;
+        const size_t s_len   = (size_t)head_size * head_size * (head_count * v_repeat) * n_seqs;
+        const size_t out_len = v_len;
+
+        std::vector<float> h_q(qk_len);
+        std::vector<float> h_k(qk_len);
+        std::vector<float> h_v(v_len);
+        std::vector<float> h_g(g_len);
+        std::vector<float> h_beta(b_len);
+        std::vector<float> h_state(s_len, 0.0f);
+
+        // Deterministic pseudo-random seed based on test parameters
+        std::mt19937 rng(42 + (uint32_t)head_size + (uint32_t)n_seq_tokens + (uint32_t)n_seqs + (uint32_t)v_repeat);
+        std::uniform_real_distribution<float> dist_qk(-1.0f, 1.0f);
+        std::uniform_real_distribution<float> dist_v(-0.3f, 5.0f);
+        std::uniform_real_distribution<float> dist_g(-20.0f, -1e-4f);
+        std::uniform_real_distribution<float> dist_b(0.0f, 1.0f);
+
+        for (auto & x : h_q)    { x = dist_qk(rng); }
+        for (auto & x : h_k)    { x = dist_qk(rng); }
+        for (auto & x : h_v)    { x = dist_v(rng); }
+        for (auto & x : h_g)    { x = dist_g(rng); }
+        for (auto & x : h_beta) { x = dist_b(rng); }
+
+        // 1. Batched GPU Execution (n_seqs = N)
+        std::vector<float> h_out_batched(out_len);
+        {
+            ggml_init_params p = { ggml_tensor_overhead() * 128 + ggml_graph_overhead(), NULL, true };
+            ggml_context_ptr c(ggml_init(p));
+            ggml_tensor * q_raw = ggml_new_tensor_4d(c.get(), type, head_size, head_count, n_seq_tokens, n_seqs);
+            ggml_tensor * k_raw = ggml_new_tensor_4d(c.get(), type, head_size, head_count, n_seq_tokens, n_seqs);
+            ggml_tensor * v_t   = ggml_new_tensor_4d(c.get(), type, head_size, head_count * v_repeat, n_seq_tokens, n_seqs);
+            ggml_tensor * g_t   = ggml_new_tensor_4d(c.get(), type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
+            ggml_tensor * b_t   = ggml_new_tensor_4d(c.get(), type, 1, head_count * v_repeat, n_seq_tokens, n_seqs);
+            ggml_tensor * s_t   = ggml_new_tensor_4d(c.get(), type, head_size, head_size, head_count * v_repeat, n_seqs);
+
+            ggml_tensor * q_t = ggml_l2_norm(c.get(), q_raw, 1e-6f);
+            ggml_tensor * k_t = ggml_l2_norm(c.get(), k_raw, 1e-6f);
+            ggml_tensor * out_t = ggml_gated_delta_net(c.get(), q_t, k_t, v_t, g_t, b_t, s_t, 1, 1);
+
+            ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(c.get(), backend1));
+            if (!buf) {
+                test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, false, "failed to allocate batched tensors");
+                print_test_result_locked(output_printer, result);
+                return test_status_t::FAIL;
+            }
+
+            ggml_backend_tensor_set(q_raw, h_q.data(), 0, qk_len * sizeof(float));
+            ggml_backend_tensor_set(k_raw, h_k.data(), 0, qk_len * sizeof(float));
+            ggml_backend_tensor_set(v_t,   h_v.data(), 0, v_len * sizeof(float));
+            ggml_backend_tensor_set(g_t,   h_g.data(), 0, g_len * sizeof(float));
+            ggml_backend_tensor_set(b_t,   h_beta.data(), 0, b_len * sizeof(float));
+            ggml_backend_tensor_set(s_t,   h_state.data(), 0, s_len * sizeof(float));
+
+            ggml_cgraph * gf_b = ggml_new_graph(c.get());
+            ggml_build_forward_expand(gf_b, out_t);
+
+            ggml_status status = ggml_backend_graph_compute(backend1, gf_b);
+            if (status != GGML_STATUS_SUCCESS) {
+                test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, false, "batched compute failed");
+                print_test_result_locked(output_printer, result);
+                return test_status_t::FAIL;
+            }
+
+            ggml_backend_tensor_get(out_t, h_out_batched.data(), 0, out_len * sizeof(float));
+        }
+
+        // 2. Single-Sequence GPU Executions (N separate calls with n_seqs = 1)
+        const size_t qk_seq_stride  = (size_t)head_size * head_count * n_seq_tokens;
+        const size_t v_seq_stride   = (size_t)head_size * (head_count * v_repeat) * n_seq_tokens;
+        const size_t g_seq_stride   = (size_t)1 * (head_count * v_repeat) * n_seq_tokens;
+        const size_t b_seq_stride   = (size_t)1 * (head_count * v_repeat) * n_seq_tokens;
+        const size_t s_seq_stride   = (size_t)head_size * head_size * (head_count * v_repeat);
+        const size_t out_seq_stride = v_seq_stride;
+
+        std::vector<float> h_out_single(out_len);
+
+        for (int64_t seq = 0; seq < n_seqs; ++seq) {
+            ggml_init_params p = { ggml_tensor_overhead() * 128 + ggml_graph_overhead(), NULL, true };
+            ggml_context_ptr c(ggml_init(p));
+            ggml_tensor * q_raw = ggml_new_tensor_4d(c.get(), type, head_size, head_count, n_seq_tokens, 1);
+            ggml_tensor * k_raw = ggml_new_tensor_4d(c.get(), type, head_size, head_count, n_seq_tokens, 1);
+            ggml_tensor * v_t   = ggml_new_tensor_4d(c.get(), type, head_size, head_count * v_repeat, n_seq_tokens, 1);
+            ggml_tensor * g_t   = ggml_new_tensor_4d(c.get(), type, 1, head_count * v_repeat, n_seq_tokens, 1);
+            ggml_tensor * b_t   = ggml_new_tensor_4d(c.get(), type, 1, head_count * v_repeat, n_seq_tokens, 1);
+            ggml_tensor * s_t   = ggml_new_tensor_4d(c.get(), type, head_size, head_size, head_count * v_repeat, 1);
+
+            ggml_tensor * q_t = ggml_l2_norm(c.get(), q_raw, 1e-6f);
+            ggml_tensor * k_t = ggml_l2_norm(c.get(), k_raw, 1e-6f);
+            ggml_tensor * out_t = ggml_gated_delta_net(c.get(), q_t, k_t, v_t, g_t, b_t, s_t, 1, 1);
+
+            ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(c.get(), backend1));
+            if (!buf) {
+                test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, false, "failed to allocate single tensors");
+                print_test_result_locked(output_printer, result);
+                return test_status_t::FAIL;
+            }
+
+            ggml_backend_tensor_set(q_raw, h_q.data() + seq * qk_seq_stride, 0, qk_seq_stride * sizeof(float));
+            ggml_backend_tensor_set(k_raw, h_k.data() + seq * qk_seq_stride, 0, qk_seq_stride * sizeof(float));
+            ggml_backend_tensor_set(v_t,   h_v.data() + seq * v_seq_stride,  0, v_seq_stride * sizeof(float));
+            ggml_backend_tensor_set(g_t,   h_g.data() + seq * g_seq_stride,  0, g_seq_stride * sizeof(float));
+            ggml_backend_tensor_set(b_t,   h_beta.data() + seq * b_seq_stride, 0, b_seq_stride * sizeof(float));
+            ggml_backend_tensor_set(s_t,   h_state.data() + seq * s_seq_stride, 0, s_seq_stride * sizeof(float));
+
+            ggml_cgraph * gf_s = ggml_new_graph(c.get());
+            ggml_build_forward_expand(gf_s, out_t);
+
+            ggml_status status = ggml_backend_graph_compute(backend1, gf_s);
+            if (status != GGML_STATUS_SUCCESS) {
+                test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", true, false, "single compute failed");
+                print_test_result_locked(output_printer, result);
+                return test_status_t::FAIL;
+            }
+
+            ggml_backend_tensor_get(out_t, h_out_single.data() + seq * out_seq_stride, 0, out_seq_stride * sizeof(float));
+        }
+
+        // 3. Batch Invariance Verification: Batched GPU vs Single-Sequence GPU
+        double err = nmse(h_out_batched.data(), h_out_single.data(), out_len);
+        if (strstr(current_op_name.c_str(), "GATED_DELTA_NET") != nullptr || getenv("PRINT_NMSE") != nullptr) {
+            printf(" [NMSE=%.6e/tol=1.0e-12] ", err);
+        }
+
+        const double tol = 1e-12;
+        const bool passed = (err <= tol);
+
+        test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test",
+                           true, passed, passed ? "" : "batch invariance failure");
+        print_test_result_locked(output_printer, result);
+
+        return passed ? test_status_t::OK : test_status_t::FAIL;
     }
 };
 
@@ -11407,6 +11621,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 2, 3));
+    // multi-sequence, multi-chunk bf16 chunked-GDN cases (A_sc per-sequence stride; Antigravity 2026-10-01)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 128, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 150, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 150, 4, 3));
+    // multi-sequence GDN batch invariance (bit-exact verification: batched n_seqs=N vs N x n_seqs=1 single-seq runs)
+    test_cases.emplace_back(new test_gated_delta_net_batch_invariance(GGML_TYPE_F32, 16, 128, 128, 2, 1));
+    test_cases.emplace_back(new test_gated_delta_net_batch_invariance(GGML_TYPE_F32, 16, 128, 150, 4, 1));
+    test_cases.emplace_back(new test_gated_delta_net_batch_invariance(GGML_TYPE_F32, 32, 128, 512, 4, 1));
+    test_cases.emplace_back(new test_gated_delta_net_batch_invariance(GGML_TYPE_F32, 16, 128, 150, 4, 3));
+    test_cases.emplace_back(new test_gated_delta_net_batch_invariance(GGML_TYPE_F32, 16, 128, 1024, 2, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
@@ -12049,6 +12274,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1, 3));
+
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 2, 3));
 
     // lightning_indexer
