@@ -2676,8 +2676,13 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
-    result.cache_type_k  = params_spec.cache_type_k;
-    result.cache_type_v  = params_spec.cache_type_v;
+    // an MTP draft context runs the target model's own weights on the same device,
+    // so it should follow the target's KV cache types. A real draft model is a
+    // different model and keeps its own (draft) cache types.
+    if (has_draft) {
+        result.cache_type_k = params_spec.cache_type_k;
+        result.cache_type_v = params_spec.cache_type_v;
+    }
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
