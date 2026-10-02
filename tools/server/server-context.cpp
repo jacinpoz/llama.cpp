@@ -1,4 +1,7 @@
 #include "server-context.h"
+#include <list>
+#include <cstdio>
+#include <cstring>
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -829,6 +832,68 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 //
 // server_context_impl (private implementation)
 //
+
+
+// R9 (local patch, 2026-10-02): slot save/restore for hybrid recurrent models (Qwen3.5/3.6 Gated DeltaNet).
+// The slot file holds the tokens + full seq state, but not the context checkpoints. Recurrent layers cannot be truncated,
+// so when the next prompt diverges from the saved tokens (e.g. the re-rendered assistant reply) the server needs a
+// checkpoint before the divergence; without them a restored slot reprocesses from token 0 (cache_n = 0). The MTP draft
+// context state was not saved either. The sidecar <file>.ckpt stores both. Missing/invalid sidecar = old behaviour.
+static const char R9_MAGIC[8] = {'K','V','N','C','K','P','T','1'};
+
+static void r9_put_blob(FILE * f, const std::vector<uint8_t> & v) {
+    const uint64_t n = v.size(); fwrite(&n, sizeof(n), 1, f); if (n) fwrite(v.data(), 1, n, f);
+}
+static bool r9_get_blob(FILE * f, std::vector<uint8_t> & v) {
+    uint64_t n = 0; if (fread(&n, sizeof(n), 1, f) != 1 || n > (1ull << 36)) return false;
+    v.resize(n); return n == 0 || fread(v.data(), 1, n, f) == n;
+}
+
+static bool r9_save_sidecar(const std::string & path, const std::list<common_prompt_checkpoint> & ckpts,
+                            llama_context * ctx_dft, llama_seq_id seq) {
+    FILE * f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    fwrite(R9_MAGIC, 1, sizeof(R9_MAGIC), f);
+    const uint64_t n = ckpts.size(); fwrite(&n, sizeof(n), 1, f);
+    for (const auto & c : ckpts) {
+        const int64_t nt = c.n_tokens; const int32_t a = c.pos_min, b = c.pos_max;
+        fwrite(&nt, sizeof(nt), 1, f); fwrite(&a, sizeof(a), 1, f); fwrite(&b, sizeof(b), 1, f);
+        r9_put_blob(f, c.data_tgt); r9_put_blob(f, c.data_dft); r9_put_blob(f, c.data_spec);
+    }
+    std::vector<uint8_t> dft;
+    if (ctx_dft) {
+        dft.resize(llama_state_seq_get_size(ctx_dft, seq));
+        if (!dft.empty()) dft.resize(llama_state_seq_get_data(ctx_dft, dft.data(), dft.size(), seq));
+    }
+    r9_put_blob(f, dft);
+    const bool ok = ferror(f) == 0;
+    fclose(f);
+    return ok;
+}
+
+static bool r9_load_sidecar(const std::string & path, std::list<common_prompt_checkpoint> & ckpts,
+                            llama_context * ctx_dft, llama_seq_id seq, size_t & n_bytes) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char magic[8]; uint64_t n = 0; bool ok = fread(magic, 1, 8, f) == 8 && memcmp(magic, R9_MAGIC, 8) == 0 &&
+                                              fread(&n, sizeof(n), 1, f) == 1 && n < 4096;
+    std::list<common_prompt_checkpoint> out;
+    for (uint64_t i = 0; ok && i < n; ++i) {
+        auto & c = out.emplace_back();
+        int64_t nt = 0; int32_t a = 0, b = 0;
+        ok = fread(&nt, sizeof(nt), 1, f) == 1 && fread(&a, sizeof(a), 1, f) == 1 && fread(&b, sizeof(b), 1, f) == 1 &&
+             r9_get_blob(f, c.data_tgt) && r9_get_blob(f, c.data_dft) && r9_get_blob(f, c.data_spec);
+        c.n_tokens = nt; c.pos_min = a; c.pos_max = b;
+    }
+    std::vector<uint8_t> dft;
+    ok = ok && r9_get_blob(f, dft);
+    n_bytes = ok ? (size_t) ftell(f) : 0;
+    fclose(f);
+    if (!ok) return false;
+    if (ctx_dft && !dft.empty() && llama_state_seq_set_data(ctx_dft, dft.data(), dft.size(), seq) == 0) return false;
+    ckpts = std::move(out);
+    return true;
+}
 
 struct server_context_impl {
     friend struct server_context;
@@ -2577,6 +2642,13 @@ private:
                         break;
                     }
 
+                    // R9: checkpoints + MTP draft state sidecar (best effort; never fails the save)
+                    if (!r9_save_sidecar(filepath + ".ckpt", slot->prompt.checkpoints, ctx_dft, slot->id)) {
+                        SRV_WRN("R9: could not write checkpoint sidecar %s.ckpt\n", filepath.c_str());
+                    } else {
+                        SRV_INF("R9: saved %zu checkpoints (+ draft state) for slot %d\n", slot->prompt.checkpoints.size(), slot->id);
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2636,6 +2708,13 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // R9: rebuild context checkpoints + MTP draft state from the sidecar, if present
+                        size_t n_ckpt_bytes = 0;
+                        if (r9_load_sidecar(filepath + ".ckpt", slot->prompt.checkpoints, ctx_dft, slot->id, n_ckpt_bytes)) {
+                            SRV_INF("R9: restored %zu checkpoints (+ draft state, %.1f MiB) for slot %d\n",
+                                    slot->prompt.checkpoints.size(), n_ckpt_bytes / 1048576.0, slot->id);
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
