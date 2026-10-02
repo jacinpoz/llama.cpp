@@ -1,5 +1,7 @@
 #include "speculative.h"
 
+#include <cstdlib>
+
 #include "common.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -2685,6 +2687,20 @@ common_params common_base_params_to_speculative(const common_params & params) {
     }
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
+
+    // P-OUT (local patch, 2026-10-02): an MTP draft context processes the prompt in its own n_ubatch chunks and only
+    // decodes a few tokens per step, but it inherits the target n_ubatch. Every context allocates a host-side compute
+    // buffer for the attention mask of ~n_ctx_seq x n_ubatch x 2 bytes; on ROCm that is hipHostMalloc memory (charged
+    // to the process memory cgroup, unreclaimable): 1 GiB at 131072 x 4096. LLAMA_SPEC_DRAFT_UBATCH caps the MTP draft
+    // context n_ubatch (n_batch is kept, so batch sizes seen by callers do not change).
+    if (!has_draft) {
+        if (const char * e = getenv("LLAMA_SPEC_DRAFT_UBATCH")) {
+            const int ub = atoi(e);
+            if (ub > 0 && ub < (int) result.n_ubatch) {
+                result.n_ubatch = ub;
+            }
+        }
+    }
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types
