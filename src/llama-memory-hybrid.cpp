@@ -211,6 +211,12 @@ llama_memory_recurrent * llama_memory_hybrid::get_mem_recr() const {
     return mem_recr.get();
 }
 
+void llama_memory_hybrid::set_upload_backend(ggml_backend_t backend) {
+    if (mem_attn) {
+        mem_attn->set_upload_backend(backend);
+    }
+}
+
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status status) : status(status) {}
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem) :

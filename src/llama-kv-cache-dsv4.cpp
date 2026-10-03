@@ -1725,6 +1725,21 @@ void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubat
     }
 }
 
+void llama_kv_cache_dsv4::set_upload_backend(ggml_backend_t backend) {
+    if (kv_raw) {
+        kv_raw->set_upload_backend(backend);
+    }
+    if (kv_csa) {
+        kv_csa->set_upload_backend(backend);
+    }
+    if (kv_hca) {
+        kv_hca->set_upload_backend(backend);
+    }
+    if (kv_lid) {
+        kv_lid->set_upload_backend(backend);
+    }
+}
+
 void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
     if (seq_id < 0) {
         kv_csa->clear(data);

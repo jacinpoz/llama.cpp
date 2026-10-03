@@ -611,6 +611,23 @@ llama_context::llama_context(
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
             }
         }
+
+        if (memory && cparams.offload_kqv && !model.devices.empty() && model.n_gpu_layers() > 0) {
+            ggml_backend_t backend_target = nullptr;
+            const auto & dev_layer = model.dev_layer(0);
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev_layer) {
+                    backend_target = backend.get();
+                    break;
+                }
+            }
+            if (!backend_target && !backends.empty()) {
+                backend_target = backends[0].get();
+            }
+            if (backend_target) {
+                memory->set_upload_backend(backend_target);
+            }
+        }
     }
 
     // Initialize the full vocabulary token ids for backend samplers.
@@ -1697,14 +1714,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
-    // P-OUT step 2: a device-resident KQ mask is uploaded by the host (ggml_backend_tensor_set) instead of through the
-    // scheduler's stream-ordered split-input copy, so the previous ubatch's compute must be finished before we overwrite it
-    {
-        static const bool kq_on_dev = [] { const char * e = getenv("LLAMA_KQ_MASK_ON_DEVICE"); return e && atoi(e) != 0; }();
-        if (kq_on_dev) {
-            ggml_backend_sched_synchronize(sched.get());
-        }
-    }
 
     // set the input data for the input tensors
     {
@@ -2868,6 +2877,9 @@ void llama_context::kq_mask_to_device(ggml_cgraph * gf) {
         if (ggml_tensor * t = ggml_graph_get_tensor(gf, name)) {
             ggml_backend_sched_set_tensor_backend(sched.get(), t, gpu);
         }
+    }
+    if (memory) {
+        memory->set_upload_backend(gpu);
     }
 }
 

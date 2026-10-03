@@ -367,6 +367,36 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
+llama_kv_cache::~llama_kv_cache() {
+    for (size_t i = 0; i < N_KQ_STAGING; ++i) {
+        if (kq_staging[i].event) {
+            if (kq_staging[i].recorded) {
+                ggml_backend_event_synchronize(kq_staging[i].event);
+            }
+            ggml_backend_event_free(kq_staging[i].event);
+            kq_staging[i].event = nullptr;
+            kq_staging[i].recorded = false;
+        }
+    }
+}
+
+void llama_kv_cache::set_upload_backend(ggml_backend_t backend) {
+    if (upload_backend != backend) {
+        for (size_t i = 0; i < N_KQ_STAGING; ++i) {
+            if (kq_staging[i].event) {
+                if (kq_staging[i].recorded) {
+                    ggml_backend_event_synchronize(kq_staging[i].event);
+                }
+                ggml_backend_event_free(kq_staging[i].event);
+                kq_staging[i].event = nullptr;
+                kq_staging[i].recorded = false;
+            }
+        }
+        upload_backend = backend;
+        kq_staging_idx = 0;
+    }
+}
+
 void llama_kv_cache::clear(bool data) {
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
@@ -1539,6 +1569,7 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
     }
 }
 
+
 struct args_set_input_kq_mask {
     const llama_hparams & hparams;
     const llama_ubatch  * ubatch;
@@ -1601,7 +1632,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
             const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
 
-            const uint64_t idst = n_kv*i;
+            const uint64_t idst = (uint64_t) n_kv * i;
 
             // for tokens of the same sequence, the mask is mostly the same, so we can reuse it
             // the only cells that could change are the ones that are with similar positions as the
@@ -1617,7 +1648,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 if (seq_srct.find(seq_id) != seq_srct.end()) {
                     const uint32_t srct = seq_srct[seq_id];
 
-                    const uint64_t idst_prev = n_kv*srct;
+                    const uint64_t idst_prev = (uint64_t) n_kv * srct;
 
                     std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
 
@@ -1633,7 +1664,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             for (uint32_t jj = 0; jj < n_kv; ++jj) {
                 uint32_t j = jj;
 
-                // we have an exiting mask for this sequence -> update just seq_idxs
+                // we have an existing mask for this sequence -> update just seq_idxs
                 if (!alibi) {
                     if (prev) {
                         if (jj >= idxs.size()) {
@@ -1747,17 +1778,6 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
-    // P-OUT step 2 (local patch, 2026-10-03): with LLAMA_KQ_MASK_ON_DEVICE the mask tensor lives in a GPU buffer (GTT on
-    // the APU) instead of the CPU backend's host compute buffer, which on ROCm is hipHostMalloc memory charged to the
-    // process memory cgroup (~n_ctx_seq x n_ubatch x 2 B = 1 GiB at 131072 x 4096). Fill a transient host copy of the
-    // ACTUAL tensor size (n_kv used, not the worst-case reserve) with the unchanged filler, then upload it.
-    std::vector<uint8_t> staging;
-    void * fill = dst->data;
-    if (!ggml_backend_buffer_is_host(dst->buffer)) {
-        staging.resize(ggml_nbytes(dst));
-        fill = staging.data();
-    }
-
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
 
@@ -1786,13 +1806,50 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_tps            =*/ n_tps,
     };
 
-    if (dst->type == GGML_TYPE_F16) {
-        set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) fill, causal_attn);
-    } else {
-        set_input_kq_mask_impl<float>(args, (float *) fill, causal_attn);
+    if (ggml_backend_buffer_is_host(dst->buffer)) {
+        if (dst->type == GGML_TYPE_F16) {
+            set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
+        } else {
+            set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+        }
+        return;
     }
-    if (!staging.empty()) {
-        ggml_backend_tensor_set(dst, staging.data(), 0, staging.size());
+
+    const size_t element_size = (dst->type == GGML_TYPE_F16) ? sizeof(ggml_fp16_t) : sizeof(float);
+    const size_t n_bytes = (size_t) n_tokens * n_kv * element_size;
+
+    auto & slot = kq_staging[kq_staging_idx];
+    if (slot.data.size() < n_bytes) {
+        slot.data.resize(n_bytes);
+    }
+
+    if (upload_backend) {
+        if (slot.event == nullptr) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(upload_backend);
+            if (dev) {
+                slot.event = ggml_backend_event_new(dev);
+            }
+        } else if (slot.recorded) {
+            ggml_backend_event_synchronize(slot.event);
+            slot.recorded = false;
+        }
+    }
+
+    if (dst->type == GGML_TYPE_F16) {
+        set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) slot.data.data(), causal_attn);
+    } else {
+        set_input_kq_mask_impl<float>(args, (float *) slot.data.data(), causal_attn);
+    }
+
+    if (upload_backend) {
+        ggml_backend_tensor_set_async(upload_backend, dst, slot.data.data(), 0, n_bytes);
+        if (slot.event) {
+            ggml_backend_event_record(slot.event, upload_backend);
+            slot.recorded = true;
+        }
+        kq_staging_idx = (kq_staging_idx + 1) % N_KQ_STAGING;
+    } else {
+        ggml_backend_tensor_set(dst, slot.data.data(), 0, n_bytes);
     }
 
     //const int64_t t_end = ggml_time_us();

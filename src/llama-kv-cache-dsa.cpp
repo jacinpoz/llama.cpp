@@ -179,6 +179,15 @@ llama_kv_cache * llama_kv_cache_dsa::get_lid() const {
     return kv_lid.get();
 }
 
+void llama_kv_cache_dsa::set_upload_backend(ggml_backend_t backend) {
+    if (kv_mla) {
+        kv_mla->set_upload_backend(backend);
+    }
+    if (kv_lid) {
+        kv_lid->set_upload_backend(backend);
+    }
+}
+
 //
 // llama_kv_cache_dsa_context
 //

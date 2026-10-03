@@ -280,6 +280,15 @@ llama_kv_cache * llama_kv_cache_iswa::get_swa() const {
     return kv_swa.get();
 }
 
+void llama_kv_cache_iswa::set_upload_backend(ggml_backend_t backend) {
+    if (kv_base) {
+        kv_base->set_upload_backend(backend);
+    }
+    if (kv_swa) {
+        kv_swa->set_upload_backend(backend);
+    }
+}
+
 //
 // llama_kv_cache_iswa_context
 //

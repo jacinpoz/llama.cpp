@@ -468,6 +468,13 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
     }
 }
 
+void llama_memory_hybrid_idx::set_upload_backend(ggml_backend_t backend) {
+    llama_memory_hybrid::set_upload_backend(backend);
+    if (mem_idx) {
+        mem_idx->set_upload_backend(backend);
+    }
+}
+
 void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
     // dropped directly, not via seq_rm: the recurrent cache may refuse it and then only the other two get cleared
     if (seq_id < 0) {
