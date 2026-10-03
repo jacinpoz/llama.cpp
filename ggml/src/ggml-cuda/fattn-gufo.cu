@@ -3,7 +3,7 @@
 // src/models/qwen36_35b_a3b/kernels/rocm/kernels.hip.cpp, DenseCausalAttentionKernel).
 //
 // Opt-in with GGML_CUDA_FA_GUFO_256=1. Only taken for prefill-shaped batches (n_q >= GGML_CUDA_FA_GUFO_MIN_Q,
-// default 64) with D = 256, n_head/n_head_kv = 8, F16 or Q8_0 K/V (Q8_0 is staged to F16 once per call),
+// default 32) with D = 256, n_head/n_head_kv = 8, F16 or Q8_0 K/V (Q8_0 is staged to F16 once per call),
 // no ALiBi/softcap/sinks, and either an explicit F16 mask or the derived (cell_pos/tok_lo/tok_hi) mask.
 //
 // Differences from the gufo original: visibility comes from the ggml mask (explicit or derived) instead of
@@ -31,7 +31,6 @@ namespace {
 constexpr int kD       = 256;
 constexpr int kGqa     = 8;   // query heads per KV head
 constexpr int kHeads   = 4;   // query heads per block (16-row blocks)
-constexpr int kKeys    = 16;  // keys per round (gufo: measured fastest)
 constexpr int kThreads = 256;
 
 using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
@@ -68,23 +67,48 @@ __device__ __forceinline__ float gufo_mask_value(const gufo_mask_args & m, int s
     return (p != INT_MIN && m.tok_lo[query] <= p && p <= m.tok_hi[query]) ? 0.0f : -INFINITY;
 }
 
-// Per (stream, 16-query tile): [first, last+1) KV cell visible to any live row; {0, 0} when none.
-__global__ void gufo_kv_bounds(const gufo_mask_args m, int2 * bounds, const int n_q, const int n_kv, const int n_tiles) {
+// Per (stream, 16-query tile): [first, last+1) KV cell visible to any live row ({0, 0} when none), plus a bitmap of
+// the kKeys-key rounds that contain at least one visible cell. With a unified KV cache the other slots' cells can sit
+// inside [first, last+1) (e.g. after a slot restore); the kernel skips their rounds instead of streaming them.
+template <int kKeys>
+__global__ void gufo_kv_bounds(const gufo_mask_args m, int2 * bounds, uint32_t * rounds, const int n_words,
+                               const int n_q, const int n_kv, const int n_tiles) {
     const int tile = blockIdx.x;
     const int seq  = blockIdx.y;
     const int q0   = tile*16;
     const int nr   = min(16, n_q - q0);
 
+    extern __shared__ uint32_t s_bits[];
+    for (int w = threadIdx.x; w < n_words; w += blockDim.x) {
+        s_bits[w] = 0;
+    }
+    __syncthreads();
+
     int lo = INT_MAX;
     int hi = -1;
-    for (int key = threadIdx.x; key < n_kv; key += blockDim.x) {
+    const int lane = threadIdx.x % 32;
+    for (int base = 0; base < n_kv; base += blockDim.x) {
+        const int key = base + threadIdx.x;   // a wave covers 32 consecutive keys (warp-uniform loop)
         bool any = false;
-        for (int r = 0; r < nr && !any; ++r) {
-            any = gufo_mask_value(m, seq, q0 + r, key) != -INFINITY;
+        if (key < n_kv) {
+            for (int r = 0; r < nr && !any; ++r) {
+                any = gufo_mask_value(m, seq, q0 + r, key) != -INFINITY;
+            }
         }
         if (any) {
             lo = min(lo, key);
             hi = max(hi, key);
+        }
+        const uint32_t vis = (uint32_t) __ballot(any);
+        if (lane == 0 && vis) {
+            const int key_w = key;   // first key of this wave (lane 0)
+            for (int g = 0; g < 32; g += kKeys) {
+                const uint32_t grp = kKeys == 32 ? vis : (vis >> g) & 0xFFFFu;
+                if (grp) {
+                    const int rd = (key_w + g) / kKeys;
+                    atomicOr(&s_bits[rd >> 5], 1u << (rd & 31));
+                }
+            }
         }
     }
     __shared__ int s_lo[kThreads];
@@ -99,16 +123,33 @@ __global__ void gufo_kv_bounds(const gufo_mask_args m, int2 * bounds, const int 
         }
         __syncthreads();
     }
+    uint32_t * out = rounds + (int64_t)(seq*n_tiles + tile)*n_words;
+    for (int w = threadIdx.x; w < n_words; w += blockDim.x) {
+        out[w] = s_bits[w];
+    }
     if (threadIdx.x == 0) {
         bounds[seq*n_tiles + tile] = s_hi[0] < 0 ? make_int2(0, 0) : make_int2(s_lo[0], s_hi[0] + 1);
     }
 }
 
+// next round >= kt with a visible cell, or kt_end
+__device__ __forceinline__ int gufo_next_round(const uint32_t * __restrict__ bits, int kt, const int kt_end) {
+    while (kt < kt_end) {
+        const uint32_t w = bits[kt >> 5] >> (kt & 31);
+        if (w) {
+            return min(kt + __ffs(w) - 1, kt_end);
+        }
+        kt = (kt | 31) + 1;
+    }
+    return kt_end;
+}
+
 // One block: 16 queries x kHeads query heads (one 16-row block each) of one KV head, one stream.
+template <int kKeys>
 __launch_bounds__(kThreads, 2) __global__ void gufo_attn_d256(
         const char * __restrict__ Q, const half * __restrict__ K, const half * __restrict__ V,
         float * __restrict__ dst, const gufo_mask_args m, const int2 * __restrict__ bounds,
-        const float scale, const int n_q, const int n_kv, const int n_head,
+        const uint32_t * __restrict__ rounds, const int n_words, const float scale, const int n_q, const int n_kv, const int n_head,
         const int64_t nb01, const int64_t nb02, const int64_t nb03,   // Q strides (bytes)
         const int64_t sk1, const int64_t sk2, const int64_t sk3,      // K strides (halves)
         const int64_t sv1, const int64_t sv2, const int64_t sv3) {    // V strides (halves)
@@ -125,6 +166,7 @@ __launch_bounds__(kThreads, 2) __global__ void gufo_attn_d256(
     constexpr int kPerLane       = kKeys/kLanes;
     constexpr int kKRegs         = kKeys*(kD/8)/kThreads;
     constexpr int kVRegs         = kKeys*kD/(kThreads*8);
+    static_assert(kKeys == 16 || kKeys == 32);
     static_assert(kLanes*kRows == kThreads && kKeys % kLanes == 0);
     static_assert(kSplit*kSTiles == 8 && kKStepsPerWave*kSplit == kD/16);
 
@@ -173,8 +215,9 @@ __launch_bounds__(kThreads, 2) __global__ void gufo_attn_d256(
     float running_sum = 0.0f;
 
     const int2 b       = bounds[seq*n_tiles_q + tile];
-    const int  kt_beg  = b.x / kKeys;
     const int  kt_end  = (b.y + kKeys - 1) / kKeys;
+    const uint32_t * rbits = rounds + (int64_t)(seq*n_tiles_q + tile)*n_words;
+    const int  kt_beg  = gufo_next_round(rbits, b.x / kKeys, kt_end);
 
     const int v_key   = lane % kKeys;
     const int v_slice = (tid / kKeys)*(kVRegs*8);
@@ -205,8 +248,9 @@ __launch_bounds__(kThreads, 2) __global__ void gufo_attn_d256(
         load_k(kt_beg*kKeys, k_cur);
         load_v(kt_beg*kKeys, v_cur);
     }
-    for (int kt = kt_beg; kt < kt_end; ++kt) {
-        const int key0 = kt*kKeys;
+    for (int kt = kt_beg; kt < kt_end; ) {
+        const int key0    = kt*kKeys;
+        const int kt_next = gufo_next_round(rbits, kt + 1, kt_end);
         __syncthreads();
 #pragma unroll
         for (int n = 0; n < kKRegs; ++n) {
@@ -214,9 +258,9 @@ __launch_bounds__(kThreads, 2) __global__ void gufo_attn_d256(
             *reinterpret_cast<uint4 *>(&kv_lds[(idx/(kD/8))*kKStride + (idx % (kD/8))*8]) = k_cur[n];
         }
         __syncthreads();
-        if (kt + 1 < kt_end) {
-            load_k(key0 + kKeys, k_pre);
-            load_v(key0 + kKeys, v_pre);
+        if (kt_next < kt_end) {
+            load_k(kt_next*kKeys, k_pre);
+            load_v(kt_next*kKeys, v_pre);
         }
         // S = Q K^T
         {
@@ -326,6 +370,7 @@ __launch_bounds__(kThreads, 2) __global__ void gufo_attn_d256(
         for (int n = 0; n < kVRegs; ++n) {
             v_cur[n] = v_pre[n];
         }
+        kt = kt_next;
     }
     if (tid % kLanes == 0) {
         row_sum[tid / kLanes] = running_sum;
@@ -350,15 +395,20 @@ __launch_bounds__(kThreads, 2) __global__ void gufo_attn_d256(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q, K, V, dst, m, bounds, scale, n_q, n_kv, n_head, nb01, nb02, nb03, sk1, sk2, sk3, sv1, sv2, sv3);
+    GGML_UNUSED_VARS(Q, K, V, dst, m, bounds, rounds, n_words, scale, n_q, n_kv, n_head, nb01, nb02, nb03, sk1, sk2, sk3, sv1, sv2, sv3);
     NO_DEVICE_CODE;
 #endif // GUFO_WMMA_DEVICE
 }
 
 } // namespace
 
+static int gufo_keys() {
+    static const int v = getenv("GGML_CUDA_FA_GUFO_KEYS") && atoi(getenv("GGML_CUDA_FA_GUFO_KEYS")) == 32 ? 32 : 16;
+    return v;
+}
+
 static int gufo_min_q() {
-    static const int v = getenv("GGML_CUDA_FA_GUFO_MIN_Q") ? atoi(getenv("GGML_CUDA_FA_GUFO_MIN_Q")) : 64;
+    static const int v = getenv("GGML_CUDA_FA_GUFO_MIN_Q") ? atoi(getenv("GGML_CUDA_FA_GUFO_MIN_Q")) : 32;
     return v;
 }
 
@@ -460,14 +510,25 @@ void ggml_cuda_flash_attn_ext_gufo(ggml_backend_cuda_context & ctx, ggml_tensor 
     }
 
     const int n_tiles = (n_q + 15)/16;
-    ggml_cuda_pool_alloc<int2> bounds(pool, (size_t) n_tiles*n_seq);
-    gufo_kv_bounds<<<dim3(n_tiles, n_seq, 1), dim3(kThreads, 1, 1), 0, stream>>>(m, bounds.ptr, n_q, n_kv, n_tiles);
-    CUDA_CHECK(cudaGetLastError());
-
+    const int keys    = gufo_keys();
+    const int n_words = ((n_kv + keys - 1)/keys + 31)/32;
+    ggml_cuda_pool_alloc<int2>     bounds(pool, (size_t) n_tiles*n_seq);
+    ggml_cuda_pool_alloc<uint32_t> rounds(pool, (size_t) n_tiles*n_seq*n_words);
+    const size_t smem_bits = (size_t) n_words*sizeof(uint32_t);
     const dim3 grid(n_tiles, (unsigned) (K->ne[2]*(kGqa/kHeads)), n_seq);
-    gufo_attn_d256<<<grid, dim3(kThreads, 1, 1), 0, stream>>>(
-        (const char *) Q->data, K_data, V_data, (float *) dst->data, m, bounds.ptr, scale, n_q, n_kv, (int) Q->ne[2],
-        Q->nb[1], Q->nb[2], Q->nb[3], sk1, sk2, sk3, sv1, sv2, sv3);
+    if (keys == 32) {
+        gufo_kv_bounds<32><<<dim3(n_tiles, n_seq, 1), dim3(kThreads, 1, 1), smem_bits, stream>>>(m, bounds.ptr, rounds.ptr, n_words, n_q, n_kv, n_tiles);
+        CUDA_CHECK(cudaGetLastError());
+        gufo_attn_d256<32><<<grid, dim3(kThreads, 1, 1), 0, stream>>>(
+            (const char *) Q->data, K_data, V_data, (float *) dst->data, m, bounds.ptr, rounds.ptr, n_words, scale, n_q, n_kv, (int) Q->ne[2],
+            Q->nb[1], Q->nb[2], Q->nb[3], sk1, sk2, sk3, sv1, sv2, sv3);
+    } else {
+        gufo_kv_bounds<16><<<dim3(n_tiles, n_seq, 1), dim3(kThreads, 1, 1), smem_bits, stream>>>(m, bounds.ptr, rounds.ptr, n_words, n_q, n_kv, n_tiles);
+        CUDA_CHECK(cudaGetLastError());
+        gufo_attn_d256<16><<<grid, dim3(kThreads, 1, 1), 0, stream>>>(
+            (const char *) Q->data, K_data, V_data, (float *) dst->data, m, bounds.ptr, rounds.ptr, n_words, scale, n_q, n_kv, (int) Q->ne[2],
+            Q->nb[1], Q->nb[2], Q->nb[3], sk1, sk2, sk3, sv1, sv2, sv3);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
