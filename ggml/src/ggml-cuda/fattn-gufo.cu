@@ -3,7 +3,7 @@
 // src/models/qwen36_35b_a3b/kernels/rocm/kernels.hip.cpp, DenseCausalAttentionKernel).
 //
 // Opt-in with GGML_CUDA_FA_GUFO_256=1. Only taken for prefill-shaped batches (n_q >= GGML_CUDA_FA_GUFO_MIN_Q,
-// default 32) with D = 256, n_head/n_head_kv = 8, F16 or Q8_0 K/V (Q8_0 is staged to F16 once per call),
+// default 32) with D = 256, n_head/n_head_kv = 8 or 6, F16, Q8_0 or Q5_0 K/V (quantized K/V is staged to F16 once per call),
 // no ALiBi/softcap/sinks, and either an explicit F16 mask or the derived (cell_pos/tok_lo/tok_hi) mask.
 //
 // Differences from the gufo original: visibility comes from the ggml mask (explicit or derived) instead of
@@ -29,8 +29,6 @@
 namespace {
 
 constexpr int kD       = 256;
-constexpr int kGqa     = 8;   // query heads per KV head
-constexpr int kHeads   = 4;   // query heads per block (16-row blocks)
 constexpr int kThreads = 256;
 
 using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
@@ -145,7 +143,8 @@ __device__ __forceinline__ int gufo_next_round(const uint32_t * __restrict__ bit
 }
 
 // One block: 16 queries x kHeads query heads (one 16-row block each) of one KV head, one stream.
-template <int kKeys>
+// GQA 8 runs 4 heads per block; GQA 6 (Qwen3.5/3.8 dense 27B) runs 2.
+template <int kKeys, int kGqa, int kHeads>
 __launch_bounds__(kThreads, 2) __global__ void gufo_attn_d256(
         const char * __restrict__ Q, const half * __restrict__ K, const half * __restrict__ V,
         float * __restrict__ dst, const gufo_mask_args m, const int2 * __restrict__ bounds,
@@ -439,9 +438,9 @@ bool ggml_cuda_fattn_gufo_supported(int device, const ggml_tensor * dst) {
     memcpy(&softcap,  (const float *) dst->op_params + 2, sizeof(float));
 
     if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || Q->nb[0] != sizeof(float)) return false;
-    if (K->type != V->type || (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0)) return false;
+    if (K->type != V->type || (K->type != GGML_TYPE_F16 && K->type != GGML_TYPE_Q8_0 && K->type != GGML_TYPE_Q5_0)) return false;
     if (Q->ne[0] != kD || K->ne[0] != kD || V->ne[0] != kD) return false;
-    if (K->ne[2] == 0 || Q->ne[2] != kGqa*K->ne[2] || V->ne[2] != K->ne[2]) return false;
+    if (K->ne[2] == 0 || (Q->ne[2] != 8*K->ne[2] && Q->ne[2] != 6*K->ne[2]) || V->ne[2] != K->ne[2]) return false;
     if (Q->ne[3] != K->ne[3] || V->ne[3] != K->ne[3]) return false;
     if (Q->ne[1] < gufo_min_q()) return false;
     if (max_bias != 0.0f || softcap != 0.0f || sinks) return false;
@@ -515,19 +514,33 @@ void ggml_cuda_flash_attn_ext_gufo(ggml_backend_cuda_context & ctx, ggml_tensor 
     ggml_cuda_pool_alloc<int2>     bounds(pool, (size_t) n_tiles*n_seq);
     ggml_cuda_pool_alloc<uint32_t> rounds(pool, (size_t) n_tiles*n_seq*n_words);
     const size_t smem_bits = (size_t) n_words*sizeof(uint32_t);
-    const dim3 grid(n_tiles, (unsigned) (K->ne[2]*(kGqa/kHeads)), n_seq);
+    const int gqa   = (int) (Q->ne[2]/K->ne[2]);
+    const int heads = gqa == 8 ? 4 : 2;
+    const dim3 grid(n_tiles, (unsigned) (K->ne[2]*(gqa/heads)), n_seq);
     if (keys == 32) {
         gufo_kv_bounds<32><<<dim3(n_tiles, n_seq, 1), dim3(kThreads, 1, 1), smem_bits, stream>>>(m, bounds.ptr, rounds.ptr, n_words, n_q, n_kv, n_tiles);
         CUDA_CHECK(cudaGetLastError());
-        gufo_attn_d256<32><<<grid, dim3(kThreads, 1, 1), 0, stream>>>(
+        if (gqa == 8) {
+            gufo_attn_d256<32, 8, 4><<<grid, dim3(kThreads, 1, 1), 0, stream>>>(
             (const char *) Q->data, K_data, V_data, (float *) dst->data, m, bounds.ptr, rounds.ptr, n_words, scale, n_q, n_kv, (int) Q->ne[2],
             Q->nb[1], Q->nb[2], Q->nb[3], sk1, sk2, sk3, sv1, sv2, sv3);
+        } else {
+            gufo_attn_d256<32, 6, 2><<<grid, dim3(kThreads, 1, 1), 0, stream>>>(
+            (const char *) Q->data, K_data, V_data, (float *) dst->data, m, bounds.ptr, rounds.ptr, n_words, scale, n_q, n_kv, (int) Q->ne[2],
+            Q->nb[1], Q->nb[2], Q->nb[3], sk1, sk2, sk3, sv1, sv2, sv3);
+        }
     } else {
         gufo_kv_bounds<16><<<dim3(n_tiles, n_seq, 1), dim3(kThreads, 1, 1), smem_bits, stream>>>(m, bounds.ptr, rounds.ptr, n_words, n_q, n_kv, n_tiles);
         CUDA_CHECK(cudaGetLastError());
-        gufo_attn_d256<16><<<grid, dim3(kThreads, 1, 1), 0, stream>>>(
+        if (gqa == 8) {
+            gufo_attn_d256<16, 8, 4><<<grid, dim3(kThreads, 1, 1), 0, stream>>>(
             (const char *) Q->data, K_data, V_data, (float *) dst->data, m, bounds.ptr, rounds.ptr, n_words, scale, n_q, n_kv, (int) Q->ne[2],
             Q->nb[1], Q->nb[2], Q->nb[3], sk1, sk2, sk3, sv1, sv2, sv3);
+        } else {
+            gufo_attn_d256<16, 6, 2><<<grid, dim3(kThreads, 1, 1), 0, stream>>>(
+            (const char *) Q->data, K_data, V_data, (float *) dst->data, m, bounds.ptr, rounds.ptr, n_words, scale, n_q, n_kv, (int) Q->ne[2],
+            Q->nb[1], Q->nb[2], Q->nb[3], sk1, sk2, sk3, sv1, sv2, sv3);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }
