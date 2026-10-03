@@ -656,6 +656,21 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
+    // R22 (local patch, 2026-10-03): truncated MTP draft vocabulary. LLAMA_MTP_DRAFT_VOCAB=K scores only ids [0, K)
+    // (BPE ids are merge-ordered, so low ids are the frequent ones) plus the special/added-token tail, instead of all
+    // n_vocab rows of the LM head (398 MiB at Q6_K per draft step). The other logits are -inf, so the logits buffer
+    // keeps its n_vocab layout and token ids need no mapping. The target still verifies every draft token, so output
+    // is unchanged (greedy) / exact (rejection sampling); a token outside the subset only costs a rejected draft.
+    static const int64_t n_dv_env = [] {
+        const char * e = getenv("LLAMA_MTP_DRAFT_VOCAB");
+        return e ? (int64_t) atoll(e) : (int64_t) 0;
+    }();
+    const int64_t n_vocab_h = head_w->ne[1];
+    int64_t n_tail = 0;
+    while (n_tail < n_vocab_h && !model.vocab.is_normal((llama_token) (n_vocab_h - 1 - n_tail))) {
+        n_tail++;
+    }
+    const int64_t n_dv = n_dv_env;
     if (mtp_draft != nullptr && head_w == model.output && n_outputs == 1) {
         // this context drafts over a row subset of the LM head: scatter its logits into a full-vocab row of -inf
         GGML_ASSERT(mtp_draft->n_keep == cparams.mtp_draft_vocab);
@@ -665,6 +680,25 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         cur = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_row), -INFINITY);
         cur = ggml_set_rows(ctx0, cur, ggml_reshape_2d(ctx0, sub, 1, n_sel), mtp_draft->ids);
         cur = ggml_reshape_2d(ctx0, cur, n_row, 1);
+    } else if (n_dv > 0 && head_s == nullptr && n_dv + n_tail < n_vocab_h) {
+        const int64_t n_mid = n_vocab_h - n_dv - n_tail;
+        ggml_tensor * w_lo = ggml_view_2d(ctx0, head_w, head_w->ne[0], n_dv, head_w->nb[1], 0);
+        ggml_tensor * lo   = ggml_mul_mat(ctx0, w_lo, cur);
+        cb(lo, "mtp_head_lo", -1);
+        // -inf filler for the skipped ids: ggml_fill needs a source of the right shape, any values
+        ggml_tensor * mid_src = n_mid <= n_dv
+                ? ggml_view_2d(ctx0, lo, n_mid, lo->ne[1], lo->nb[1], 0)
+                : ggml_pad(ctx0, lo, n_mid - n_dv, 0, 0, 0);
+        ggml_tensor * mid = ggml_fill(ctx0, mid_src, -INFINITY);
+        cb(mid, "mtp_head_mid", -1);
+        ggml_tensor * out = ggml_concat(ctx0, lo, mid, 0);
+        if (n_tail > 0) {
+            ggml_tensor * w_hi = ggml_view_2d(ctx0, head_w, head_w->ne[0], n_tail, head_w->nb[1], (size_t) (n_vocab_h - n_tail) * head_w->nb[1]);
+            ggml_tensor * hi   = ggml_mul_mat(ctx0, w_hi, cur);
+            cb(hi, "mtp_head_hi", -1);
+            out = ggml_concat(ctx0, out, hi, 0);
+        }
+        cur = out;
     } else {
         cur = build_lora_mm(head_w, cur, head_s);
     }
