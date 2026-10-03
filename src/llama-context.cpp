@@ -2862,10 +2862,10 @@ static void ubatch_prepare_reserve(
 // so the worst-case reserve does not size a host-pinned compute buffer for them (see llama_kv_cache::set_input_kq_mask)
 void llama_context::kq_mask_to_device(ggml_cgraph * gf) {
     static const bool enabled = [] { const char * e = getenv("LLAMA_KQ_MASK_ON_DEVICE"); return e && atoi(e) != 0; }();
-    // Only for contexts with a KV cache (the P-OUT target: the chat models). A cache-less context (non-causal embedding
-    // models) keeps the host mask: moving it made the embedding server pinned host memory grow with batch shape
+    // Only for causal contexts with a KV cache (the P-OUT target: the chat models). Non-causal (embedding) contexts
+    // keep the host mask: moving it made the embedding server pinned host memory grow with batch shape
     // (up to 3.8 GB, 2026-10-03) in combination with GGML_CUDA_MMB_F32SPLIT and flash-attn off.
-    if (!enabled || gf == nullptr || !memory) {
+    if (!enabled || gf == nullptr || !memory || !cparams.causal_attn) {
         return;
     }
     ggml_backend_t gpu = nullptr;
