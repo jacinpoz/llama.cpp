@@ -658,7 +658,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         cb(lo, "mtp_head_lo", -1);
         // -inf filler for the skipped ids: ggml_fill needs a source of the right shape, any values
         ggml_tensor * mid_src = n_mid <= n_dv
-                ? ggml_view_2d(ctx0, lo, n_mid, lo->ne[1], lo->nb[1], 0)
+                ? ggml_cont(ctx0, ggml_view_2d(ctx0, lo, n_mid, lo->ne[1], lo->nb[1], 0))
                 : ggml_pad(ctx0, lo, n_mid - n_dv, 0, 0, 0);
         ggml_tensor * mid = ggml_fill(ctx0, mid_src, -INFINITY);
         cb(mid, "mtp_head_mid", -1);
