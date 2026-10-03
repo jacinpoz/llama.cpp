@@ -11770,6 +11770,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
     // R25 gufo FA perf: Qwen3.6-35B prefill ubatch 4096 at depth (q8_0 KV, packed mask and derived)
+    // small batches at depth: where should gufo hand over to the tile kernel (GGML_CUDA_FA_GUFO_MIN_Q)?
+    for (int64_t nb : {16, 32, 64, 128, 512}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
     for (int64_t kv : {4096, 8192, 16384, 32768}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, 4096, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, 4096, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, true));
