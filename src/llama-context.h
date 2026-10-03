@@ -275,6 +275,8 @@ public:
     //   enabled, so the reserved buffers cover a batch the derived form cannot serve (see the note in
     //   graph_reserve).  Pass kq_mask_packed_reachable() for a worst-case reserve; the fused-op
     //   support probes must NOT set it - they verify the derived form is present in the graph.
+    void kq_mask_to_device(ggml_cgraph * gf); // P-OUT step 2 (opt-in, LLAMA_KQ_MASK_ON_DEVICE)
+
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
         bool packed_kq_mask = false);

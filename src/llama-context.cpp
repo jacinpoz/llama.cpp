@@ -1678,6 +1678,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        kq_mask_to_device(gf);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1694,6 +1695,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+    }
+
+    // P-OUT step 2: a device-resident KQ mask is uploaded by the host (ggml_backend_tensor_set) instead of through the
+    // scheduler's stream-ordered split-input copy, so the previous ubatch's compute must be finished before we overwrite it
+    {
+        static const bool kq_on_dev = [] { const char * e = getenv("LLAMA_KQ_MASK_ON_DEVICE"); return e && atoi(e) != 0; }();
+        if (kq_on_dev) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
     }
 
     // set the input data for the input tensors
@@ -2839,6 +2849,28 @@ static void ubatch_prepare_reserve(
     }
 }
 
+// P-OUT step 2: opt-in (LLAMA_KQ_MASK_ON_DEVICE=1) placement of the attention-mask graph inputs on the first GPU backend,
+// so the worst-case reserve does not size a host-pinned compute buffer for them (see llama_kv_cache::set_input_kq_mask)
+void llama_context::kq_mask_to_device(ggml_cgraph * gf) {
+    static const bool enabled = [] { const char * e = getenv("LLAMA_KQ_MASK_ON_DEVICE"); return e && atoi(e) != 0; }();
+    if (!enabled || gf == nullptr) {
+        return;
+    }
+    ggml_backend_t gpu = nullptr;
+    for (const auto & b : backends) {
+        const auto t = ggml_backend_dev_type(ggml_backend_get_device(b.get()));
+        if (t == GGML_BACKEND_DEVICE_TYPE_GPU || t == GGML_BACKEND_DEVICE_TYPE_IGPU) { gpu = b.get(); break; }
+    }
+    if (!gpu) {
+        return;
+    }
+    for (const char * name : { "attn_inp_kq_mask", "attn_inp_kq_mask_swa" }) {
+        if (ggml_tensor * t = ggml_graph_get_tensor(gf, name)) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), t, gpu);
+        }
+    }
+}
+
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes,
         bool packed_kq_mask) {
@@ -2893,6 +2925,7 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+    kq_mask_to_device(gf);
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;

@@ -1747,7 +1747,16 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    // P-OUT step 2 (local patch, 2026-10-03): with LLAMA_KQ_MASK_ON_DEVICE the mask tensor lives in a GPU buffer (GTT on
+    // the APU) instead of the CPU backend's host compute buffer, which on ROCm is hipHostMalloc memory charged to the
+    // process memory cgroup (~n_ctx_seq x n_ubatch x 2 B = 1 GiB at 131072 x 4096). Fill a transient host copy of the
+    // ACTUAL tensor size (n_kv used, not the worst-case reserve) with the unchanged filler, then upload it.
+    std::vector<uint8_t> staging;
+    void * fill = dst->data;
+    if (!ggml_backend_buffer_is_host(dst->buffer)) {
+        staging.resize(ggml_nbytes(dst));
+        fill = staging.data();
+    }
 
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
@@ -1778,9 +1787,12 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     };
 
     if (dst->type == GGML_TYPE_F16) {
-        set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
+        set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) fill, causal_attn);
     } else {
-        set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+        set_input_kq_mask_impl<float>(args, (float *) fill, causal_attn);
+    }
+    if (!staging.empty()) {
+        ggml_backend_tensor_set(dst, staging.data(), 0, staging.size());
     }
 
     //const int64_t t_end = ggml_time_us();
