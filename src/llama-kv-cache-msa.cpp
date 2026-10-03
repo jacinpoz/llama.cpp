@@ -175,6 +175,15 @@ llama_kv_cache * llama_kv_cache_msa::get_idx() const {
     return kv_idx.get();
 }
 
+void llama_kv_cache_msa::set_upload_backend(ggml_backend_t backend) {
+    if (kv_base) {
+        kv_base->set_upload_backend(backend);
+    }
+    if (kv_idx) {
+        kv_idx->set_upload_backend(backend);
+    }
+}
+
 // llama_kv_cache_msa_context
 
 llama_kv_cache_msa_context::llama_kv_cache_msa_context(llama_memory_status status) :

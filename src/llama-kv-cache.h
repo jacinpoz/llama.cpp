@@ -126,6 +126,8 @@ public:
 
     ~llama_kv_cache();
 
+    void set_upload_backend(ggml_backend_t backend) override;
+
     //
     // llama_memory_i
     //
@@ -488,6 +490,15 @@ private:
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 
     void state_clear(llama_seq_id seq_id, uint32_t strm, const slot_info & sinfo);
+    struct kq_staging_slot {
+        std::vector<uint8_t> data;
+        ggml_backend_event_t event = nullptr;
+        bool recorded = false;
+    };
+    static constexpr size_t N_KQ_STAGING = 4;
+    mutable ggml_backend_t upload_backend = nullptr;
+    mutable kq_staging_slot kq_staging[N_KQ_STAGING];
+    mutable size_t kq_staging_idx = 0;
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
