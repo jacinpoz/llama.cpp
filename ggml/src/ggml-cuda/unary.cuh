@@ -130,3 +130,7 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 
     return ggml_cuda_op_silu_single(gate) * up;
 }
+
+// GDN output gate: RMS_NORM*w, silu(z)*normed, Q8_1 into mm's quantize cache (see unary.cu).
+bool ggml_cuda_op_norm_silu_gate_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * norm_mul,
+        const ggml_tensor * unary_node, const ggml_tensor * mul_node, const ggml_tensor * mm);

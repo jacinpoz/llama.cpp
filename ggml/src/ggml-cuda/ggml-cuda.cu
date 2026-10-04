@@ -4896,6 +4896,47 @@ static int ggml_cuda_try_fuse_attn_prep(ggml_backend_cuda_context & ctx, const g
     return 0;
 }
 
+// GDN output: RMS_NORM MUL(w) | MUL_MAT(z) RESHAPE SILU MUL -> the z matmul, then one kernel for the norm and the
+// gate that writes the out-projection's Q8_1 input (the norm does not depend on z, so it moves after it).
+// Bit-identical. GGML_CUDA_DISABLE_GDN_OUT_GATE_FUSION=1 turns it off.
+static int ggml_cuda_try_fuse_gdn_out_gate(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_GDN_OUT_GATE_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_GDN_OUT_GATE_FUSION")) != 0;
+    if (disabled || i + 5 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * norm  = cgraph->nodes[i];
+    const ggml_tensor * nmul  = cgraph->nodes[i + 1];
+    ggml_tensor *       zmm   = cgraph->nodes[i + 2];
+    const ggml_tensor * zr    = cgraph->nodes[i + 3];
+    ggml_tensor *       unary = cgraph->nodes[i + 4];
+    ggml_tensor *       mul   = cgraph->nodes[i + 5];
+    if (norm->op != GGML_OP_RMS_NORM || nmul->op != GGML_OP_MUL || (nmul->src[0] != norm && nmul->src[1] != norm) ||
+            zmm->op != GGML_OP_MUL_MAT || zr->op != GGML_OP_RESHAPE || zr->src[0] != zmm || unary->op != GGML_OP_UNARY ||
+            unary->src[0] != zr || mul->op != GGML_OP_MUL || !((mul->src[0] == nmul && mul->src[1] == unary) || (mul->src[0] == unary && mul->src[1] == nmul))) {
+        return 0;
+    }
+    // the z matmul must not read the norm chain, and the norm chain feeds only the gate MUL
+    if (zmm->src[1] == norm || zmm->src[1] == nmul || ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
+            ggml_node_get_use_count(cgraph, i + 3) != 1 || ggml_node_get_use_count(cgraph, i + 4) != 1 ||
+            (norm->flags & GGML_TENSOR_FLAG_OUTPUT) || (nmul->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const ggml_tensor * mm = ggml_cuda_find_mul_q8_1_matmul(cgraph, i + 5, mul);
+    if (mm == nullptr) {
+        return 0;
+    }
+    if (!ggml_cuda_compute_forward(ctx, zmm)) {
+        GGML_ABORT("gdn out gate: z MUL_MAT dispatch failed");
+    }
+    if (!ggml_cuda_op_norm_silu_gate_q8_1(ctx, norm, nmul, unary, mul, mm)) {
+        // shapes not covered: run the rest unfused (z is already computed)
+        ggml_cuda_compute_forward(ctx, (ggml_tensor *) norm);
+        ggml_cuda_compute_forward(ctx, (ggml_tensor *) nmul);
+        ggml_cuda_op_unary_mul_q8_1(ctx, unary, mul, mm);
+    }
+    return 5;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4916,6 +4957,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_MUL_MAT) {
         const int sk = ggml_cuda_try_fuse_attn_prep(*cuda_ctx, cgraph, i);
+        if (sk != 0) {
+            return sk;
+        }
+    }
+
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int sk = ggml_cuda_try_fuse_gdn_out_gate(*cuda_ctx, cgraph, i);
         if (sk != 0) {
             return sk;
         }

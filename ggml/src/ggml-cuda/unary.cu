@@ -971,3 +971,82 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
             GGML_ABORT("unsupported unary op for fused scale+unary");
     }
 }
+
+// GDN output gate: RMS_NORM * w (rms_norm_f32<256>'s reduction) of each head row, then silu(z) * normed, quantized to
+// Q8_1 into the matmul's quantize cache as unary_gated_q8_1_op_kernel does. Bit-identical to those two kernels.
+template <int ncols>
+static __global__ void __launch_bounds__(256, 1) norm_silu_gate_q8_1_kernel(
+        const float * x, const int64_t sx, const float * w, const float eps, const float * z, const int64_t sz,
+        block_q8_1 * y, const int64_t row_len) {
+    static_assert(ncols % QK8_1 == 0 && ncols <= 256, "ncols");
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    __shared__ float s_sum[32];
+    const float xi = tid < ncols ? x[row*sx + tid] : 0.0f;
+    float tmp = tid < ncols ? xi * xi : 0.0f;
+    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+    if (tid >= ncols) {
+        return;
+    }
+    const float n = scale * xi * w[tid];
+    const float v = op_silu(z[row*sz + tid]) * n;
+
+    const int64_t i    = (int64_t) row*ncols + tid;
+    const int     lane = tid % 32;
+    const int64_t blocks_per_row = (GGML_PAD(row_len, MATRIX_ROW_PADDING)) / QK8_1;
+    const int64_t ib = (i / row_len) * blocks_per_row + (i % row_len) / QK8_1;
+
+    float amax = fabsf(v);
+    float sum = v;
+    amax = warp_reduce_max<32>(amax);
+    sum  = warp_reduce_sum<32>(sum);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+
+    y[ib].qs[lane] = q;
+    if (lane == 0) {
+        y[ib].ds = make_half2(d, sum);
+    }
+}
+
+bool ggml_cuda_op_norm_silu_gate_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * norm_mul,
+        const ggml_tensor * unary_node, const ggml_tensor * mul_node, const ggml_tensor * mm) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = norm_mul->src[0] == rms_norm ? norm_mul->src[1] : norm_mul->src[0];
+    const ggml_tensor * z = unary_node->src[0];
+    if (x->type != GGML_TYPE_F32 || x->ne[0] != 128 || x->nb[0] != sizeof(float) || !ggml_is_contiguous_rows(x) ||
+            w->type != GGML_TYPE_F32 || ggml_nelements(w) != 128 || !ggml_is_contiguous(w) ||
+            z->type != GGML_TYPE_F32 || !ggml_is_contiguous_1(z) || !ggml_are_same_shape(z, x) ||
+            ggml_get_unary_op(unary_node) != GGML_UNARY_OP_SILU ||
+            (x->ne[2]*x->ne[3] != 1 && (x->nb[2] != x->nb[1]*x->ne[1] || x->nb[3] != x->nb[2]*x->ne[2]))) {
+        return false;
+    }
+    const ggml_tensor * src1 = mm->src[1];
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne13 = src1->ne[3];
+    const int64_t s11 = src1->nb[1] / ts_src1, s12 = src1->nb[2] / ts_src1, s13 = src1->nb[3] / ts_src1;
+    const ggml_tensor * src1_key = src1;
+    while (src1_key->view_src != nullptr) {
+        src1_key = src1_key->view_src;
+    }
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const size_t q8_1_size = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    bool cached = false;
+    void * y = ctx.q8_1_cache_get(src1_key, ctx.curr_stream_no, q8_1_size, ne10, ne11, ne12, ne13, s11, s12, s13, cached);
+    if (cached) {
+        return true;
+    }
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    const int64_t nrows = ggml_nrows(x);
+    norm_silu_gate_q8_1_kernel<128><<<(unsigned) nrows, 256, 0, ctx.stream()>>>(
+        (const float *) x->data, x->nb[1]/sizeof(float), (const float *) w->data, eps,
+        (const float *) z->data, z->nb[1]/sizeof(float), (block_q8_1 *) y, mm->src[1]->ne[0]);
+    CUDA_CHECK(cudaGetLastError());
+    GGML_UNUSED(mul_node);
+    return true;
+}
