@@ -4,7 +4,13 @@
 
 #include "common.cuh"
 
+#include <unordered_set>
+
 int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i);
+
+// Nodes a fusion already computed out of graph order (the attention head prep's V cache write); the graph loop skips
+// them. A try_fuse return of -1 means node i was handled on its own and nothing after it was skipped.
+extern thread_local std::unordered_set<const ggml_tensor *> g_precomputed_nodes;
 
 // Upstream #29948's dense fused gate/up/GLU MMQ predicate (defined in ggml-cuda.cu, next to the matcher the
 // graph optimizer uses); the arm itself lives here with the rest of the dispatcher.

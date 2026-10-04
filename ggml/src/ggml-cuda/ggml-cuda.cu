@@ -7313,6 +7313,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_gdn_clear_state_srcs();
             g_conv_state_srcs.clear();
             g_conv_elided_cpys.clear();
+            g_precomputed_nodes.clear();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
 #ifdef USE_CUDA_GRAPH
@@ -7373,6 +7374,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (node->op == GGML_OP_CPY && g_conv_elided_cpys.erase(node) > 0) {
                     continue;
                 }
+                if (g_precomputed_nodes.erase(node) > 0) {
+                    continue;
+                }
                 if (node->op == GGML_OP_CONCAT && !g_conv_state_srcs.empty()) {
                     // the conv-input fusion did not take this CONCAT after all: materialize the skipped gather
                     for (int s_i = 0; s_i < 2; ++s_i) {
@@ -7431,7 +7435,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
-                    i += nodes_to_skip;
+                    // -1: node i was handled on its own (nothing after it skipped)
+                    i += nodes_to_skip > 0 ? nodes_to_skip : 0;
                     continue;
                 }
 
