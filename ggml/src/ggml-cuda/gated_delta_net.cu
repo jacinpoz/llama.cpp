@@ -4,6 +4,26 @@
 #include "ggml-cuda/common.cuh"
 
 #include <cstdint>
+#include <unordered_map>
+
+static thread_local std::unordered_map<const ggml_tensor *, ggml_cuda_gdn_state_src> gdn_state_srcs;
+
+void ggml_cuda_gdn_clear_state_srcs() {
+    gdn_state_srcs.clear();
+}
+
+void ggml_cuda_gdn_set_state_src(const ggml_tensor * gdn, const ggml_cuda_gdn_state_src & src) {
+    gdn_state_srcs[gdn] = src;
+}
+
+bool ggml_cuda_gdn_get_state_src(const ggml_tensor * gdn, ggml_cuda_gdn_state_src & src) {
+    const auto it = gdn_state_srcs.find(gdn);
+    if (it == gdn_state_srcs.end()) {
+        return false;
+    }
+    src = it->second;
+    return true;
+}
 
 constexpr int gdn_cols_per_warp = 4;
 
@@ -352,6 +372,13 @@ static void ggml_cuda_op_gated_delta_net_impl(
             s_ids        = (const int32_t *) root->src[1]->data;
             s_row_stride = root->src[0]->nb[1] / sizeof(float);
         }
+    }
+    ggml_cuda_gdn_state_src redirect;
+    if (ggml_cuda_gdn_get_state_src(dst, redirect)) {
+        GGML_ASSERT(n_seqs == 1 && s_ids == nullptr);
+        s_d          = redirect.base;
+        s_ids        = redirect.ids;
+        s_row_stride = redirect.row_stride;
     }
 
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
