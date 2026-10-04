@@ -4568,6 +4568,15 @@ static int ggml_cuda_match_idx_relu_sum(const ggml_cgraph * g, int i, ggml_cuda_
     return count;
 }
 
+// RMS_NORM SCALE VIEW RMS_NORM SCALE: the VIEW is the second norm's input slice (a no-op), so only the four
+// computing nodes are checked.
+static bool ggml_cuda_can_fuse_norm_pair(const ggml_cgraph * cgraph, const int i) {
+    const int idxs[4]    = { i, i + 1, i + 3, i + 4 };
+    const ggml_op ops[4] = { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_RMS_NORM, GGML_OP_SCALE };
+    const int outputs[2] = { i + 1, i + 4 };
+    return ggml_can_fuse_subgraph_ext(cgraph, idxs, 4, ops, outputs, 2);
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -6003,6 +6012,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // rms_norm + scale (build_gdn_l2_norm, the GDN q/k l2 norm), every width: one kernel instead of two,
     // bit-identical (see rms_norm_scale_f32).  GGML_CUDA_FUSE_RMS_SCALE=0 turns it off.
     static const bool fuse_rms_scale = getenv("GGML_CUDA_FUSE_RMS_SCALE") == nullptr || atoi(getenv("GGML_CUDA_FUSE_RMS_SCALE")) != 0;
+    // The GDN q and k l2 norms (RMS_NORM SCALE VIEW RMS_NORM SCALE) as one launch; same kernel body, bit-identical.
+    if (fuse_rms_scale && node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes &&
+            cgraph->nodes[i + 2]->op == GGML_OP_VIEW && cgraph->nodes[i + 3]->src[0] == cgraph->nodes[i + 2] &&
+            ggml_cuda_can_fuse_norm_pair(cgraph, i) &&
+            ggml_cuda_op_rms_norm_scale_pair_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 3], cgraph->nodes[i + 4])) {
+        return 4;
+    }
     if (fuse_rms_scale && node->op == GGML_OP_RMS_NORM && ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE })) {
         ggml_tensor * scale = cgraph->nodes[i + 1];
         if (scale->src[0] == node && node->src[0]->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&

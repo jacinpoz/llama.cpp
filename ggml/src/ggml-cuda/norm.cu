@@ -177,23 +177,12 @@ static __global__ void rms_norm_f32(const float * x,
 // rounded exactly as rms_norm_f32 writes it, and the scale is applied as scale_f32 does
 // (s * v + b), so the result is bit-identical to the two kernels it replaces.
 template <int block_size>
-static __global__ void rms_norm_scale_f32(const float * x, float * dst, const int ncols, const int64_t stride_row,
-        const int64_t stride_channel, const int64_t stride_sample, const float eps, const float s, const float b) {
-    ggml_cuda_pdl_lc();
-    const int nrows     = gridDim.x;
-    const int nchannels = gridDim.y;
-
-    const int row     = blockIdx.x;
-    const int channel = blockIdx.y;
-    const int sample  = blockIdx.z;
-    const int tid     = threadIdx.x;
-
-    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
-    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+static __device__ __forceinline__ void rms_norm_scale_row(const float * x, float * dst, const int ncols,
+        const float eps, const float s, const float b) {
+    const int tid = threadIdx.x;
 
     float tmp = 0.0f; // partial sum for thread in warp
 
-    ggml_cuda_pdl_sync();
     for (int col = tid; col < ncols; col += block_size) {
         const float xi = x[col];
         tmp += xi * xi;
@@ -210,6 +199,45 @@ static __global__ void rms_norm_scale_f32(const float * x, float * dst, const in
         const float v = scale * x[col];
         dst[col] = s * v + b;
     }
+}
+
+template <int block_size>
+static __global__ void rms_norm_scale_f32(const float * x, float * dst, const int ncols, const int64_t stride_row,
+        const int64_t stride_channel, const int64_t stride_sample, const float eps, const float s, const float b) {
+    ggml_cuda_pdl_lc();
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row     = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample  = blockIdx.z;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    ggml_cuda_pdl_sync();
+    rms_norm_scale_row<block_size>(x, dst, ncols, eps, s, b);
+}
+
+// Two independent rms_norm + scale jobs of the same shape and parameters (the GDN q and k l2 norms) in one
+// launch: blockIdx.z in [0, nsamples) is the first, [nsamples, 2*nsamples) the second. Same per-row code as
+// rms_norm_scale_f32, so the results are bit-identical to two separate launches.
+template <int block_size>
+static __global__ void rms_norm_scale_pair_f32(const float * x0, float * dst0, const float * x1, float * dst1,
+        const int ncols, const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const int nsamples, const float eps, const float s, const float b) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int  row     = blockIdx.x;
+    const int  channel = blockIdx.y;
+    const bool second  = blockIdx.z >= nsamples;
+    const int  sample  = second ? blockIdx.z - nsamples : blockIdx.z;
+
+    const float * x   = (second ? x1 : x0) + sample*stride_sample + channel*stride_channel + row*stride_row;
+    float       * dst = (second ? dst1 : dst0) + ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    rms_norm_scale_row<block_size>(x, dst, ncols, eps, s, b);
 }
 
 template <int block_size>
@@ -879,6 +907,38 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
         const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
         ggml_cuda_kernel_launch(rms_norm_scale_f32<1024>, launch_params, src0_d, out_d, (int) ne00, s01, s02, s03, eps, s, b);
     }
+}
+
+bool ggml_cuda_op_rms_norm_scale_pair_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm0, ggml_tensor * scale0,
+        ggml_tensor * norm1, ggml_tensor * scale1) {
+    const ggml_tensor * x0 = norm0->src[0];
+    const ggml_tensor * x1 = norm1->src[0];
+    for (const ggml_tensor * t : { x0, x1, (const ggml_tensor *) norm0, (const ggml_tensor *) norm1, (const ggml_tensor *) scale0, (const ggml_tensor *) scale1 }) {
+        if (t->type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    if (scale0->src[0] != norm0 || scale1->src[0] != norm1 || !ggml_is_contiguous(scale0) || !ggml_is_contiguous(scale1) ||
+            !ggml_are_same_shape(scale0, norm0) || !ggml_are_same_shape(scale1, norm1) || !ggml_are_same_shape(norm0, norm1) ||
+            x0->nb[0] != sizeof(float) || x0->ne[0] >= 1024 ||
+            x0->nb[1] != x1->nb[1] || x0->nb[2] != x1->nb[2] || x0->nb[3] != x1->nb[3] ||
+            memcmp(norm0->op_params, norm1->op_params, sizeof(float)) != 0 ||
+            memcmp(scale0->op_params, scale1->op_params, 2*sizeof(float)) != 0) {
+        return false;
+    }
+    float eps, s, b;
+    memcpy(&eps, norm0->op_params, sizeof(float));
+    memcpy(&s, (const float *) scale0->op_params + 0, sizeof(float));
+    memcpy(&b, (const float *) scale0->op_params + 1, sizeof(float));
+
+    const int64_t ts = sizeof(float);
+    const dim3 blocks_num(x0->ne[1], x0->ne[2], 2*x0->ne[3]);
+    const dim3 block_dims(256, 1, 1);
+    rms_norm_scale_pair_f32<256><<<blocks_num, block_dims, 32*sizeof(float), ctx.stream()>>>(
+        (const float *) x0->data, (float *) scale0->data, (const float *) x1->data, (float *) scale1->data,
+        (int) x0->ne[0], x0->nb[1]/ts, x0->nb[2]/ts, x0->nb[3]/ts, (int) x0->ne[3], eps, s, b);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
