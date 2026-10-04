@@ -3,7 +3,7 @@
 // src/models/qwen36_35b_a3b/kernels/rocm/kernels.hip.cpp, DenseCausalAttentionKernel).
 //
 // Opt-in with GGML_CUDA_FA_GUFO_256=1. Only taken for prefill-shaped batches (n_q >= GGML_CUDA_FA_GUFO_MIN_Q,
-// default 32) with D = 256, n_head/n_head_kv = 8 or 6, F16, Q8_0 or Q5_0 K/V (quantized K/V is decoded on load),
+// default 32) with D = 256, n_head/n_head_kv = 8 or 6, F16, Q8_0 or Q5_0 K/V (quantized K/V is converted per KV head),
 // no ALiBi/softcap/sinks, and either an explicit F16 mask or the derived (cell_pos/tok_lo/tok_hi) mask.
 //
 // Differences from the gufo original: visibility comes from the ggml mask (explicit or derived) instead of
@@ -14,6 +14,7 @@
 // keys get P = 0 exactly and staged K/V beyond n_kv are zero.
 
 #include "common.cuh"
+#include "convert.cuh"
 #include "fattn-gufo.cuh"
 
 #include <climits>
@@ -182,7 +183,7 @@ template <int kKeys, int kGqa, int kHeads, ggml_type kKvType>
 __launch_bounds__(kThreads, 2) __global__ void gufo_attn_d256(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
         float * __restrict__ dst, const gufo_mask_args m, const int2 * __restrict__ bounds,
-        const uint32_t * __restrict__ rounds, const int n_words, const float scale, const int n_q, const int n_kv, const int n_head,
+        const uint32_t * __restrict__ rounds, const int n_words, const float scale, const int n_q, const int n_kv, const int n_head, const int kv_head0,
         const int64_t nb01, const int64_t nb02, const int64_t nb03,   // Q strides (bytes)
         const int64_t sk1, const int64_t sk2, const int64_t sk3,      // K strides (bytes)
         const int64_t sv1, const int64_t sv2, const int64_t sv3) {    // V strides (bytes)
@@ -211,7 +212,7 @@ __launch_bounds__(kThreads, 2) __global__ void gufo_attn_d256(
 
     const int tile        = blockIdx.x;
     const int query_start = tile*16;
-    const int kv_head     = blockIdx.y / (kGqa/kRowBlocks);
+    const int kv_head     = kv_head0 + blockIdx.y / (kGqa/kRowBlocks);
     const int first_head  = kv_head*kGqa + (blockIdx.y % (kGqa/kRowBlocks))*kRowBlocks;
     const int seq         = blockIdx.z;
     const int n_tiles_q   = gridDim.x;
@@ -428,7 +429,7 @@ __launch_bounds__(kThreads, 2) __global__ void gufo_attn_d256(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q, K, V, dst, m, bounds, rounds, n_words, scale, n_q, n_kv, n_head, nb01, nb02, nb03, sk1, sk2, sk3, sv1, sv2, sv3);
+    GGML_UNUSED_VARS(Q, K, V, dst, m, bounds, rounds, n_words, scale, n_q, n_kv, n_head, kv_head0, nb01, nb02, nb03, sk1, sk2, sk3, sv1, sv2, sv3);
     NO_DEVICE_CODE;
 #endif // GUFO_WMMA_DEVICE
 }
@@ -491,10 +492,10 @@ template <int kKeys, int kGqa, int kHeads>
 static void gufo_launch_attn(
         const ggml_type kv_type, const dim3 grid, cudaStream_t stream, const char * Q, const char * K, const char * V, float * dst,
         const gufo_mask_args & m, const int2 * bounds, const uint32_t * rounds, const int n_words, const float scale,
-        const int n_q, const int n_kv, const int n_head, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int n_q, const int n_kv, const int n_head, const int kv_head0, const int64_t nb01, const int64_t nb02, const int64_t nb03,
         const int64_t sk1, const int64_t sk2, const int64_t sk3, const int64_t sv1, const int64_t sv2, const int64_t sv3) {
 #define GUFO_LAUNCH(T) gufo_attn_d256<kKeys, kGqa, kHeads, T><<<grid, dim3(kThreads, 1, 1), 0, stream>>>( \
-        Q, K, V, dst, m, bounds, rounds, n_words, scale, n_q, n_kv, n_head, nb01, nb02, nb03, sk1, sk2, sk3, sv1, sv2, sv3)
+        Q, K, V, dst, m, bounds, rounds, n_words, scale, n_q, n_kv, n_head, kv_head0, nb01, nb02, nb03, sk1, sk2, sk3, sv1, sv2, sv3)
     switch (kv_type) {
         case GGML_TYPE_F16:  GUFO_LAUNCH(GGML_TYPE_F16);  break;
         case GGML_TYPE_Q8_0: GUFO_LAUNCH(GGML_TYPE_Q8_0); break;
@@ -547,19 +548,46 @@ void ggml_cuda_flash_attn_ext_gufo(ggml_backend_cuda_context & ctx, ggml_tensor 
     const size_t smem_bits = (size_t) n_words*sizeof(uint32_t);
     const int gqa   = (int) (Q->ne[2]/K->ne[2]);
     const int heads = gqa == 8 ? 4 : 2;
-    const dim3 grid(n_tiles, (unsigned) (K->ne[2]*(gqa/heads)), n_seq);
-#define GUFO_ARGS K->type, grid, stream, (const char *) Q->data, (const char *) K->data, (const char *) V->data, (float *) dst->data, \
-        m, bounds.ptr, rounds.ptr, n_words, scale, n_q, n_kv, (int) Q->ne[2], Q->nb[1], Q->nb[2], Q->nb[3], sk1, sk2, sk3, sv1, sv2, sv3
+    const int  n_kv_head = (int) K->ne[2];
     if (keys == 32) {
         gufo_kv_bounds<32><<<dim3(n_tiles, n_seq, 1), dim3(kThreads, 1, 1), smem_bits, stream>>>(m, bounds.ptr, rounds.ptr, n_words, n_q, n_kv, n_tiles);
-        CUDA_CHECK(cudaGetLastError());
-        gqa == 8 ? gufo_launch_attn<32, 8, 4>(GUFO_ARGS) : gufo_launch_attn<32, 6, 2>(GUFO_ARGS);
     } else {
         gufo_kv_bounds<16><<<dim3(n_tiles, n_seq, 1), dim3(kThreads, 1, 1), smem_bits, stream>>>(m, bounds.ptr, rounds.ptr, n_words, n_q, n_kv, n_tiles);
-        CUDA_CHECK(cudaGetLastError());
-        gqa == 8 ? gufo_launch_attn<16, 8, 4>(GUFO_ARGS) : gufo_launch_attn<16, 6, 2>(GUFO_ARGS);
     }
+    CUDA_CHECK(cudaGetLastError());
+
+    const auto launch = [&](ggml_type type, dim3 grid, const void * k, const void * v, int kv_head0,
+                            int64_t k1, int64_t k2, int64_t k3, int64_t v1, int64_t v2, int64_t v3) {
+#define GUFO_ARGS type, grid, stream, (const char *) Q->data, (const char *) k, (const char *) v, (float *) dst->data, m, bounds.ptr, rounds.ptr, \
+        n_words, scale, n_q, n_kv, (int) Q->ne[2], kv_head0, Q->nb[1], Q->nb[2], Q->nb[3], k1, k2, k3, v1, v2, v3
+        if (keys == 32) {
+            gqa == 8 ? gufo_launch_attn<32, 8, 4>(GUFO_ARGS) : gufo_launch_attn<32, 6, 2>(GUFO_ARGS);
+        } else {
+            gqa == 8 ? gufo_launch_attn<16, 8, 4>(GUFO_ARGS) : gufo_launch_attn<16, 6, 2>(GUFO_ARGS);
+        }
 #undef GUFO_ARGS
+    };
+
+    // Quantized K/V: one KV head at a time is converted to F16 (decoding in the kernel repeats the work for every
+    // block of the same head and is slower at depth). The buffers are sized from the whole cache, not n_kv, so the
+    // pool hands back the same allocation every call instead of keeping one per n_kv.
+    const bool stage = K->type != GGML_TYPE_F16 && n_seq == 1 && K->view_src && V->view_src;
+    if (!stage) {
+        launch(K->type, dim3(n_tiles, (unsigned) (n_kv_head*(gqa/heads)), n_seq), K->data, V->data, 0,
+               K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3]);
+        return;
+    }
+    const int64_t cells = std::max<int64_t>(n_kv, std::max(K->view_src->ne[1], V->view_src->ne[1]));
+    ggml_cuda_pool_alloc<half> K_f16(pool, (size_t) cells*kD), V_f16(pool, (size_t) cells*kD);
+    const to_fp16_nc_cuda_t k_to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+    const to_fp16_nc_cuda_t v_to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
+    const size_t kts = ggml_type_size(K->type), vts = ggml_type_size(V->type);
+    for (int h = 0; h < n_kv_head; ++h) {
+        k_to_fp16((const char *) K->data + h*K->nb[2], K_f16.ptr, kD, n_kv, 1, 1, K->nb[1]/kts, K->nb[2]/kts, K->nb[3]/kts, stream);
+        v_to_fp16((const char *) V->data + h*V->nb[2], V_f16.ptr, kD, n_kv, 1, 1, V->nb[1]/vts, V->nb[2]/vts, V->nb[3]/vts, stream);
+        launch(GGML_TYPE_F16, dim3(n_tiles, (unsigned) (gqa/heads), 1), K_f16.ptr, V_f16.ptr, h,
+               kD*sizeof(half), 0, 0, kD*sizeof(half), 0, 0);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
