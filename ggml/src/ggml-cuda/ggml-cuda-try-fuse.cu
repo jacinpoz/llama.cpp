@@ -35,6 +35,7 @@
 #include "ggml-cuda/indexer-score.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/gdn-conv.cuh"
+#include "ggml-cuda/gdn-gates.cuh"
 #include "ggml-cuda/ple-conv.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -2153,6 +2154,13 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int sk = ggml_cuda_try_fuse_gdn_gates(*cuda_ctx, cgraph, i);
+        if (sk > 0) {
+            return sk;
+        }
+    }
 
     // HC_COMBINE -> BF16 HC_MIX (GGML_CUDA_FUSE_HC_COMBINE_MIX=0: off): the combine and the mixer's norm in one kernel
     if (const int n_hc_combine_mix = ggml_cuda_hc_combine_mix_try_fuse(*cuda_ctx, cgraph, i)) {
