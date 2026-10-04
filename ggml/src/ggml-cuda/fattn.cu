@@ -1,3 +1,4 @@
+#include "fattn-gqa-dec.cuh"
 #include "fattn-gufo.cuh"
 #include "common.cuh"
 #include "fattn-common.cuh"
@@ -884,66 +885,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
-// Single-token decode whose GQA ratio the tile kernel cannot fold whole (6 on Qwen3.5/3.8 dense 27B gets
-// ncols2 = 2, so every K/V tile is read 3 times): present the ratio query heads of each KV head as ratio query
-// columns, so one block reads each tile once. The kernel then writes [D, n_head_kv, ratio], which
-// k_fattn_unfold_gqa reorders to [D, n_head]. Opt-in with GGML_HIP_FA_GQA_FOLD=1: the folded launch sums in a
-// different order than the unfolded one, so decode logits no longer match speculative-verify logits bit for bit.
-static __global__ void k_fattn_unfold_gqa(const float * __restrict__ src, float * __restrict__ dst, const int D, const int n_head_kv, const int gqa) {
-    const int h = blockIdx.x;
-    const int j = blockIdx.y;
-    for (int d = threadIdx.x; d < D; d += blockDim.x) {
-        dst[(int64_t) (h*gqa + j)*D + d] = src[(int64_t) (j*n_head_kv + h)*D + d];
-    }
-}
-
-static bool ggml_cuda_flash_attn_ext_tile_gqa_fold(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    static const bool enabled = getenv("GGML_HIP_FA_GQA_FOLD") && atoi(getenv("GGML_HIP_FA_GQA_FOLD")) != 0;
-    const ggml_tensor * Q    = dst->src[0];
-    const ggml_tensor * K    = dst->src[1];
-    const ggml_tensor * mask = dst->src[3];
-    if (!enabled || Q->ne[1] != 1 || Q->ne[3] != 1 || mask == nullptr || dst->src[4] != nullptr || dst->src[5] != nullptr ||
-            !ggml_is_contiguous(dst) || K->ne[1] % FATTN_KQ_STRIDE != 0) {
-        return false;
-    }
-    const int gqa = (int) (Q->ne[2]/K->ne[2]);
-    if (gqa < 3 || gqa > 8 || gqa % 4 == 0) {
-        return false;
-    }
-    float max_bias = 0.0f;
-    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
-    if (max_bias != 0.0f) {
-        return false;
-    }
-
-    ggml_tensor Q2 = *Q;
-    Q2.ne[1] = gqa;
-    Q2.ne[2] = K->ne[2];
-    Q2.nb[1] = Q->nb[2];
-    Q2.nb[2] = Q->nb[2]*gqa;
-
-    ggml_tensor mask2 = *mask;
-    mask2.nb[1] = 0;
-
-    ggml_cuda_pool_alloc<float> tmp(ctx.pool(), ggml_nelements(dst));
-    ggml_tensor dst2 = *dst;
-    dst2.src[0] = &Q2;
-    dst2.src[3] = &mask2;
-    dst2.data   = tmp.ptr;
-    dst2.ne[1]  = K->ne[2];
-    dst2.ne[2]  = gqa;
-    dst2.nb[2]  = dst2.nb[1]*dst2.ne[1];
-    dst2.nb[3]  = dst2.nb[2]*dst2.ne[2];
-    ggml_cuda_flash_attn_ext_tile(ctx, &dst2);
-
-    k_fattn_unfold_gqa<<<dim3((unsigned) K->ne[2], (unsigned) gqa), 256, 0, ctx.stream()>>>(
-        tmp.ptr, (float *) dst->data, (int) dst->ne[0], (int) K->ne[2], gqa);
-    CUDA_CHECK(cudaGetLastError());
-    return true;
-}
-
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (ggml_cuda_fattn_gqa_dec_supported(ctx.device, dst)) {
+        ggml_cuda_flash_attn_ext_gqa_dec(ctx, dst);
+        return;
+    }
     if (ggml_cuda_fattn_gufo_supported(ctx.device, dst)) {
         ggml_cuda_flash_attn_ext_gufo(ctx, dst);
         return;
@@ -952,9 +899,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
-            if (!ggml_cuda_flash_attn_ext_tile_gqa_fold(ctx, dst)) {
-                ggml_cuda_flash_attn_ext_tile(ctx, dst);
-            }
+            ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VEC:
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
