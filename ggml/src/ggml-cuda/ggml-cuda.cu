@@ -4577,6 +4577,52 @@ static bool ggml_cuda_can_fuse_norm_pair(const ggml_cgraph * cgraph, const int i
     return ggml_can_fuse_subgraph_ext(cgraph, idxs, 4, ops, outputs, 2);
 }
 
+// GET_ROWS gathering one sequence's recurrent state whose only consumer (through one RESHAPE) is a
+// GATED_DELTA_NET that takes the sequential kernel (n_seqs == 1, n_tokens <= 16, not KDA): the gather is
+// skipped and the GDN kernel reads the state in place from the cache row. Each warp loads its whole state
+// column before writing that same column, so reading and writing the same row is safe. Bit-identical.
+// GGML_CUDA_DISABLE_GDN_STATE_INPLACE=1 turns it off.
+static bool ggml_cuda_try_elide_gdn_state_gather(const ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_GDN_STATE_INPLACE") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_GDN_STATE_INPLACE")) != 0;
+    const ggml_tensor * gr = cgraph->nodes[i];
+    if (disabled || gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            gr->ne[1] != 1 || gr->ne[2] != 1 || gr->ne[3] != 1 || ggml_node_get_use_count(cgraph, i) != 1) {
+        return false;
+    }
+    const ggml_tensor * src = gr->src[0];
+    const ggml_tensor * ids = gr->src[1];
+    if (src->type != GGML_TYPE_F32 || src->nb[0] != sizeof(float) || src->ne[0] != gr->ne[0] ||
+            ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1) {
+        return false;
+    }
+    const int i_end = std::min(cgraph->n_nodes, i + 64);
+    int ir = -1;
+    for (int j = i + 1; j < i_end && ir < 0; ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_RESHAPE && cgraph->nodes[j]->src[0] == gr) {
+            ir = j;
+        }
+    }
+    if (ir < 0 || ggml_node_get_use_count(cgraph, ir) != 1 || (cgraph->nodes[ir]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * r = cgraph->nodes[ir];
+    for (int j = ir + 1; j < i_end; ++j) {
+        const ggml_tensor * gdn = cgraph->nodes[j];
+        if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->src[5] != r) {
+            continue;
+        }
+        const ggml_tensor * v = gdn->src[2];
+        const ggml_tensor * g = gdn->src[3];
+        const int64_t S_v = v->ne[0];
+        if (v->ne[3] != 1 || v->ne[2] > 16 || g->ne[0] == S_v || ggml_nelements(gr) != S_v*S_v*v->ne[1]) {
+            return false;
+        }
+        ggml_cuda_gdn_set_state_src(gdn, { (const float *) src->data, (const int32_t *) ids->data, (int64_t) (src->nb[1]/sizeof(float)) });
+        return true;
+    }
+    return false;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -6780,6 +6826,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             if (t_ev) { g_ev_pre_us += ggml_time_us() - t_ev; g_loop_start = ggml_time_us(); }
+            ggml_cuda_gdn_clear_state_srcs();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -6819,6 +6866,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                if (node->op == GGML_OP_GET_ROWS && ggml_cuda_try_elide_gdn_state_gather(cgraph, i)) {
                     continue;
                 }
 
