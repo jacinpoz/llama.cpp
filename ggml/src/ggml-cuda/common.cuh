@@ -1932,6 +1932,13 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * conv_input = nullptr;
     const ggml_tensor * conv_states = nullptr;
     int conv_kernel_size = 0;
+    // Optional decode form (ggml-cuda.cu elides the GET_ROWS and the state CPY): the states are read from row
+    // conv_state_ids[0] of conv_state_src (row stride in floats) instead of conv_states, and the shifted state
+    // (conv_input columns 1..cs-1) is written to conv_state_dst.
+    const int32_t * conv_state_ids = nullptr;
+    const float * conv_state_src = nullptr;
+    int64_t conv_state_row_stride = 0;
+    float * conv_state_dst = nullptr;
     // Index x_scale by the destination channel (token), not the source channel
     // (expert). Used for the MoE down x topk-weights fusion.
     bool x_scale_channel_dst = false;
@@ -1948,6 +1955,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * conv_input = nullptr;
     const void * conv_states = nullptr;
     int conv_kernel_size = 0;
+    const int32_t * conv_state_ids = nullptr;
+    const float * conv_state_src = nullptr;
+    int64_t conv_state_row_stride = 0;
+    float * conv_state_dst = nullptr;
     bool x_scale_channel_dst = false;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
