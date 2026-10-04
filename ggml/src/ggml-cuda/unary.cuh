@@ -152,3 +152,6 @@ int ggml_cuda_scale_unary_try_fuse(ggml_backend_cuda_context & ctx, const ggml_c
 bool ggml_cuda_sigmoid_mul_add_fusable(const ggml_tensor * sig, const ggml_tensor * mul, const ggml_tensor * add);
 void ggml_cuda_op_sigmoid_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * sig, ggml_tensor * mul, ggml_tensor * add);
 int  ggml_cuda_sigmoid_mul_add_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+// GDN output gate: RMS_NORM*w, silu(z)*normed, Q8_1 into mm's quantize cache (see unary.cu).
+bool ggml_cuda_op_norm_silu_gate_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * norm_mul,
+        const ggml_tensor * unary_node, const ggml_tensor * mul_node, const ggml_tensor * mm);
