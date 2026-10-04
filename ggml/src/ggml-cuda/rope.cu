@@ -2,6 +2,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "rope.cuh"
+#include "cpy-utils.cuh"
 
 // The ROPE -> VIEW -> SET_ROWS fusion (ggml_cuda_should_fuse_rope_set_rows, upstream #16884) is
 // selected by ggml_cuda_check_fusion_memory_ranges(), i.e. by buffer addresses, so its fused
@@ -207,6 +208,46 @@ static __global__ void rope_neox(const T *            x,
     dst[idst + n_offs/2 + n_dims / 2] = ggml_cuda_cast<D>(x0 * sin_theta + x1 * cos_theta);
 }
 
+// cos/sin of the rotation for relative channel pair iw of token i2 (mrope / imrope sections); shared by rope_multi
+// and the fused attention head-prep kernel below, so both compute the same values.
+template <bool forward, bool has_ff>
+static __device__ __forceinline__ void rope_multi_cos_sin(
+        const int iw, const int32_t * pos, const uint32_t i2, const int ne02, const mrope_sections sections,
+        const bool is_imrope, const float theta_scale, const float * freq_factors, const float freq_scale,
+        const rope_corr_dims corr_dims, const float ext_factor, const float attn_factor,
+        float & cos_theta, float & sin_theta) {
+    const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
+    const int sec_w = sections.v[1] + sections.v[0];
+    const int sector = (iw / 2) % sect_dims;
+
+    float theta_base = 0.0;
+    if (is_imrope) {
+        if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
+            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
+        } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
+            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
+        } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
+            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
+        } else {
+            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
+        }
+    } else {
+        if (sector < sections.v[0]) {
+            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
+        } else if (sector >= sections.v[0] && sector < sec_w) {
+            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
+        } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
+            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
+        } else if (sector >= sec_w + sections.v[2]) {
+            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
+        }
+    }
+
+    const float freq_factor = has_ff ? freq_factors[iw/2] : 1.0f;
+
+    rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor, cos_theta, sin_theta);
+}
+
 template <bool forward, bool has_ff, typename T, typename D>
 static __global__ void rope_multi(const T *            x,
                                   D *                  dst,
@@ -268,39 +309,10 @@ static __global__ void rope_multi(const T *            x,
 
     const int iw = i0 - n_offs; // relative idx
 
-    const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
-    const int sec_w = sections.v[1] + sections.v[0];
-    const int sector = (iw / 2) % sect_dims;
-
-    float theta_base = 0.0;
-    if (is_imrope) {
-        if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
-        } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
-        } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
-            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
-        } else {
-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
-        }
-    } else {
-        if (sector < sections.v[0]) {
-            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
-        } else if (sector >= sections.v[0] && sector < sec_w) {
-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
-        } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
-        } else if (sector >= sec_w + sections.v[2]) {
-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
-        }
-    }
-
-    const float freq_factor = has_ff ? freq_factors[iw/2] : 1.0f;
-
     float cos_theta;
     float sin_theta;
-
-    rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor, cos_theta, sin_theta);
+    rope_multi_cos_sin<forward, has_ff>(iw, pos, i2, ne02, sections, is_imrope, theta_scale, freq_factors, freq_scale,
+                                        corr_dims, ext_factor, attn_factor, cos_theta, sin_theta);
 
     // idst/ix point at channel i0/2; the first channel of the rotated pair is n_offs + iw/2 = i0/2 + n_offs/2
     const float x0 = x[ix + n_offs/2 + 0];
@@ -977,4 +989,259 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
     } else {
         GGML_ABORT("fatal error");
     }
+}
+
+// Attention head prep for one (head, token) row of 256 (the Qwen3.5/3.8 Q and K paths at decode/verify widths):
+// RMS_NORM * weight -> ROPE (mrope) -> 256-point Hadamard, then either written out (Q) or quantized to q5_0 into the
+// cache row idx[token] (K: the SET_ROWS). Each stage is the code of the kernel it replaces (rms_norm_f32<256>'s
+// reduction, rope_multi_cos_sin, fwht_cuda<256>'s layout and stage order, quantize_f32_q5_0_block), so the result is
+// bit-identical.
+struct attn_head_prep_params {
+    const float *   x;            // [256] rows, head stride sx1, token stride sx2 (floats)
+    int64_t         sx1, sx2;
+    const float *   w;            // norm weight [256]
+    float           eps;
+    int             n_dims, n_offs;
+    const int32_t * pos;
+    int             n_tok;        // rope ne02 (pos is [n_tok * 4] for mrope)
+    mrope_sections  sections;
+    bool            is_imrope;
+    float           theta_scale, freq_scale, ext_factor, attn_factor;
+    rope_corr_dims  corr_dims;
+    const float *   freq_factors;
+    float *         out;          // [256, n_head, n_tok] contiguous, or nullptr
+    char *          cache;        // q5_0 cache view data, or nullptr
+    int64_t         cache_nb1;
+    const void *    idx;          // set_rows row index per token
+    bool            idx_i64;
+};
+
+template <bool has_ff>
+static __global__ void __launch_bounds__(256, 1) k_attn_head_prep(const attn_head_prep_params p) {
+    const int head = blockIdx.x;
+    const int tok  = blockIdx.y;
+    const int tid  = threadIdx.x;
+
+    __shared__ float s_sum[32];
+    __shared__ float y[256];
+    __shared__ float r[256];
+
+    const float xi = p.x[tok*p.sx2 + head*p.sx1 + tid];
+    float tmp = xi * xi;
+    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
+    const float mean  = tmp / 256;
+    const float scale = rsqrtf(mean + p.eps);
+    y[tid] = scale * xi * p.w[tid];
+    __syncthreads();
+
+    if (tid < 128) {
+        const int i0 = 2*tid;
+        if (i0 < p.n_offs || i0 >= p.n_offs + p.n_dims) {
+            r[i0 + 0] = y[i0 + 0];
+            r[i0 + 1] = y[i0 + 1];
+        } else {
+            const int iw = i0 - p.n_offs;
+            float cos_theta;
+            float sin_theta;
+            rope_multi_cos_sin<true, has_ff>(iw, p.pos, tok, p.n_tok, p.sections, p.is_imrope, p.theta_scale, p.freq_factors,
+                                             p.freq_scale, p.corr_dims, p.ext_factor, p.attn_factor, cos_theta, sin_theta);
+            const float x0 = y[i0/2 + p.n_offs/2 + 0];
+            const float x1 = y[i0/2 + p.n_offs/2 + p.n_dims/2];
+            r[i0/2 + p.n_offs/2 + 0]          = x0*cos_theta - x1*sin_theta;
+            r[i0/2 + p.n_offs/2 + p.n_dims/2] = x0*sin_theta + x1*cos_theta;
+        }
+    }
+    __syncthreads();
+
+    // fwht_cuda<256>: one wave, element i*32 + lane in reg[i]
+    if (tid < WARP_SIZE) {
+        constexpr int el_w = 256 / WARP_SIZE;
+        const int lane = tid;
+        float reg[el_w];
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) {
+            reg[i] = r[i*WARP_SIZE + lane] * (1.0f / 16.0f);
+        }
+#pragma unroll
+        for (int h = 1; h < WARP_SIZE; h *= 2) {
+#pragma unroll
+            for (int j = 0; j < el_w; j++) {
+                const float val  = reg[j];
+                const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, WARP_SIZE);
+                reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+            }
+        }
+#pragma unroll
+        for (int h = WARP_SIZE; h < 256; h *= 2) {
+            const int step = h / WARP_SIZE;
+#pragma unroll
+            for (int j = 0; j < el_w; j += 2 * step) {
+#pragma unroll
+                for (int k = 0; k < step; k++) {
+                    const float x = reg[j + k];
+                    const float z = reg[j + k + step];
+                    reg[j + k]        = x + z;
+                    reg[j + k + step] = x - z;
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) {
+            y[i*WARP_SIZE + lane] = reg[i];
+        }
+    }
+    __syncthreads();
+
+    if (p.out != nullptr) {
+        p.out[((int64_t) tok*gridDim.x + head)*256 + tid] = y[tid];
+    }
+    if (p.cache != nullptr && tid < 256/QK5_0) {
+        const int64_t row = p.idx_i64 ? ((const int64_t *) p.idx)[tok] : (int64_t) ((const int32_t *) p.idx)[tok];
+        block_q5_0 * dst = (block_q5_0 *) (p.cache + row*p.cache_nb1) + head*(256/QK5_0) + tid;
+        quantize_f32_q5_0_block(&y[tid*QK5_0], dst);
+    }
+}
+
+// V path: fwht_cuda<64> over the four 64-chunks of one (head, token) row of 256, then quantized to q5_0 into cache row
+// idx[token] (the SET_ROWS). Bit-identical to the two kernels it replaces.
+static __global__ void __launch_bounds__(4*WARP_SIZE, 1) k_hadamard64_set_rows_q5_0(
+        const float * x, const int64_t sx1, const int64_t sx2, char * cache, const int64_t cache_nb1,
+        const void * idx, const bool idx_i64) {
+    const int head = blockIdx.x;
+    const int tok  = blockIdx.y;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int w    = threadIdx.x / WARP_SIZE;
+
+    __shared__ float y[256];
+
+    constexpr int el_w = 64 / WARP_SIZE;
+    const float * src = x + tok*sx2 + head*sx1 + w*64;
+    float reg[el_w];
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        reg[i] = src[i*WARP_SIZE + lane] * 0.125f;
+    }
+#pragma unroll
+    for (int h = 1; h < WARP_SIZE; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < el_w; j++) {
+            const float val  = reg[j];
+            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, WARP_SIZE);
+            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+        }
+    }
+#pragma unroll
+    for (int h = WARP_SIZE; h < 64; h *= 2) {
+        const int step = h / WARP_SIZE;
+#pragma unroll
+        for (int j = 0; j < el_w; j += 2 * step) {
+#pragma unroll
+            for (int k = 0; k < step; k++) {
+                const float a = reg[j + k];
+                const float b = reg[j + k + step];
+                reg[j + k]        = a + b;
+                reg[j + k + step] = a - b;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) {
+        y[w*64 + i*WARP_SIZE + lane] = reg[i];
+    }
+    __syncthreads();
+    if (threadIdx.x < 256/QK5_0) {
+        const int64_t row = idx_i64 ? ((const int64_t *) idx)[tok] : (int64_t) ((const int32_t *) idx)[tok];
+        block_q5_0 * dst = (block_q5_0 *) (cache + row*cache_nb1) + head*(256/QK5_0) + threadIdx.x;
+        quantize_f32_q5_0_block(&y[threadIdx.x*QK5_0], dst);
+    }
+}
+
+static bool attn_set_rows_ok(const ggml_tensor * set_rows, const int64_t n_head, const int64_t n_tok) {
+    const ggml_tensor * idx = set_rows->src[1];
+    return set_rows->op == GGML_OP_SET_ROWS && set_rows->type == GGML_TYPE_Q5_0 &&
+        (idx->type == GGML_TYPE_I64 || idx->type == GGML_TYPE_I32) && ggml_is_contiguous(idx) && ggml_nelements(idx) == n_tok &&
+        set_rows->src[0]->ne[0] == 256*n_head && set_rows->src[0]->ne[1] == n_tok && set_rows->ne[0] == 256*n_head &&
+        set_rows->ne[2] == 1 && set_rows->ne[3] == 1;
+}
+
+bool ggml_cuda_op_attn_head_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * mul,
+        const ggml_tensor * rope, ggml_tensor * hadamard, ggml_tensor * set_rows) {
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    const int64_t n_head = x->ne[1];
+    const int64_t n_tok  = x->ne[2];
+    const int mode = ((const int32_t *) rope->op_params)[2];
+    if (x->type != GGML_TYPE_F32 || x->ne[0] != 256 || x->ne[3] != 1 || x->nb[0] != sizeof(float) ||
+            w->type != GGML_TYPE_F32 || ggml_nelements(w) != 256 || !ggml_is_contiguous(w) ||
+            rope->src[0] != mul || rope->type != GGML_TYPE_F32 || !(mode & GGML_ROPE_TYPE_MROPE) || mode == GGML_ROPE_TYPE_VISION ||
+            rope->src[1]->type != GGML_TYPE_I32 || hadamard->type != GGML_TYPE_F32 || hadamard->src[1]->ne[0] != 256) {
+        return false;
+    }
+    if (set_rows == nullptr && (!ggml_is_contiguous(hadamard) || ggml_nelements(hadamard) != 256*n_head*n_tok)) {
+        return false;
+    }
+    if (set_rows != nullptr && !attn_set_rows_ok(set_rows, n_head, n_tok)) {
+        return false;
+    }
+
+    attn_head_prep_params p{};
+    p.x   = (const float *) x->data;
+    p.sx1 = x->nb[1]/sizeof(float);
+    p.sx2 = x->nb[2]/sizeof(float);
+    p.w   = (const float *) w->data;
+    memcpy(&p.eps, rms_norm->op_params, sizeof(float));
+
+    const int n_ctx_orig = ((const int32_t *) rope->op_params)[4];
+    p.n_dims = ((const int32_t *) rope->op_params)[1];
+    p.n_offs = ((const int32_t *) rope->op_params)[15];
+    float freq_base, beta_fast, beta_slow;
+    memcpy(&freq_base,     (const int32_t *) rope->op_params +  5, sizeof(float));
+    memcpy(&p.freq_scale,  (const int32_t *) rope->op_params +  6, sizeof(float));
+    memcpy(&p.ext_factor,  (const int32_t *) rope->op_params +  7, sizeof(float));
+    memcpy(&p.attn_factor, (const int32_t *) rope->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,     (const int32_t *) rope->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,     (const int32_t *) rope->op_params + 10, sizeof(float));
+    memcpy(&p.sections.v,  (const int32_t *) rope->op_params + 11, sizeof(int)*4);
+    p.is_imrope    = mode == GGML_ROPE_TYPE_IMROPE;
+    p.theta_scale  = powf(freq_base, -2.0f/p.n_dims);
+    ggml_rope_yarn_corr_dims(p.n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, p.corr_dims.v);
+    p.freq_factors = rope->src[2] ? (const float *) rope->src[2]->data : nullptr;
+    p.pos          = (const int32_t *) rope->src[1]->data;
+    p.n_tok        = (int) n_tok;
+
+    if (set_rows != nullptr) {
+        p.cache     = (char *) set_rows->data;
+        p.cache_nb1 = set_rows->nb[1];
+        p.idx       = set_rows->src[1]->data;
+        p.idx_i64   = set_rows->src[1]->type == GGML_TYPE_I64;
+    } else {
+        p.out = (float *) hadamard->data;
+    }
+
+    const dim3 grid((unsigned) n_head, (unsigned) n_tok, 1);
+    if (p.freq_factors != nullptr) {
+        k_attn_head_prep<true><<<grid, 256, 0, ctx.stream()>>>(p);
+    } else {
+        k_attn_head_prep<false><<<grid, 256, 0, ctx.stream()>>>(p);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool ggml_cuda_op_hadamard64_set_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * hadamard, ggml_tensor * set_rows) {
+    const ggml_tensor * src = hadamard->src[1];  // [64, 4*n_head, n_tok] view of the [256, n_head, n_tok] V rows
+    if (src->type != GGML_TYPE_F32 || src->ne[0] != 64 || !ggml_is_contiguous(src) || src->ne[1] % 4 != 0 || src->ne[3] != 1) {
+        return false;
+    }
+    const int64_t n_head = src->ne[1]/4;
+    const int64_t n_tok  = src->ne[2];
+    if (!attn_set_rows_ok(set_rows, n_head, n_tok)) {
+        return false;
+    }
+    const dim3 grid((unsigned) n_head, (unsigned) n_tok, 1);
+    k_hadamard64_set_rows_q5_0<<<grid, 4*WARP_SIZE, 0, ctx.stream()>>>(
+        (const float *) src->data, 256, 256*n_head, (char *) set_rows->data, set_rows->nb[1],
+        set_rows->src[1]->data, set_rows->src[1]->type == GGML_TYPE_I64);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }

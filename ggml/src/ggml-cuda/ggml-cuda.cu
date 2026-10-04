@@ -4811,6 +4811,91 @@ static int ggml_cuda_try_fuse_attn_tail(ggml_backend_cuda_context & ctx, const g
     return 8;
 }
 
+// Attention head prep (Qwen3.5/3.8 with KV rotation): the Q chain RMS_NORM MUL ROPE RESHAPE MUL_MAT(hadamard) and
+// the K chain (the same + RESHAPE VIEW SET_ROWS) each become one launch, and the V chain MUL_MAT(hadamard 64) ...
+// SET_ROWS is written when the MUL_MAT runs and the SET_ROWS is skipped. Bit-identical (see rope.cu).
+// GGML_CUDA_DISABLE_ATTN_PREP_FUSION=1 turns it off.
+static thread_local std::unordered_set<const ggml_tensor *> g_precomputed_nodes;
+
+static bool ggml_cuda_attn_prep_uses_ok(const ggml_cgraph * cgraph, const int i, const int n) {
+    for (int k = i; k < i + n; ++k) {
+        if ((cgraph->nodes[k]->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, k) != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int ggml_cuda_try_fuse_attn_prep(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_ATTN_PREP_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_ATTN_PREP_FUSION")) != 0;
+    if (disabled) {
+        return 0;
+    }
+    const ggml_tensor * node = cgraph->nodes[i];
+    auto is_had = [](const ggml_tensor * t, const int64_t n) {
+        return t->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(t, 1) == GGML_HINT_SRC0_IS_HADAMARD && t->src[1]->ne[0] == n;
+    };
+    if (node->op == GGML_OP_RMS_NORM && i + 4 < cgraph->n_nodes) {
+        const ggml_tensor * mul  = cgraph->nodes[i + 1];
+        const ggml_tensor * rope = cgraph->nodes[i + 2];
+        const ggml_tensor * rsh  = cgraph->nodes[i + 3];
+        ggml_tensor *       had  = cgraph->nodes[i + 4];
+        if (mul->op != GGML_OP_MUL || (mul->src[0] != node && mul->src[1] != node) || rope->op != GGML_OP_ROPE ||
+                rope->src[0] != mul || rsh->op != GGML_OP_RESHAPE || rsh->src[0] != rope || !is_had(had, 256) ||
+                had->src[1] != rsh || !ggml_cuda_attn_prep_uses_ok(cgraph, i, 4)) {
+            return 0;
+        }
+        // K: RESHAPE VIEW SET_ROWS follow
+        if (i + 7 < cgraph->n_nodes) {
+            const ggml_tensor * r2 = cgraph->nodes[i + 5];
+            const ggml_tensor * vw = cgraph->nodes[i + 6];
+            ggml_tensor *       sr = cgraph->nodes[i + 7];
+            if (r2->op == GGML_OP_RESHAPE && r2->src[0] == had && vw->op == GGML_OP_VIEW && vw->src[0] == r2 &&
+                    sr->op == GGML_OP_SET_ROWS && sr->src[0] == vw && ggml_cuda_attn_prep_uses_ok(cgraph, i + 4, 3)) {
+                return ggml_cuda_op_attn_head_prep(ctx, node, mul, rope, had, sr) ? 7 : 0;
+            }
+        }
+        return ggml_cuda_op_attn_head_prep(ctx, node, mul, rope, had, nullptr) ? 4 : 0;
+    }
+    if (is_had(node, 64) && i + 2 < cgraph->n_nodes && ggml_cuda_attn_prep_uses_ok(cgraph, i, 1)) {
+        const ggml_tensor * rsh = cgraph->nodes[i + 1];
+        if (rsh->op != GGML_OP_RESHAPE || rsh->src[0] != node || ggml_node_get_use_count(cgraph, i + 1) != 1) {
+            return 0;
+        }
+        const int end = std::min(cgraph->n_nodes, i + 24);
+        for (int j = i + 2; j + 1 < end; ++j) {
+            const ggml_tensor * vw = cgraph->nodes[j];
+            if (vw->op != GGML_OP_VIEW || vw->src[0] != rsh) {
+                continue;
+            }
+            ggml_tensor * sr = cgraph->nodes[j + 1];
+            if (ggml_node_get_use_count(cgraph, j) != 1 || sr->op != GGML_OP_SET_ROWS || sr->src[0] != vw) {
+                return 0;
+            }
+            // nothing between may touch the destination cache (it is written early)
+            for (int k = i + 1; k < j; ++k) {
+                const ggml_tensor * n = cgraph->nodes[k];
+                for (int sidx = 0; sidx < GGML_MAX_SRC; ++sidx) {
+                    const ggml_tensor * t = n->src[sidx];
+                    while (t != nullptr && t->view_src != nullptr) {
+                        t = t->view_src;
+                    }
+                    const ggml_tensor * d = sr->view_src ? sr->view_src : sr;
+                    if (t == d) {
+                        return 0;
+                    }
+                }
+            }
+            if (!ggml_cuda_op_hadamard64_set_rows(ctx, node, sr)) {
+                return 0;
+            }
+            g_precomputed_nodes.insert(sr);
+            return -1;  // node i done; nothing after it skipped
+        }
+    }
+    return 0;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4828,6 +4913,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_MUL_MAT) {
+        const int sk = ggml_cuda_try_fuse_attn_prep(*cuda_ctx, cgraph, i);
+        if (sk != 0) {
+            return sk;
+        }
+    }
 
     if (node->op == GGML_OP_FLASH_ATTN_EXT) {
         const int sk = ggml_cuda_try_fuse_attn_tail(*cuda_ctx, cgraph, i);
@@ -6992,6 +7084,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_gdn_clear_state_srcs();
             g_conv_state_srcs.clear();
             g_conv_elided_cpys.clear();
+            g_precomputed_nodes.clear();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -7043,6 +7136,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (node->op == GGML_OP_CPY && g_conv_elided_cpys.erase(node) > 0) {
                     continue;
                 }
+                if (g_precomputed_nodes.erase(node) > 0) {
+                    continue;
+                }
                 if (node->op == GGML_OP_CONCAT && !g_conv_state_srcs.empty()) {
                     // the conv-input fusion did not take this CONCAT after all: materialize the skipped gather
                     for (int s_i = 0; s_i < 2; ++s_i) {
@@ -7077,7 +7173,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
-                    i += nodes_to_skip;
+                    // -1: node i was handled on its own (nothing after it skipped)
+                    i += nodes_to_skip > 0 ? nodes_to_skip : 0;
                     continue;
                 }
 
