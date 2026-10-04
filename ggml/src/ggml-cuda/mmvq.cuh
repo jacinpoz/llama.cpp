@@ -1,5 +1,8 @@
 #include "common.cuh"
 
+#include <unordered_map>
+#include <unordered_set>
+
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 // Dedicated MUL_MAT_ID MoE kernel band (mul_mat_vec_q_moe).  That kernel is one warp per token and
 // its per-token reduction does not depend on the column count, so it covers the whole speculative
@@ -58,6 +61,19 @@ bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool 
 int ggml_cuda_mul_mat_id_weighted_down_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 
 int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+// SSM conv-input fusion target: MUL_MAT i (the qkv projection) feeding the last row of a dim-0 CONCAT j with a
+// GET_ROWS of conv states (s0) as the first source. See ggml_cuda_ssm_conv_in_try_fuse.
+bool ggml_cuda_match_conv_input_fusion(const ggml_cgraph * cgraph, int i, int & j_out, const ggml_tensor *& s0_out);
+
+// Decode conv state read in place (ggml-cuda.cu elides the conv-states GET_ROWS that the conv-input fusion would
+// have read, and the state CPY the fusion then writes itself). Registered per graph evaluation.
+struct ggml_cuda_conv_state_src {
+    const float *   base;
+    const int32_t * ids;
+    int64_t         row_stride;
+};
+extern thread_local std::unordered_map<const ggml_tensor *, ggml_cuda_conv_state_src> g_conv_state_srcs;
+extern thread_local std::unordered_set<const ggml_tensor *>                            g_conv_elided_cpys;
 bool ggml_cuda_ssm_prescan_match_at(const struct ggml_cgraph * cgraph, int i);
 int ggml_cuda_ssm_prescan_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 

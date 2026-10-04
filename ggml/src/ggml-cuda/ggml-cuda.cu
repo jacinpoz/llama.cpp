@@ -7134,6 +7134,40 @@ static bool ggml_cuda_try_elide_gdn_state_gather(const ggml_cgraph * cgraph, con
     return false;
 }
 
+// Decode-only (one sequence, one token): the conv-states GET_ROWS is skipped when the qkv MUL_MAT's conv-input
+// fusion will consume it; that epilogue reads the cache row through the same index (and also writes the shifted
+// state, eliding the state CPY). Pure copies, bit-identical. GGML_CUDA_DISABLE_CONV_STATE_INPLACE=1 turns it off.
+static bool ggml_cuda_try_elide_conv_state_gather(const ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_CONV_STATE_INPLACE") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_CONV_STATE_INPLACE")) != 0;
+    const ggml_tensor * gr = cgraph->nodes[i];
+    if (disabled || gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            gr->ne[1] != 1 || gr->ne[2] != 1 || gr->ne[3] != 1 || ggml_node_get_use_count(cgraph, i) != 1) {
+        return false;
+    }
+    const ggml_tensor * src = gr->src[0];
+    const ggml_tensor * ids = gr->src[1];
+    if (src->type != GGML_TYPE_F32 || src->nb[0] != sizeof(float) || src->ne[0] != gr->ne[0] ||
+            ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1) {
+        return false;
+    }
+    const int end = std::min(cgraph->n_nodes, i + 16);
+    for (int r = i + 1; r < end; ++r) {
+        if (cgraph->nodes[r]->src[0] == gr && (cgraph->nodes[r]->op != GGML_OP_RESHAPE || ggml_node_get_use_count(cgraph, r) != 1)) {
+            return false;
+        }
+    }
+    for (int m = i + 1; m < end; ++m) {
+        int j = -1;
+        const ggml_tensor * s0 = nullptr;
+        if (cgraph->nodes[m]->op == GGML_OP_MUL_MAT && ggml_cuda_match_conv_input_fusion(cgraph, m, j, s0) && s0 == gr &&
+                cgraph->nodes[j]->ne[2] == 1 && cgraph->nodes[j]->ne[3] == 1) {
+            g_conv_state_srcs[gr] = { (const float *) src->data, (const int32_t *) ids->data, (int64_t) (src->nb[1]/sizeof(float)) };
+            return true;
+        }
+    }
+    return false;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, ggml_cuda_graph * graph) {
     int64_t t_ev = g_cgc_on ? ggml_time_us() : 0;
     bool graph_evaluated_or_captured = false;
@@ -7277,6 +7311,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_gdn_gather_index gdn_gather_index;
             cuda_ctx->gdn_deferred_gathers.clear();
             ggml_cuda_gdn_clear_state_srcs();
+            g_conv_state_srcs.clear();
+            g_conv_elided_cpys.clear();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
 #ifdef USE_CUDA_GRAPH
@@ -7330,6 +7366,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (node->op == GGML_OP_GET_ROWS && ggml_cuda_try_elide_gdn_state_gather(cgraph, i)) {
                     continue;
+                }
+                if (node->op == GGML_OP_GET_ROWS && ggml_cuda_try_elide_conv_state_gather(cgraph, i)) {
+                    continue;
+                }
+                if (node->op == GGML_OP_CPY && g_conv_elided_cpys.erase(node) > 0) {
+                    continue;
+                }
+                if (node->op == GGML_OP_CONCAT && !g_conv_state_srcs.empty()) {
+                    // the conv-input fusion did not take this CONCAT after all: materialize the skipped gather
+                    for (int s_i = 0; s_i < 2; ++s_i) {
+                        const ggml_tensor * t = node->src[s_i];
+                        while (t != nullptr && t->view_src != nullptr) {
+                            t = t->view_src;
+                        }
+                        if (t != nullptr && g_conv_state_srcs.erase(t) > 0) {
+                            ggml_cuda_compute_forward(*cuda_ctx, (ggml_tensor *) t);
+                        }
+                    }
                 }
 
                 if (fuse_gdn_state_gather && node->op == GGML_OP_GET_ROWS &&

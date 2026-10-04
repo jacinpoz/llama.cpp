@@ -724,6 +724,10 @@ static __global__ void mul_mat_vec_q(
     [[maybe_unused]] float * conv_input = nullptr;
     [[maybe_unused]] const float * conv_states = nullptr;
     [[maybe_unused]] int conv_kernel_size = 0;
+    [[maybe_unused]] const int32_t * conv_state_ids = nullptr;
+    [[maybe_unused]] const float * conv_state_src = nullptr;
+    [[maybe_unused]] int64_t conv_state_row_stride = 0;
+    [[maybe_unused]] float * conv_state_dst = nullptr;
     ggml_glu_op active_glu;
     float glu_limit = 0.0f;
 
@@ -740,11 +744,15 @@ static __global__ void mul_mat_vec_q(
         if (use_dst_gate) {
             dst_gate = fusion.dst_gate;
         }
-        use_conv_input = fusion.conv_input != nullptr && fusion.conv_states != nullptr;
+        use_conv_input = fusion.conv_input != nullptr && (fusion.conv_states != nullptr || fusion.conv_state_src != nullptr);
         if (use_conv_input) {
-            conv_input       = (float *) fusion.conv_input;
-            conv_states      = (const float *) fusion.conv_states;
-            conv_kernel_size = fusion.conv_kernel_size;
+            conv_input            = (float *) fusion.conv_input;
+            conv_states           = (const float *) fusion.conv_states;
+            conv_kernel_size      = fusion.conv_kernel_size;
+            conv_state_ids        = fusion.conv_state_ids;
+            conv_state_src        = fusion.conv_state_src;
+            conv_state_row_stride = fusion.conv_state_row_stride;
+            conv_state_dst        = fusion.conv_state_dst;
         }
         if constexpr (type == GGML_TYPE_NVFP4) {
             use_scale      = fusion.x_scale    != nullptr;
@@ -924,10 +932,22 @@ static __global__ void mul_mat_vec_q(
                 const float r_bcast = __shfl_sync(0xffffffff, result_val, i, warp_size);
                 const int c = row0 + i;
                 const int cs = conv_kernel_size;
-                if (threadIdx.x < cs) {
-                    const int k = threadIdx.x;
-                    const float v = k < cs - 1 ? conv_states[(cs-1)*c + k] : r_bcast;
+                const int k = threadIdx.x;
+                float v = r_bcast;
+                if (k < cs - 1) {
+                    v = conv_state_src != nullptr ? conv_state_src[conv_state_ids[0]*conv_state_row_stride + (cs-1)*c + k]
+                                                  : conv_states[(cs-1)*c + k];
+                }
+                if (k < cs) {
                     conv_input[cs*c + k] = v;
+                }
+                if (conv_state_dst != nullptr) {
+                    // the next state is conv_input columns 1..cs-1; every lane has loaded before any lane stores,
+                    // so conv_state_dst may be the row conv_state_src was read from
+                    const float v_next = __shfl_sync(0xffffffff, v, k + 1, warp_size);
+                    if (k < cs - 1) {
+                        conv_state_dst[(cs-1)*c + k] = v_next;
+                    }
                 }
             } else if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < stride_col_dst)) {
                 dst[j*stride_col_dst + i] = result_val;
@@ -1825,11 +1845,16 @@ void ggml_cuda_mul_mat_vec_q(
         fusion_local.x_scale_channel_dst = fusion->x_scale_channel_dst;
         if (fusion->conv_input) {
             GGML_ASSERT(fusion->conv_input->type == GGML_TYPE_F32);
-            GGML_ASSERT(fusion->conv_states && fusion->conv_states->type == GGML_TYPE_F32);
+            GGML_ASSERT((fusion->conv_states && fusion->conv_states->type == GGML_TYPE_F32) ||
+                        (fusion->conv_state_src && fusion->conv_state_ids));
             GGML_ASSERT(fusion->conv_kernel_size >= 2);
-            fusion_local.conv_input       = fusion->conv_input->data;
-            fusion_local.conv_states      = fusion->conv_states->data;
-            fusion_local.conv_kernel_size = fusion->conv_kernel_size;
+            fusion_local.conv_input            = fusion->conv_input->data;
+            fusion_local.conv_states           = fusion->conv_states ? fusion->conv_states->data : nullptr;
+            fusion_local.conv_kernel_size      = fusion->conv_kernel_size;
+            fusion_local.conv_state_ids        = fusion->conv_state_ids;
+            fusion_local.conv_state_src        = fusion->conv_state_src;
+            fusion_local.conv_state_row_stride = fusion->conv_state_row_stride;
+            fusion_local.conv_state_dst        = fusion->conv_state_dst;
         }
         if (fusion->gate_scale) {
             GGML_ASSERT(fusion->gate_scale->type == GGML_TYPE_F32);
@@ -2835,16 +2860,15 @@ int ggml_cuda_mul_mat_id_weighted_down_try_fuse(ggml_backend_cuda_context & ctx,
     return 0;
 }
 
-// SSM conv-input fusion: the qkv_mixed MUL_MAT output feeds the last row of an interleaved
-// [conv_kernel_size, channels] conv input (via view nodes and a dim-0 CONCAT); fold the concat into
-// the mmvq epilogue.  Returns the number of nodes to skip (j - i), 0 otherwise.
-// GGML_CUDA_DISABLE_SSM_CONV_IN=1 turns it off.
-int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+thread_local std::unordered_map<const ggml_tensor *, ggml_cuda_conv_state_src> g_conv_state_srcs;
+thread_local std::unordered_set<const ggml_tensor *>                            g_conv_elided_cpys;
+
+bool ggml_cuda_match_conv_input_fusion(const ggml_cgraph * cgraph, const int i, int & j_out, const ggml_tensor *& s0_out) {
     static const bool disable_ssm_conv_in = [] { const char * e = getenv("GGML_CUDA_DISABLE_SSM_CONV_IN"); return e != nullptr && std::atoi(e); }();
-    ggml_tensor * node = cgraph->nodes[i];
+    const ggml_tensor * node = cgraph->nodes[i];
     if (disable_ssm_conv_in || node->op != GGML_OP_MUL_MAT || !(node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
             !ggml_cuda_should_fuse_mul_mat_vec_q(node)) {
-        return 0;
+        return false;
     }
     const int scan_end = std::min(cgraph->n_nodes, i + 8);
     for (int j = i + 1; j < scan_end; ++j) {
@@ -2902,14 +2926,68 @@ int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_c
         if (!states_ready) {
             continue;
         }
-        ggml_cuda_mm_fusion_args_host fusion_data{};
-        fusion_data.conv_input       = n;
-        fusion_data.conv_states      = s0;
-        fusion_data.conv_kernel_size = cs;
-        ggml_cuda_mul_mat_vec_q(ctx, node->src[0], node->src[1], node->src[2], node, &fusion_data);
-        return j - i;
+        j_out  = j;
+        s0_out = s0;
+        return true;
     }
-    return 0;
+    return false;
+}
+
+// The CPY that stores conv_input columns 1..cs-1 (conv_state_last) into a contiguous cache row.
+static const ggml_tensor * ggml_cuda_find_conv_state_cpy(const ggml_cgraph * cgraph, const int j_concat) {
+    const ggml_tensor * n  = cgraph->nodes[j_concat];
+    const int64_t       cs = n->ne[0];
+    const int64_t       C  = n->ne[1];
+    const int end = std::min(cgraph->n_nodes, j_concat + 8);
+    for (int k = j_concat + 1; k < end; ++k) {
+        const ggml_tensor * cpy = cgraph->nodes[k];
+        if (cpy->op != GGML_OP_CPY) {
+            continue;
+        }
+        const ggml_tensor * last = cpy->src[0];
+        const ggml_tensor * dst  = cpy->src[1];
+        if (last->op == GGML_OP_VIEW && last->view_src == n && last->view_offs == sizeof(float) &&
+                last->ne[0] == cs - 1 && last->ne[1] == C && last->ne[2] == 1 && last->ne[3] == 1 && last->nb[1] == n->nb[1] &&
+                dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) && ggml_nelements(dst) == (cs - 1)*C &&
+                cpy->type == GGML_TYPE_F32 && ggml_node_get_use_count(cgraph, k) == 0 && !(cpy->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return cpy;
+        }
+    }
+    return nullptr;
+}
+
+// SSM conv-input fusion: the qkv_mixed MUL_MAT output feeds the last row of an interleaved
+// [conv_kernel_size, channels] conv input (via view nodes and a dim-0 CONCAT); fold the concat into
+// the mmvq epilogue.  Returns the number of nodes to skip (j - i), 0 otherwise.
+// GGML_CUDA_DISABLE_SSM_CONV_IN=1 turns it off.
+int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    ggml_tensor * node = cgraph->nodes[i];
+    int j = -1;
+    const ggml_tensor * s0 = nullptr;
+    if (!ggml_cuda_match_conv_input_fusion(cgraph, i, j, s0)) {
+        return 0;
+    }
+    const ggml_tensor * n = cgraph->nodes[j];
+    ggml_cuda_mm_fusion_args_host fusion_data{};
+    fusion_data.conv_input       = n;
+    fusion_data.conv_states      = s0;
+    fusion_data.conv_kernel_size = n->ne[0];
+    const auto it = g_conv_state_srcs.find(s0);
+    if (it != g_conv_state_srcs.end()) {
+        // decode form: states read from the cache row, shifted state written to the snapshot slot
+        fusion_data.conv_states           = nullptr;
+        fusion_data.conv_state_src        = it->second.base;
+        fusion_data.conv_state_ids        = it->second.ids;
+        fusion_data.conv_state_row_stride = it->second.row_stride;
+        const ggml_tensor * cpy = ggml_cuda_find_conv_state_cpy(cgraph, j);
+        if (cpy != nullptr) {
+            fusion_data.conv_state_dst = (float *) cpy->src[1]->data;
+            g_conv_elided_cpys.insert(cpy);
+        }
+        g_conv_state_srcs.erase(it);
+    }
+    ggml_cuda_mul_mat_vec_q(ctx, node->src[0], node->src[1], node->src[2], node, &fusion_data);
+    return j - i;
 }
 
 // Fuse the SSM pre-scan chain: conv+silu, l2_norm(q,k) and the gate/beta projections (decode only).
