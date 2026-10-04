@@ -11402,12 +11402,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     // gufo GQA-6: Qwen3.5/3.8 dense 27B shapes (4 KV heads x 6), including the q5_0 KV cache
-    for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q5_0}) {
+    for (ggml_type t : {GGML_TYPE_F16, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0}) {
         for (int64_t kv : {256, 1024, 4352}) {
             for (int64_t nb : {64, 200, 512}) {
                 if (nb > kv) continue;
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t, t));
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 1, 2, 3}, true, false, 0, true));
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, t, t));
             }
         }
     }
