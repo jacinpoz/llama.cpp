@@ -27,6 +27,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/gdn-gates.cuh"
 #include "ggml-cuda/fattn-qsa.cuh"
 #include "ggml-cuda/indexer-topk.cuh"
 #include "ggml-cuda/indexer-score.cuh"
@@ -4584,6 +4585,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int sk = ggml_cuda_try_fuse_gdn_gates(*cuda_ctx, cgraph, i);
+        if (sk > 0) {
+            return sk;
+        }
+    }
 
     // Prefill indexer head reduction (relu + head-sum) for the qwen4exp sparse-attention graph.
     if (node->op == GGML_OP_UNARY && GGML_CUDA_CC_IS_RDNA3_5(cc)) {
