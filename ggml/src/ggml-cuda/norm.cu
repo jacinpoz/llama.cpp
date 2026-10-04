@@ -664,6 +664,76 @@ static __global__ void rms_norm_q8_1_f32(
         mul += row*mul_stride_row;
     }
 
+    // Rows of up to kRegs*block_size columns keep each thread's values in registers between the passes
+    // (same arithmetic as the reloading loops below, so the results are bit-identical).
+    constexpr int kRegs = 8;
+    if (ncols <= kRegs*block_size) {
+        float v[kRegs];
+        float tmp = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kRegs; ++k) {
+            const int col = tid + k*block_size;
+            if (col < ncols) {
+                float xi;
+                if constexpr (has_add) {
+                    const int64_t off = sample*stride_sample + channel*stride_channel + row*stride_row;
+                    xi = xa[off + col] + xb[off + col];
+                    ((float *) x)[col] = xi;
+                } else {
+                    xi = x[col];
+                }
+                v[k] = xi;
+                tmp += xi * xi;
+            }
+        }
+
+        extern __shared__ float s_sum[];
+        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+        const float mean = tmp / ncols;
+        const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+        for (int k = 0; k < kRegs; ++k) {
+            const int col = tid + k*block_size;
+            if (col < ncols) {
+                v[k] = mul == nullptr ? scale * v[k] : scale * v[k] * mul[col];
+                dst[col] = v[k];
+            }
+        }
+
+        if constexpr (has_add) {
+            if (y == nullptr) {
+                return;
+            }
+        }
+
+        // a warp's lanes hold the 32 consecutive columns of one Q8_1 block
+#pragma unroll
+        for (int k = 0; k < kRegs; ++k) {
+            const int col = tid + k*block_size;
+            if (k*block_size >= ncols) {
+                break;
+            }
+            const int ib = col / QK8_1;
+            const int lane = col % QK8_1;
+            const float xi = col < ncols ? v[k] : 0.0f;
+            float amax = fabsf(xi);
+            float sum  = xi;
+            amax = warp_reduce_max(amax);
+            sum  = warp_reduce_sum(sum);
+            if (col < ncols) {
+                const float d = amax / 127.0f;
+                const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+                y[ib].qs[lane] = q;
+                if (lane == 0) {
+                    y[ib].ds = make_half2(d, sum);
+                }
+            }
+        }
+        return;
+    }
+
     float tmp = 0.0f;
     if constexpr (has_add) {
         // contiguous rows: xa, xb and the sum x share the row offset
