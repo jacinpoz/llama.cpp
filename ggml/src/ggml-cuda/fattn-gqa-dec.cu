@@ -223,7 +223,7 @@ constexpr int kCombineWaves = 8;
 template <int G>
 __launch_bounds__(kCombineWaves*WARP_SIZE, 1) __global__ void gqa_dec_combine(
         const float * __restrict__ part_acc, const float2 * __restrict__ part_ms, float * __restrict__ dst,
-        const int n_chunks, const int n_head_kv, const int n_head, const int q0) {
+        const int n_chunks, const int n_head_kv, const int n_head, const int q0, const gqa_dec_epilogue ep) {
     const int hq   = blockIdx.x;
     const int t    = blockIdx.y;
     const int h    = hq / G;
@@ -286,15 +286,54 @@ __launch_bounds__(kCombineWaves*WARP_SIZE, 1) __global__ void gqa_dec_combine(
             }
         }
         float * out = dst + ((int64_t) (q0 + t)*n_head + hq)*kD + lane*8;
+        float o[8];
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            out[i] = AA[i]/SS;
+            o[i] = AA[i]/SS;
+        }
+        if (ep.gate != nullptr) {
+            // inverse V rotation: fwht over each 64-dim chunk (8 lanes x 8 dims), stages in the order of the chunk
+            // index bits 0..5 as fwht_cuda<64> runs them, so the result is bit-identical; then x sigmoid(gate)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                o[i] *= 0.125f;
+            }
+#pragma unroll
+            for (int hh = 1; hh < 8; hh *= 2) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    if ((i & hh) == 0) {
+                        const float x = o[i];
+                        const float y = o[i + hh];
+                        o[i]      = x + y;
+                        o[i + hh] = x - y;
+                    }
+                }
+            }
+#pragma unroll
+            for (int hh = 1; hh < 8; hh *= 2) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float val2 = __shfl_xor(o[i], hh, WARP_SIZE);
+                    o[i] = (lane & hh) == 0 ? o[i] + val2 : val2 - o[i];
+                }
+            }
+            const float * gp = reinterpret_cast<const float *>(ep.gate + (int64_t) (q0 + t)*ep.gate_nb2 + (int64_t) hq*ep.gate_nb1) + lane*8;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                o[i] = o[i] * (1.0f / (1.0f + expf(-gp[i])));
+            }
+            out = ep.out + ((int64_t) (q0 + t)*n_head + hq)*kD + lane*8;
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            out[i] = o[i];
         }
     }
 }
 
 template <int G, ggml_type T>
-void gqa_dec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void gqa_dec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const gqa_dec_epilogue & ep) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
@@ -323,17 +362,17 @@ void gqa_dec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1]);
         CUDA_CHECK(cudaGetLastError());
         gqa_dec_combine<G><<<dim3(n_head, nq), kCombineWaves*WARP_SIZE, 0, stream>>>(
-            part_acc.ptr, part_ms.ptr, (float *) dst->data, n_chunks, n_head_kv, n_head, q0);
+            part_acc.ptr, part_ms.ptr, (float *) dst->data, n_chunks, n_head_kv, n_head, q0, ep);
         CUDA_CHECK(cudaGetLastError());
     }
 }
 
 template <int G>
-void gqa_dec_launch_type(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void gqa_dec_launch_type(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const gqa_dec_epilogue & ep) {
     switch (dst->src[1]->type) {
-        case GGML_TYPE_F16:  gqa_dec_launch<G, GGML_TYPE_F16> (ctx, dst); break;
-        case GGML_TYPE_Q8_0: gqa_dec_launch<G, GGML_TYPE_Q8_0>(ctx, dst); break;
-        case GGML_TYPE_Q5_0: gqa_dec_launch<G, GGML_TYPE_Q5_0>(ctx, dst); break;
+        case GGML_TYPE_F16:  gqa_dec_launch<G, GGML_TYPE_F16> (ctx, dst, ep); break;
+        case GGML_TYPE_Q8_0: gqa_dec_launch<G, GGML_TYPE_Q8_0>(ctx, dst, ep); break;
+        case GGML_TYPE_Q5_0: gqa_dec_launch<G, GGML_TYPE_Q5_0>(ctx, dst, ep); break;
         default: GGML_ABORT("gqa_dec: unsupported K/V type");
     }
 }
@@ -373,11 +412,11 @@ bool ggml_cuda_fattn_gqa_dec_supported(const int device, const ggml_tensor * dst
 #endif // GGML_USE_HIP
 }
 
-void ggml_cuda_flash_attn_ext_gqa_dec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_flash_attn_ext_gqa_dec(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const gqa_dec_epilogue & ep) {
     const int gqa = (int) (dst->src[0]->ne[2]/dst->src[1]->ne[2]);
     if (gqa == 6) {
-        gqa_dec_launch_type<6>(ctx, dst);
+        gqa_dec_launch_type<6>(ctx, dst, ep);
     } else {
-        gqa_dec_launch_type<8>(ctx, dst);
+        gqa_dec_launch_type<8>(ctx, dst, ep);
     }
 }

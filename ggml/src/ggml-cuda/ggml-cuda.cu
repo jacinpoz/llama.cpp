@@ -28,6 +28,7 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/gdn-gates.cuh"
+#include "ggml-cuda/fattn-gqa-dec.cuh"
 #include "ggml-cuda/fattn-qsa.cuh"
 #include "ggml-cuda/indexer-topk.cuh"
 #include "ggml-cuda/indexer-score.cuh"
@@ -4756,6 +4757,60 @@ static bool ggml_cuda_try_elide_conv_state_gather(const ggml_cgraph * cgraph, co
     return false;
 }
 
+// Qwen3.5/3.8 gated-attention tail after a GQA-decode FLASH_ATTN_EXT (n_q <= 8):
+//   RESHAPE RESHAPE MUL_MAT(hadamard 64) RESHAPE VIEW(gate of Qcur_full) CONT SIGMOID MUL
+// is folded into the attention combine kernel (fwht64 in fwht_cuda's stage order, so bit-identical, then
+// x sigmoid(gate)), saving three launches per attention layer. GGML_CUDA_DISABLE_ATTN_TAIL_FUSION=1 turns it off.
+static int ggml_cuda_try_fuse_attn_tail(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool disabled = getenv("GGML_CUDA_DISABLE_ATTN_TAIL_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_ATTN_TAIL_FUSION")) != 0;
+    ggml_tensor * fa = cgraph->nodes[i];
+    if (disabled || fa->op != GGML_OP_FLASH_ATTN_EXT || i + 8 >= cgraph->n_nodes || !ggml_cuda_fattn_gqa_dec_supported(ctx.device, fa)) {
+        return 0;
+    }
+    static const ggml_op ops[] = {
+        GGML_OP_FLASH_ATTN_EXT, GGML_OP_RESHAPE, GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE,
+        GGML_OP_VIEW, GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL,
+    };
+    for (int k = 0; k < 9; ++k) {
+        if (cgraph->nodes[i + k]->op != ops[k]) {
+            return 0;
+        }
+    }
+    const ggml_tensor * r1   = cgraph->nodes[i + 1];
+    const ggml_tensor * r2   = cgraph->nodes[i + 2];
+    const ggml_tensor * mm   = cgraph->nodes[i + 3];
+    const ggml_tensor * pre  = cgraph->nodes[i + 4];
+    const ggml_tensor * gv   = cgraph->nodes[i + 5];
+    const ggml_tensor * cont = cgraph->nodes[i + 6];
+    const ggml_tensor * sig  = cgraph->nodes[i + 7];
+    ggml_tensor *       mul  = cgraph->nodes[i + 8];
+    const int64_t D = fa->ne[0], H = fa->ne[1], T = fa->ne[2];
+    if (r1->src[0] != fa || r2->src[0] != r1 || mm->src[1] != r2 || pre->src[0] != mm || cont->src[0] != gv ||
+            sig->src[0] != cont || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID ||
+            !((mul->src[0] == pre && mul->src[1] == sig) || (mul->src[0] == sig && mul->src[1] == pre))) {
+        return 0;
+    }
+    if (ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD || r2->ne[0] != 64 || mm->type != GGML_TYPE_F32 ||
+            D != 256 || fa->ne[3] != 1 || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) || ggml_nelements(mul) != D*H*T ||
+            gv->type != GGML_TYPE_F32 || gv->nb[0] != sizeof(float) || gv->ne[0] != D || gv->ne[1] != H ||
+            (T > 1 && gv->ne[2] != T)) {
+        return 0;
+    }
+    for (int k : { 0, 1, 2, 3, 4, 5, 6, 7 }) {
+        const ggml_tensor * n = cgraph->nodes[i + k];
+        if ((n->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i + k) != 1) {
+            return 0;
+        }
+    }
+    gqa_dec_epilogue ep;
+    ep.gate     = (const char *) gv->data;
+    ep.gate_nb1 = gv->nb[1];
+    ep.gate_nb2 = T > 1 ? gv->nb[2] : 0;
+    ep.out      = (float *) mul->data;
+    ggml_cuda_flash_attn_ext_gqa_dec(ctx, fa, ep);
+    return 8;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4773,6 +4828,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        const int sk = ggml_cuda_try_fuse_attn_tail(*cuda_ctx, cgraph, i);
+        if (sk > 0) {
+            return sk;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT) {
         const int sk = ggml_cuda_try_fuse_gdn_gates(*cuda_ctx, cgraph, i);
