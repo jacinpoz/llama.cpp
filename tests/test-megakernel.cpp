@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -776,6 +777,234 @@ static bool test_ffn(hipStream_t stream, int n_blocks, bool timing) {
     printf("ffn: %s\n", ok ? "OK" : "FAILED");
     return ok;
 }
+
+// Path F prototype: independent ops side by side in one normal launch. Each block runs one op;
+// params travel by value in kernarg and the hardware dispatcher balances the blocks.
+template <int BLOCK>
+static __device__ void mf_run_op(const mk_param_blob & blob, int opcode, int variant, int n_tiles, int blk, char * lds) {
+    auto exec = [&](auto op) {
+        using Op = decltype(op);
+        using P  = mk_op_params<Op>;
+        const P & p = *reinterpret_cast<const P *>(blob.b);
+        constexpr int nsub = BLOCK / Op::threads;
+        const int sub  = threadIdx.x / Op::threads;
+        const int tile = blk*nsub + sub;
+        Op::run(p, variant, tile < n_tiles ? tile : n_tiles - 1, tile < n_tiles, lds + sub*Op::lds_bytes);
+    };
+    switch (opcode) {
+        case MK_OP_MMVQ:          mk_mmvq_dispatch<BLOCK>(variant, exec); break;
+        case MK_OP_QUANTIZE_Q8_1: exec(mk_quantize_q8_1<BLOCK>{}); break;
+        default: break;
+    }
+}
+
+struct mf_op { mk_param_blob blob; int opcode, variant, n_tiles, n_blocks; };
+
+template <int BLOCK>
+__global__ void __launch_bounds__(BLOCK) k_multi2(const mf_op a, const mf_op b) {
+    __shared__ __align__(16) char lds[8192];
+    if ((int) blockIdx.x < a.n_blocks) {
+        mf_run_op<BLOCK>(a.blob, a.opcode, a.variant, a.n_tiles, blockIdx.x, lds);
+    } else {
+        mf_run_op<BLOCK>(b.blob, b.opcode, b.variant, b.n_tiles, blockIdx.x - a.n_blocks, lds);
+    }
+}
+
+
+// rms_norm -> two independent matvecs over the same input: the GDN qkv (Q6_K) and z (IQ4_XS) projections.
+struct proj_case {
+    static constexpr int n_embd = 5120;
+    ggml_backend_t backend = nullptr; ggml_context * ctx = nullptr; ggml_backend_buffer_t buf = nullptr; ggml_cgraph * gf = nullptr;
+    ggml_tensor * x = nullptr, * norm_w = nullptr, * wa = nullptr, * wb = nullptr, * oa = nullptr, * ob = nullptr;
+    proj_case() {
+        backend = ggml_backend_cuda_init(ggml_cuda_get_device());
+        ggml_init_params ip = { 64*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+        ctx = ggml_init(ip);
+        x      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        // MK_ROWS_MULT scales both matrices past the 96 MiB infinity cache, as in real decode.
+        const int m = getenv("MK_ROWS_MULT") ? atoi(getenv("MK_ROWS_MULT")) : 1;
+        wa     = ggml_new_tensor_2d(ctx, GGML_TYPE_Q6_K,   n_embd, 10240*m);
+        wb     = ggml_new_tensor_2d(ctx, GGML_TYPE_IQ4_XS, n_embd, 6144*m);
+        ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), norm_w);
+        oa = ggml_mul_mat(ctx, wa, cur);
+        ob = ggml_mul_mat(ctx, wb, cur);
+        gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, oa);
+        ggml_build_forward_expand(gf, ob);
+        buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        std::vector<float> v(n_embd);
+        for (int i = 0; i < n_embd; ++i) { v[i] = 0.01f*(float) ((i*37) % 101 - 50); }
+        ggml_backend_tensor_set(x, v.data(), 0, ggml_nbytes(x));
+        for (int i = 0; i < n_embd; ++i) { v[i] = 1.0f + 0.001f*(float) (i % 13); }
+        ggml_backend_tensor_set(norm_w, v.data(), 0, ggml_nbytes(norm_w));
+        ffn_case::fill_quant(wa);
+        ffn_case::fill_quant(wb);
+    }
+    ~proj_case() { ggml_backend_buffer_free(buf); ggml_free(ctx); ggml_backend_free(backend); }
+};
+
+// Typed form: exact op types are template arguments and params are typed kernel arguments, so the
+// compiler sees kernarg pointers (global loads, scalar params) and instantiates only these two bodies.
+template <int BLOCK, typename OpA, typename OpB>
+__global__ void __launch_bounds__(BLOCK) k_multi_typed(const mk_op_params<OpA> pa, int nta, int nba, const mk_op_params<OpB> pb, int ntb) {
+    __shared__ __align__(16) char lds[(BLOCK/OpA::threads*OpA::lds_bytes > BLOCK/OpB::threads*OpB::lds_bytes ?
+                                      BLOCK/OpA::threads*OpA::lds_bytes : BLOCK/OpB::threads*OpB::lds_bytes) + 16];
+    auto go = [&](auto op, const auto & p, int nt, int blk) {
+        using Op = decltype(op);
+        constexpr int nsub = BLOCK / Op::threads;
+        const int sub  = threadIdx.x / Op::threads;
+        const int tile = blk*nsub + sub;
+        Op::run(p, 0, tile < nt ? tile : nt - 1, tile < nt, lds + sub*Op::lds_bytes);
+    };
+    if ((int) blockIdx.x < nba) {
+        go(OpA{}, pa, nta, blockIdx.x);
+    } else {
+        go(OpB{}, pb, ntb, blockIdx.x - nba);
+    }
+}
+
+template <typename Op, int MINB>
+__global__ void __launch_bounds__(Op::threads, MINB > 0 ? MINB : 1) k_direct(const mk_op_params<Op> p) {
+    __shared__ __align__(16) char lds[Op::lds_bytes + 16];
+    Op::block(p, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x % 32, threadIdx.x / 32, true, lds);
+}
+
+template <typename Op>
+__global__ void __launch_bounds__(Op::threads, 1) k_run1(const mk_op_params<Op> p, int nt) {
+    __shared__ __align__(16) char lds[Op::lds_bytes + 16];
+    Op::run(p, 0, blockIdx.x, true, lds);
+}
+
+// Tuned form: (BLOCK, 1) launch bounds, and decode-shaped tiles (one channel, one sample) passed straight
+// to block() without run()'s generic decode.
+template <int BLOCK, typename OpA, typename OpB>
+__global__ void __launch_bounds__(BLOCK, 1) k_multi_fast(const mk_op_params<OpA> pa, int nta, int nba, const mk_op_params<OpB> pb, int ntb) {
+    __shared__ __align__(16) char lds[(BLOCK/OpA::threads*OpA::lds_bytes > BLOCK/OpB::threads*OpB::lds_bytes ?
+                                      BLOCK/OpA::threads*OpA::lds_bytes : BLOCK/OpB::threads*OpB::lds_bytes) + 16];
+    auto go = [&](auto op, const auto & p, int nt, int blk) {
+        using Op = decltype(op);
+        constexpr int nsub = BLOCK / Op::threads;
+        const int sub   = threadIdx.x / Op::threads;
+        const int local = threadIdx.x % Op::threads;
+        const int tile  = blk*nsub + sub;
+        Op::block(p, tile < nt ? tile : nt - 1, 0, 0, local % 32, local / 32, tile < nt, lds + sub*Op::lds_bytes);
+    };
+    if ((int) blockIdx.x < nba) {
+        go(OpA{}, pa, nta, blockIdx.x);
+    } else {
+        go(OpB{}, pb, ntb, blockIdx.x - nba);
+    }
+}
+
+static bool test_multi(hipStream_t stream) {
+    proj_case pc;
+    std::vector<mk_recorded_op> recs;
+    ggml_cuda_mk_set_recording(&recs);
+    GGML_ASSERT(ggml_backend_graph_compute(pc.backend, pc.gf) == GGML_STATUS_SUCCESS);
+    ggml_cuda_mk_set_recording(nullptr);
+    ggml_backend_synchronize(pc.backend);
+    printf("multi: %zu recorded launches:", recs.size());
+    for (const auto & r : recs) { printf(" %s(v=0x%x,%d)", mk_opname(r.opcode), r.variant, r.n_tiles); }
+    printf("\n");
+    if (recs.size() != 3 || recs[1].opcode != MK_OP_MMVQ || recs[2].opcode != MK_OP_MMVQ) {
+        printf("multi: unexpected launch pattern, skipped\n");
+        return false;
+    }
+    std::vector<float> ra(pc.oa->ne[0]), rb(pc.ob->ne[0]);
+    ggml_backend_tensor_get(pc.oa, ra.data(), 0, ggml_nbytes(pc.oa));
+    ggml_backend_tensor_get(pc.ob, rb.data(), 0, ggml_nbytes(pc.ob));
+
+    constexpr int BLOCK = 256;
+    mf_op op[2];
+    for (int i = 0; i < 2; ++i) {
+        const mk_recorded_op & r = recs[1 + i];
+        memcpy(op[i].blob.b, r.params.data(), r.params.size());
+        op[i].opcode = r.opcode; op[i].variant = r.variant; op[i].n_tiles = r.n_tiles;
+        op[i].n_blocks = (r.n_tiles + BLOCK/r.threads - 1) / (BLOCK/r.threads);
+    }
+    std::vector<float> poison(pc.oa->ne[0], NAN);
+    ggml_backend_tensor_set(pc.oa, poison.data(), 0, ggml_nbytes(pc.oa));
+    ggml_backend_tensor_set(pc.ob, poison.data(), 0, ggml_nbytes(pc.ob));
+    ggml_backend_synchronize(pc.backend);
+    k_multi2<BLOCK><<<op[0].n_blocks + op[1].n_blocks, BLOCK, 0, stream>>>(op[0], op[1]);
+    sync_bounded(stream, 10000, "multi");
+    std::vector<float> ga(pc.oa->ne[0]), gb(pc.ob->ne[0]);
+    ggml_backend_tensor_get(pc.oa, ga.data(), 0, ggml_nbytes(pc.oa));
+    ggml_backend_tensor_get(pc.ob, gb.data(), 0, ggml_nbytes(pc.ob));
+    const bool ok = memcmp(ga.data(), ra.data(), ga.size()*4) == 0 && memcmp(gb.data(), rb.data(), gb.size()*4) == 0;
+    printf("multi: matvec pair %s\n", ok ? "bit-identical" : "DIFFERS");
+
+    using OpA = mk_mmvq<BLOCK, GGML_TYPE_Q6_K,   1, false, false, 0, true>;
+    using OpB = mk_mmvq<BLOCK, GGML_TYPE_IQ4_XS, 1, false, false, 0, true>;
+    GGML_ASSERT(recs[1].variant == mk_mmvq_variant(GGML_TYPE_Q6_K, 1, false, true) && recs[2].variant == mk_mmvq_variant(GGML_TYPE_IQ4_XS, 1, false, true));
+    mk_mmvq_params pa, pb;
+    memcpy(&pa, recs[1].params.data(), sizeof(pa));
+    memcpy(&pb, recs[2].params.data(), sizeof(pb));
+    // Grid sizes come from the recorded block sizes: OpA::threads in host code uses the generic mmvq table.
+    const int nba = (recs[1].n_tiles + BLOCK/recs[1].threads - 1) / (BLOCK/recs[1].threads);
+    const int nbb = (recs[2].n_tiles + BLOCK/recs[2].threads - 1) / (BLOCK/recs[2].threads);
+    auto typed = [&] { k_multi_typed<BLOCK, OpA, OpB><<<nba + nbb, BLOCK, 0, stream>>>(pa, recs[1].n_tiles, nba, pb, recs[2].n_tiles); };
+    ggml_backend_tensor_set(pc.oa, poison.data(), 0, ggml_nbytes(pc.oa));
+    ggml_backend_tensor_set(pc.ob, poison.data(), 0, ggml_nbytes(pc.ob));
+    ggml_backend_synchronize(pc.backend);
+    typed();
+    sync_bounded(stream, 10000, "multi typed");
+    ggml_backend_tensor_get(pc.oa, ga.data(), 0, ggml_nbytes(pc.oa));
+    ggml_backend_tensor_get(pc.ob, gb.data(), 0, ggml_nbytes(pc.ob));
+    const bool ok_typed = memcmp(ga.data(), ra.data(), ga.size()*4) == 0 && memcmp(gb.data(), rb.data(), gb.size()*4) == 0;
+    printf("multi: recorded threads %d / %d, blocks %d + %d\n", recs[1].threads, recs[2].threads, nba, nbb);
+    printf("multi: typed matvec pair %s\n", ok_typed ? "bit-identical" : "DIFFERS");
+    ggml_backend_tensor_set(pc.oa, poison.data(), 0, ggml_nbytes(pc.oa));
+    ggml_backend_tensor_set(pc.ob, poison.data(), 0, ggml_nbytes(pc.ob));
+    ggml_backend_synchronize(pc.backend);
+    k_multi_fast<BLOCK, OpA, OpB><<<nba + nbb, BLOCK, 0, stream>>>(pa, recs[1].n_tiles, nba, pb, recs[2].n_tiles);
+    sync_bounded(stream, 10000, "multi fast");
+    ggml_backend_tensor_get(pc.oa, ga.data(), 0, ggml_nbytes(pc.oa));
+    ggml_backend_tensor_get(pc.ob, gb.data(), 0, ggml_nbytes(pc.ob));
+    const bool ok_fast = memcmp(ga.data(), ra.data(), ga.size()*4) == 0 && memcmp(gb.data(), rb.data(), gb.size()*4) == 0;
+    printf("multi: fast 2-op kernel %s\n", ok_fast ? "bit-identical" : "DIFFERS");
+    if (!ok_typed) {
+        int da = 0, na = 0, db = 0, nb = 0;
+        for (size_t i = 0; i < ga.size(); ++i) { da += memcmp(&ga[i], &ra[i], 4) != 0; na += std::isnan(ga[i]); }
+        for (size_t i = 0; i < gb.size(); ++i) { db += memcmp(&gb[i], &rb[i], 4) != 0; nb += std::isnan(gb[i]); }
+        printf("multi: qkv differs %d (nan %d) of %zu, z differs %d (nan %d) of %zu; e.g. qkv[0] %.9g vs %.9g\n", da, na, ga.size(), db, nb, gb.size(), ga[0], ra[0]);
+    }
+
+    // Timing: the normal path (graph: norm + 2 mmvq) vs the norm's recorded launch... approximated by the
+    // reference graph minus nothing: compare the full graph against norm-in-graph + one multi-op launch.
+    constexpr int iters = 2000;
+    if (getenv("MK_MULTI_PARTS")) {
+        // Each op alone in the multi-op kernel shape, and the IQ4_XS op at its native 32-thread blocks.
+        using OpB32 = mk_mmvq<32, GGML_TYPE_IQ4_XS, 1, false, false, 0, true>;
+        auto t_a   = [&] { k_multi_typed<BLOCK, OpA, OpB><<<nba, BLOCK, 0, stream>>>(pa, recs[1].n_tiles, nba, pb, 0); };
+        auto t_b   = [&] { k_multi_typed<BLOCK, OpA, OpB><<<nbb, BLOCK, 0, stream>>>(pa, 0, 0, pb, recs[2].n_tiles); };
+        auto t_aa  = [&] { k_multi_typed<BLOCK, OpA, OpA><<<nba, BLOCK, 0, stream>>>(pa, recs[1].n_tiles, nba, pa, 0); };
+        using OpA8 = mk_mmvq<256, GGML_TYPE_Q6_K, 1, false, false, 0, true>;
+        auto t_dir1 = [&] { k_direct<OpA8, 1><<<nba, 256, 0, stream>>>(pa); };
+        auto t_dir0 = [&] { k_direct<OpA8, 0><<<nba, 256, 0, stream>>>(pa); };
+        auto t_run1 = [&] { k_run1<OpA8><<<nba, 256, 0, stream>>>(pa, nba); };
+        auto t_fast_a = [&] { k_multi_fast<BLOCK, OpA, OpB><<<nba, BLOCK, 0, stream>>>(pa, recs[1].n_tiles, nba, pb, 0); };
+        auto t_fast   = [&] { k_multi_fast<BLOCK, OpA, OpB><<<nba + nbb, BLOCK, 0, stream>>>(pa, recs[1].n_tiles, nba, pb, recs[2].n_tiles); };
+        auto t_sep    = [&] { k_direct<OpA8, 1><<<nba, 256, 0, stream>>>(pa); k_direct<mk_mmvq<32, GGML_TYPE_IQ4_XS, 1, false, false, 0, true>, 1><<<recs[2].n_tiles, 32, 0, stream>>>(pb); };
+        auto t_b32 = [&] { k_multi_typed<32, OpB32, OpB32><<<recs[2].n_tiles, 32, 0, stream>>>(pb, recs[2].n_tiles, recs[2].n_tiles, pb, 0); };
+        for (auto & [f, name] : std::vector<std::pair<std::function<void()>, const char *>>{ {t_a, "Q6_K op alone, BLOCK 256"}, {t_aa, "Q6_K op, kernel of Q6_K only"}, {t_dir1, "Q6_K block(), bounds(256,1)"}, {t_fast_a, "Q6_K in fast 2-op kernel"}, {t_fast, "both ops, fast 2-op kernel"}, {t_sep, "both ops, 2 direct kernels"}, {t_dir0, "Q6_K block(), bounds(256)"}, {t_run1, "Q6_K run(), bounds(256,1)"}, {t_b, "IQ4_XS op alone, BLOCK 256"}, {t_b32, "IQ4_XS op alone, BLOCK 32"} }) {
+            const float ms = gpu_time_ms(stream, 60000, name, [&] { for (int i = 0; i < 500; ++i) { f(); } });
+            printf("multi parts: %-28s %.1f us\n", name, 1000.0f*ms/500);
+        }
+    }
+    for (int rep = 0; rep < 3; ++rep) {
+        ggml_backend_synchronize(pc.backend);
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) { ggml_backend_graph_compute_async(pc.backend, pc.gf); }
+        ggml_backend_synchronize(pc.backend);
+        const double us_ref = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
+        const float ms_pair = gpu_time_ms(stream, 60000, "multi pair", [&] { for (int i = 0; i < iters; ++i) { typed(); } });
+        printf("multi timing rep %d: reference graph (norm + 2 mmvq) %.1f us; typed multi-op launch (2 mmvq) %.1f us\n",
+               rep, us_ref, 1000.0f*ms_pair/iters);
+    }
+    return ok && ok_typed && ok_fast;
+}
 #endif // __has_include("mk-ops-ffn.cuh")
 
 int main(int argc, char ** argv) {
@@ -825,7 +1054,9 @@ int main(int argc, char ** argv) {
         if (!getenv("MK_FFN_ONLY")) { test_timing(stream, n_blocks); }
     }
 #if __has_include("mk-ops-ffn.cuh")
-    if (ffn || timing) {
+    if (getenv("MK_MULTI")) {
+        ok = test_multi(stream) && ok;
+    } else if (ffn || timing) {
         ok = test_ffn(stream, n_blocks, timing) && ok;
     }
 #else

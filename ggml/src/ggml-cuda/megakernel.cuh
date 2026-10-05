@@ -132,6 +132,7 @@ struct mk_recorded_op {
     uint16_t opcode;
     uint16_t variant;
     int32_t  n_tiles;
+    int32_t  threads;   // the launcher's block size, which is the op's sub-tile width
     std::vector<uint8_t> params;
 };
 
@@ -142,11 +143,11 @@ void ggml_cuda_mk_set_recording(std::vector<mk_recorded_op> * rec); // nullptr s
 #endif
 
 template <typename P>
-static void mk_record(uint16_t opcode, int variant, int64_t n_tiles, const P & p) {
+static void mk_record(uint16_t opcode, int variant, int64_t n_tiles, int threads, const P & p) {
     if (g_mk_recording == nullptr) {
         return;
     }
-    mk_recorded_op r = { opcode, (uint16_t) variant, (int32_t) n_tiles, std::vector<uint8_t>(sizeof(P)) };
+    mk_recorded_op r = { opcode, (uint16_t) variant, (int32_t) n_tiles, threads, std::vector<uint8_t>(sizeof(P)) };
     memcpy(r.params.data(), &p, sizeof(P));
     g_mk_recording->push_back(std::move(r));
 }

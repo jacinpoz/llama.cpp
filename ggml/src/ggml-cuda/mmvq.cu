@@ -811,7 +811,7 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
         const bool replayable = !small_k && !halve_iters && rows_per_block == 0 && !small_m && nrows_loop == 0 &&
                                 fusion.cat_dst[0] == nullptr;
         mk_record(MK_OP_MMVQ, mk_mmvq_variant(type, c_ncols_dst, c_ncols_dst == 1 && has_fusion, long_k),
-                  replayable ? (int64_t) block_nums.x*block_nums.y*block_nums.z : -1, p);
+                  replayable ? (int64_t) block_nums.x*block_nums.y*block_nums.z : -1, (int) (block_dims.x*block_dims.y), p);
     }
     if constexpr (c_ncols_dst == 1) {
         if (fusion.cat_dst[0] != nullptr) {

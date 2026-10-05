@@ -967,7 +967,7 @@ static void rms_norm_q8_1_record(
     p.nchannels      = blocks_num.y;
     p.eps            = eps;
     mk_record(MK_OP_RMSNORM_Q8_1, (xa != nullptr ? MK_RMSNORM_Q8_1_ADD : 0) | (block_size == 256 ? MK_RMSNORM_Q8_1_W256 : 0),
-              (int64_t) blocks_num.x*blocks_num.y*blocks_num.z, p);
+              (int64_t) blocks_num.x*blocks_num.y*blocks_num.z, block_size, p);
 }
 
 static void rms_norm_q8_1_cuda(
