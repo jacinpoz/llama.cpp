@@ -3710,13 +3710,24 @@ static __global__ void __launch_bounds__(BLOCK, 1) mmvq_triple(
     }
 }
 
+static int mmvq_triple_ncols(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, const ggml_cuda_mmvq_capture & c) {
+    auto one_row = [](const ggml_cuda_mmvq_capture & x) { return x.valid && x.grid_y == 1 && x.grid_z == 1 && 256 % x.threads == 0; };
+    if (!one_row(a) || !one_row(b) || !one_row(c)) {
+        return 0;
+    }
+    for (int t = 1; t <= MMVQ_MAX_BATCH_SIZE; ++t) {
+        if (a.variant == mk_mmvq_variant(GGML_TYPE_IQ4_XS, t, false, true) &&
+                b.variant == mk_mmvq_variant(GGML_TYPE_Q8_0, t, false, true) &&
+                c.variant == mk_mmvq_variant(GGML_TYPE_Q8_0, t, false, true)) {
+            return t;
+        }
+    }
+    return 0;
+}
+
 bool ggml_cuda_mmvq_triple_supported(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, const ggml_cuda_mmvq_capture & c) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    auto one_row = [](const ggml_cuda_mmvq_capture & x) { return x.valid && x.grid_y == 1 && x.grid_z == 1; };
-    return one_row(a) && one_row(b) && one_row(c) && get_device_table_id(cc) == MMVQ_PARAMETERS_RDNA3_0 &&
-           a.variant == mk_mmvq_variant(GGML_TYPE_IQ4_XS, 1, false, true) && a.threads == 32 &&
-           b.variant == mk_mmvq_variant(GGML_TYPE_Q8_0, 1, false, true) && b.threads == 256 &&
-           c.variant == mk_mmvq_variant(GGML_TYPE_Q8_0, 1, false, true) && c.threads == 256;
+    return mmvq_triple_ncols(a, b, c) > 0 && get_device_table_id(cc) == MMVQ_PARAMETERS_RDNA3_0;
 }
 
 void ggml_cuda_mmvq_launch_triple(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, const ggml_cuda_mmvq_capture & c,
@@ -3726,11 +3737,27 @@ void ggml_cuda_mmvq_launch_triple(const ggml_cuda_mmvq_capture & a, const ggml_c
     memcpy(&pb, b.params, sizeof(pb));
     memcpy(&pc, c.params, sizeof(pc));
     constexpr int BLOCK = 256;
-    using OpA = mk_mmvq<BLOCK, GGML_TYPE_IQ4_XS, 1, false, false, 0, true>;
-    using OpQ8 = mk_mmvq<BLOCK, GGML_TYPE_Q8_0, 1, false, false, 0, true>;
+    // block counts come from the launcher's own block sizes (host code cannot see the device mmvq table)
     const uint32_t nba = (a.grid_x + BLOCK/a.threads - 1) / (BLOCK/a.threads);
-    const uint32_t nbb = b.grid_x, nbc = c.grid_x;
-    mmvq_triple<BLOCK, OpA, OpQ8, OpQ8><<<nba + nbb + nbc, BLOCK, 0, stream>>>(pa, a.grid_x, nba, pb, b.grid_x, nbb, pc, c.grid_x);
+    const uint32_t nbb = (b.grid_x + BLOCK/b.threads - 1) / (BLOCK/b.threads);
+    const uint32_t nbc = (c.grid_x + BLOCK/c.threads - 1) / (BLOCK/c.threads);
+    auto launch = [&](auto t_c) {
+        constexpr int T = decltype(t_c)::value;
+        using OpA = mk_mmvq<BLOCK, GGML_TYPE_IQ4_XS, T, false, false, 0, true>;
+        using OpQ8 = mk_mmvq<BLOCK, GGML_TYPE_Q8_0, T, false, false, 0, true>;
+        mmvq_triple<BLOCK, OpA, OpQ8, OpQ8><<<nba + nbb + nbc, BLOCK, 0, stream>>>(pa, a.grid_x, nba, pb, b.grid_x, nbb, pc, c.grid_x);
+    };
+    switch (mmvq_triple_ncols(a, b, c)) {
+        case 1: launch(std::integral_constant<int, 1>{}); break;
+        case 2: launch(std::integral_constant<int, 2>{}); break;
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        case 6: launch(std::integral_constant<int, 6>{}); break;
+        case 7: launch(std::integral_constant<int, 7>{}); break;
+        case 8: launch(std::integral_constant<int, 8>{}); break;
+        default: GGML_ABORT("mmvq triple: unsupported shapes");
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -3739,7 +3766,8 @@ void ggml_cuda_mmvq_launch_triple(const ggml_cuda_mmvq_capture & a, const ggml_c
 int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
     static const bool enabled = getenv("GGML_CUDA_MULTI_OP") != nullptr;
     ggml_tensor * q = cgraph->nodes[i];
-    if (!enabled || q->op != GGML_OP_MUL_MAT || q->src[0]->type != GGML_TYPE_IQ4_XS || q->ne[1] != 1 || q->src[2] != nullptr) {
+    if (!enabled || q->op != GGML_OP_MUL_MAT || q->src[0]->type != GGML_TYPE_IQ4_XS || q->ne[1] < 1 || q->ne[1] > MMVQ_MAX_BATCH_SIZE ||
+            q->ne[2] != 1 || q->src[2] != nullptr) {
         return 0;
     }
     ggml_tensor * kv[2] = { nullptr, nullptr };
@@ -3747,13 +3775,13 @@ int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     for (int k = i + 1; k < std::min(cgraph->n_nodes, i + 24) && n_kv < 2; ++k) {
         ggml_tensor * n = cgraph->nodes[k];
         if (n->op == GGML_OP_MUL_MAT && n->src[1] == q->src[1] && (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-            if (n->src[0]->type != GGML_TYPE_Q8_0 || n->ne[1] != 1 || n->src[2] != nullptr) {
+            if (n->src[0]->type != GGML_TYPE_Q8_0 || n->ne[1] != q->ne[1] || n->ne[2] != 1 || n->src[2] != nullptr) {
                 return 0;
             }
             kv[n_kv++] = n;
         }
     }
-    if (n_kv != 2 || !ggml_cuda_should_fuse_mul_mat_vec_q(q)) {
+    if (n_kv != 2 || ggml_cuda_mul_mat_kernel(ctx, q->src[0], q->src[1], q) != GGML_CUDA_MM_MMVQ) {
         return 0;
     }
     ggml_cuda_redirect_early_output(cgraph, kv[0]);
