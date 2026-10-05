@@ -34,6 +34,21 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
         [&](const int64_t i, const float v) { y_block[i * stride_y + tid] = v; });
 }
 
+static __global__ void k_gdn_conv(const mk_gdn_conv_params p) {
+    constexpr int threads = mk_gdn_conv<1>::threads;
+    __shared__ float lds[mk_gdn_conv<threads>::lds_bytes/sizeof(float)];
+    mk_gdn_conv<threads>::run(p, 0, blockIdx.x, true, (char *) lds);
+}
+
+void ggml_cuda_gdn_conv(const mk_gdn_conv_params & p, cudaStream_t stream) {
+    constexpr int threads = mk_gdn_conv<1>::threads;
+    GGML_ASSERT(p.C % threads == 0 && 2*p.n_qk_heads*threads <= p.C && p.n_tokens >= 1 && p.n_tokens <= MK_GDN_MAX_T);
+    const int n_tiles = p.C / threads;
+    mk_record(MK_OP_GDN_CONV, 0, n_tiles, threads, p);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3(n_tiles, 1, 1), threads, 0, stream);
+    ggml_cuda_kernel_launch(k_gdn_conv, launch_params, p);
+}
+
 template <bool apply_silu, size_t split_d_inner, size_t d_conv, int64_t split_n_t>
 static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, const float * __restrict__ src1,
                                                const float * __restrict__ bias,
