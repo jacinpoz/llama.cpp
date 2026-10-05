@@ -3721,16 +3721,7 @@ static const ggml_tensor * ggml_cuda_find_mul_q8_1_matmul(const ggml_cgraph * cg
     }
 
     // The MUL output must have exactly one consumer (the matmul or its view).
-    int uses = 0;
-    for (int j = 0; j < n; ++j) {
-        const ggml_tensor * t = cgraph->nodes[j];
-        for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            if (t->src[s] == mul) {
-                uses++;
-            }
-        }
-    }
-    if (uses != 1) {
+    if (!ggml_node_has_n_uses(cgraph, mul_idx, 1)) {
         return nullptr;
     }
 
