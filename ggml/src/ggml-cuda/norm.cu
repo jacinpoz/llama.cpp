@@ -1,14 +1,7 @@
 #include "norm.cuh"
 #include "mmb.cuh"
+#include "mk-ops-ffn.cuh"
 #include <cstdint>
-
-// RNE f32 -> bf16, bit-identical to mmb.cu's mmb_f2bf (used to emit the HC normalized stream's
-// BF16 copy from the producer so the following MMB GEMM can skip its own conversion pass).
-static __device__ __forceinline__ uint16_t norm_f2bf(float f) {
-    uint32_t u = __float_as_uint(f);
-    u += 0x7fffu + ((u >> 16) & 1u);
-    return (uint16_t)(u >> 16);
-}
 
 template <int block_size>
 static __global__ void norm_f32(
@@ -109,68 +102,38 @@ static __global__ void rms_norm_f32(const float * x,
                                     uint16_t *    dst16                = nullptr,
                                     bool          store_f32            = true) {
     ggml_cuda_pdl_lc();
-    const int nrows     = gridDim.x;
-    const int nchannels = gridDim.y;
+    mk_rmsnorm_f32_params p;
+    p.x                    = x;
+    p.dst                  = dst;
+    p.mul                  = mul;
+    p.add                  = add;
+    p.dst16                = dst16;
+    p.stride_row           = stride_row;
+    p.stride_channel       = stride_channel;
+    p.stride_sample        = stride_sample;
+    p.mul_stride_row       = mul_stride_row;
+    p.mul_stride_channel   = mul_stride_channel;
+    p.mul_stride_sample    = mul_stride_sample;
+    p.add_stride_row       = add_stride_row;
+    p.add_stride_channel   = add_stride_channel;
+    p.add_stride_sample    = add_stride_sample;
+    p.mul_ncols_packed     = mul_ncols_packed;
+    p.mul_nrows_packed     = mul_nrows_packed;
+    p.mul_nchannels_packed = mul_nchannels_packed;
+    p.mul_nsamples_packed  = mul_nsamples_packed;
+    p.add_ncols_packed     = add_ncols_packed;
+    p.add_nrows_packed     = add_nrows_packed;
+    p.add_nchannels_packed = add_nchannels_packed;
+    p.add_nsamples_packed  = add_nsamples_packed;
+    p.ncols                = ncols;
+    p.nrows                = gridDim.x;
+    p.nchannels            = gridDim.y;
+    p.eps                  = eps;
+    p.store_f32            = store_f32;
 
-    const int row       = blockIdx.x;
-    const int channel   = blockIdx.y;
-    const int sample    = blockIdx.z;
-    const int tid       = threadIdx.x;
-
-    static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
-
-    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
-    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
-    if (dst16 != nullptr) {
-        dst16 += ((sample*nchannels + channel)*nrows + row)*ncols;
-    }
-
-    if constexpr (do_multiply) {
-        const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
-        const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
-        const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
-        mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
-    }
-
-    if constexpr (do_add) {
-        const int add_row     = fastmodulo(row, add_nrows_packed);
-        const int add_channel = fastmodulo(channel, add_nchannels_packed);
-        const int add_sample  = fastmodulo(sample, add_nsamples_packed);
-        add += add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
-    }
-
-    float tmp = 0.0f; // partial sum for thread in warp
-
-    ggml_cuda_pdl_sync();
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col];
-        tmp += xi * xi;
-    }
-
-    // sum up partial sums
     extern __shared__ float s_sum[];
-    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
-
-    const float mean = tmp / ncols;
-    const float scale = rsqrtf(mean + eps);
-
-    for (int col = tid; col < ncols; col += block_size) {
-        float v;
-        if constexpr (do_multiply && do_add) {
-            const int mul_col = fastmodulo(col, mul_ncols_packed);
-            const int add_col = fastmodulo(col, add_ncols_packed);
-            v = scale * x[col] * mul[mul_col] + add[add_col];
-        } else if constexpr (do_multiply) {
-            const int mul_col = fastmodulo(col, mul_ncols_packed);
-            v = scale * x[col] * mul[mul_col];
-        } else {
-            v = scale * x[col];
-        }
-        if (store_f32) dst[col] = v;
-        if (dst16 != nullptr) {
-            dst16[col] = norm_f2bf(v);
-        }
-    }
+    ggml_cuda_pdl_sync();
+    mk_rmsnorm_f32<block_size, block_size>::template row<do_multiply, do_add>(p, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, true, (char *) s_sum);
 }
 
 // rms_norm followed by ggml_scale (build_gdn_l2_norm: the GDN q/k l2 norm).  The norm output is
@@ -650,149 +613,25 @@ static __global__ void rms_norm_q8_1_f32(
         const int ncols, const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
         const int64_t mul_stride_row, const int ncols_padded, const float eps,
         const float * xa, const float * xb) {
-    const int nrows     = gridDim.x;
-    const int nchannels = gridDim.y;
-    const int row       = blockIdx.x;
-    const int channel   = blockIdx.y;
-    const int sample    = blockIdx.z;
-    const int tid       = threadIdx.x;
-
-    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
-    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
-    y   += ((sample*nchannels + channel)*nrows + row)*(ncols_padded/QK8_1);
-    if (mul != nullptr) {
-        mul += row*mul_stride_row;
-    }
-
-    // Rows of up to kRegs*block_size columns keep each thread's values in registers between the passes
-    // (same arithmetic as the reloading loops below, so the results are bit-identical).
-    constexpr int kRegs = 8;
-    if (ncols <= kRegs*block_size) {
-        float v[kRegs];
-        float tmp = 0.0f;
-#pragma unroll
-        for (int k = 0; k < kRegs; ++k) {
-            const int col = tid + k*block_size;
-            if (col < ncols) {
-                float xi;
-                if constexpr (has_add) {
-                    const int64_t off = sample*stride_sample + channel*stride_channel + row*stride_row;
-                    xi = xa[off + col] + xb[off + col];
-                    ((float *) x)[col] = xi;
-                } else {
-                    xi = x[col];
-                }
-                v[k] = xi;
-                tmp += xi * xi;
-            }
-        }
-
-        extern __shared__ float s_sum[];
-        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
-
-        const float mean = tmp / ncols;
-        const float scale = rsqrtf(mean + eps);
-
-#pragma unroll
-        for (int k = 0; k < kRegs; ++k) {
-            const int col = tid + k*block_size;
-            if (col < ncols) {
-                v[k] = mul == nullptr ? scale * v[k] : scale * v[k] * mul[col];
-                dst[col] = v[k];
-            }
-        }
-
-        if constexpr (has_add) {
-            if (y == nullptr) {
-                return;
-            }
-        }
-
-        // a warp's lanes hold the 32 consecutive columns of one Q8_1 block
-#pragma unroll
-        for (int k = 0; k < kRegs; ++k) {
-            const int col = tid + k*block_size;
-            if (k*block_size >= ncols) {
-                break;
-            }
-            const int ib = col / QK8_1;
-            const int lane = col % QK8_1;
-            const float xi = col < ncols ? v[k] : 0.0f;
-            float amax = fabsf(xi);
-            float sum  = xi;
-            amax = warp_reduce_max(amax);
-            sum  = warp_reduce_sum(sum);
-            if (col < ncols) {
-                const float d = amax / 127.0f;
-                const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
-                y[ib].qs[lane] = q;
-                if (lane == 0) {
-                    y[ib].ds = make_half2(d, sum);
-                }
-            }
-        }
-        return;
-    }
-
-    float tmp = 0.0f;
-    if constexpr (has_add) {
-        // contiguous rows: xa, xb and the sum x share the row offset
-        const int64_t off = sample*stride_sample + channel*stride_channel + row*stride_row;
-        float * xs = (float *) x;
-        for (int col = tid; col < ncols; col += block_size) {
-            const float xi = xa[off + col] + xb[off + col];
-            xs[col] = xi;
-            tmp += xi * xi;
-        }
-    } else {
-        for (int col = tid; col < ncols; col += block_size) {
-            const float xi = x[col];
-            tmp += xi * xi;
-        }
-    }
+    mk_rmsnorm_q8_1_params p;
+    p.x              = x;
+    p.dst            = dst;
+    p.y              = y;
+    p.mul            = mul;
+    p.xa             = xa;
+    p.xb             = xb;
+    p.stride_row     = stride_row;
+    p.stride_channel = stride_channel;
+    p.stride_sample  = stride_sample;
+    p.mul_stride_row = mul_stride_row;
+    p.ncols          = ncols;
+    p.ncols_padded   = ncols_padded;
+    p.nrows          = gridDim.x;
+    p.nchannels      = gridDim.y;
+    p.eps            = eps;
 
     extern __shared__ float s_sum[];
-    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
-
-    const float mean = tmp / ncols;
-    const float scale = rsqrtf(mean + eps);
-
-    if (mul == nullptr) {
-        for (int col = tid; col < ncols; col += block_size) {
-            dst[col] = scale * x[col];
-        }
-    } else {
-        for (int col = tid; col < ncols; col += block_size) {
-            dst[col] = scale * x[col] * mul[col];
-        }
-    }
-
-    __syncthreads();
-
-    if constexpr (has_add) {
-        if (y == nullptr) {
-            return;
-        }
-    }
-
-    // Quantize the row. Warp w covers the 32-element block at col = tid +
-    // k*block_size, so all warps work in parallel and the warp reductions
-    // overlap. The reduction matches the standalone quantize kernel bit for bit.
-    for (int col = tid; col < ncols; col += block_size) {
-        const int ib = col / QK8_1;
-        const int lane = col % QK8_1;
-        const float xi = dst[col];
-        float amax = fabsf(xi);
-        float sum  = xi;
-        amax = warp_reduce_max(amax);
-        sum  = warp_reduce_sum(sum);
-        const float d = amax / 127.0f;
-        const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
-        y[ib].qs[lane] = q;
-        if (lane == 0) {
-            y[ib].ds = make_half2(d, sum);
-        }
-    }
+    mk_rmsnorm_q8_1<block_size, block_size>::template row<has_add>(p, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, true, (char *) s_sum);
 }
 
 static void rms_norm_q8_1_cuda(

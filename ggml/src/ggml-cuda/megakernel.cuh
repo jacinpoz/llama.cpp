@@ -15,9 +15,11 @@ enum mk_opcode : uint16_t {
 
     // WS-A: mk-ops-ffn.cuh
     MK_OP_RMSNORM_Q8_1,        // optional residual add; whole row per tile
-    MK_OP_MMVQ,                // IQ4_XS / Q6_K / Q8_0, optional GLU and add; rows per tile
-    MK_OP_LM_HEAD_ARGMAX,      // mmvq rows + per-tile argmax partials
+    MK_OP_MMVQ,                // IQ4_XS / Q6_K / Q8_0 / Q4_K / Q5_K, optional GLU and add; rows per tile
+    MK_OP_LM_HEAD_ARGMAX,      // per-tile argmax partials over the LM head logits
     MK_OP_ARGMAX_COMBINE,
+    MK_OP_RMSNORM_F32,         // optional weight mul
+    MK_OP_QUANTIZE_Q8_1,
 
     // WS-B: mk-ops-gdn.cuh
     MK_OP_GDN_GATES,

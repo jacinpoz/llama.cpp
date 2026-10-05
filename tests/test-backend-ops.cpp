@@ -4049,6 +4049,56 @@ struct test_add_rms_norm : public test_case {
     }
 };
 
+// [ADD +] RMS_NORM + MUL feeding a quantized MUL_MAT
+struct test_rms_norm_mul_mat : public test_case {
+    const ggml_type type_w;
+    const int64_t n_embd;
+    const int64_t n_out;
+    const int64_t n_tokens;
+    const bool with_add;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_MUL_MAT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_w, n_embd, n_out, n_tokens, with_add);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_rms_norm_mul_mat(ggml_type type_w = GGML_TYPE_Q8_0, int64_t n_embd = 5120, int64_t n_out = 1024,
+            int64_t n_tokens = 1, bool with_add = false)
+        : type_w(type_w), n_embd(n_embd), n_out(n_out), n_tokens(n_tokens), with_add(with_add) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        if (with_add) {
+            ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(res, "res");
+            x = ggml_add(ctx, x, res);
+            ggml_set_name(x, "add");
+        }
+        ggml_tensor * norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(norm_w, "norm_w");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type_w, n_embd, n_out);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), norm_w);
+        ggml_set_name(cur, "norm");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, w, cur);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_UNARY(RELU) + GGML_OP_SQR (fused operation)
 struct test_relu_sqr : public test_case {
     const ggml_type type;
@@ -10333,6 +10383,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
 
+    // Qwen3.8-27B decode and verify band, T = 1..8
+    for (int64_t t = 1; t <= 8; ++t) {
+        test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_IQ4_XS, 5120, 17408, t, false));
+        test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q8_0,   5120, 1024,  t, false));
+        test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_IQ4_XS, 5120, 10240, t, true));
+        test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q6_K,   5120, 10240, t, true));
+    }
+
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}, 1e-6f, false, true));
 
@@ -11578,6 +11636,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    // Qwen3.8-27B decode and verify band, T = 1..8
+    {
+        struct mm_shape { int64_t m, k; };
+        const mm_shape shapes[] = {
+            {17408, 5120},  // ffn_gate / ffn_up
+            { 5120, 17408}, // ffn_down
+            {10240, 5120},  // attn_qkv (GDN)
+            { 6144, 5120},  // attn_gate (GDN z)
+            {12288, 5120},  // attn_q
+            { 1024, 5120},  // attn_k / attn_v
+            { 5120, 6144},  // ssm_out / attn_output
+        };
+        for (ggml_type type : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+            for (int64_t t = 1; t <= 8; ++t) {
+                for (const mm_shape & sh : shapes) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, sh.m, t, sh.k, {1, 1}, {1, 1}));
+                }
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, t, 17408, 5120,
+                    false, 1, 1, false, false, true, false, {1, 1})); // ffn gate/up + swiglu
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, t, 5120, 17408,
+                    false, 1, 1, false, true, false, false, {1, 1})); // ffn_down + residual add
+            }
+        }
+        for (int64_t t = 1; t <= 8; ++t) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, t, 5120, {1, 1}, {1, 1})); // lm_head
+        }
+        test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 8, 1, 1}));
     }
 
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
