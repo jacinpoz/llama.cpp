@@ -1,54 +1,14 @@
 #include "gdn-gates.cuh"
 
 #include "ggml-impl.h"
-
-static constexpr int gdn_gates_threads = 256;
+#include "mk-ops-gdn.cuh"
 
 // One block per (output row, token); rows [0, H) are alpha, [H, 2H) beta. Each token is reduced on its own, in the
 // same order whatever the batch width, so decode and speculative-verify batches give the same values.
-static __global__ void __launch_bounds__(gdn_gates_threads, 1) k_gdn_gates(
-        const char * __restrict__ w_alpha, const char * __restrict__ w_beta, const float * __restrict__ x,
-        const float * __restrict__ dt, const float * __restrict__ a, float * __restrict__ gate, float * __restrict__ beta,
-        const int K, const int H, const int64_t nbw_alpha, const int64_t nbw_beta,
-        const int64_t sx, const int64_t s_gate, const int64_t s_beta) {
-    const int row = blockIdx.x;
-    const int t   = blockIdx.y;
-    const int tid = threadIdx.x;
-
-    const bool is_alpha = row < H;
-    const int  r        = is_alpha ? row : row - H;
-    const float4 * w  = reinterpret_cast<const float4 *>(is_alpha ? w_alpha + r*nbw_alpha : w_beta + r*nbw_beta);
-    const float4 * xv = reinterpret_cast<const float4 *>(x + t*sx);
-
-    float sum = 0.0f;
-    for (int k = tid; k < K/4; k += gdn_gates_threads) {
-        const float4 wv = w[k];
-        const float4 xx = xv[k];
-        sum += wv.x*xx.x + wv.y*xx.y + wv.z*xx.z + wv.w*xx.w;
-    }
-    sum = warp_reduce_sum(sum);
-
-    __shared__ float partial[gdn_gates_threads/WARP_SIZE];
-    if (tid % WARP_SIZE == 0) {
-        partial[tid / WARP_SIZE] = sum;
-    }
-    __syncthreads();
-    if (tid != 0) {
-        return;
-    }
-    float v = 0.0f;
-#pragma unroll
-    for (int j = 0; j < gdn_gates_threads/WARP_SIZE; ++j) {
-        v += partial[j];
-    }
-
-    if (is_alpha) {
-        const float z  = v + dt[r];
-        const float sp = z > 20.0f ? z : logf(1.0f + expf(z));
-        gate[t*s_gate + r] = sp*a[r];
-    } else {
-        beta[t*s_beta + r] = 1.0f / (1.0f + expf(-v));
-    }
+static __global__ void __launch_bounds__(256, 1) k_gdn_gates(const mk_gdn_gates_params p) {
+    using op = mk_gdn_gates<256>;
+    __shared__ float partial[op::threads/WARP_SIZE];
+    op::run_at(p, blockIdx.x, blockIdx.y, true, (char *) partial);
 }
 
 static bool gdn_gates_is_f32_vec(const ggml_tensor * t, const int64_t n) {
@@ -111,10 +71,12 @@ int ggml_cuda_try_fuse_gdn_gates(ggml_backend_cuda_context & ctx, const ggml_cgr
         return 0;
     }
 
-    k_gdn_gates<<<dim3((unsigned) (2*H), (unsigned) T), gdn_gates_threads, 0, ctx.stream()>>>(
+    const mk_gdn_gates_params p = {
         (const char *) w_a->data, (const char *) w_b->data, (const float *) x->data, (const float *) dt->data,
         (const float *) A->data, (float *) mul->data, (float *) sig->data, (int) K, (int) H,
-        w_a->nb[1], w_b->nb[1], x->nb[1]/sizeof(float), H, H);
+        (int64_t) w_a->nb[1], (int64_t) w_b->nb[1], (int64_t) (x->nb[1]/sizeof(float)), H, H, (int) T, nullptr,
+    };
+    k_gdn_gates<<<dim3((unsigned) (2*H), (unsigned) T), mk_gdn_gates<256>::threads, 0, ctx.stream()>>>(p);
     CUDA_CHECK(cudaGetLastError());
     return 8;
 }

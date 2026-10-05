@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "ssm-conv.cuh"
 #include "unary.cuh"
+#include "mk-ops-gdn.cuh"
 
 template <bool apply_silu, size_t split_d_inner, size_t d_conv>
 static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
@@ -26,35 +27,11 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
     const int stride_w = src1_nb1 / sizeof(float);
     const int stride_y = dst_nb1 / sizeof(float);
 
-    float x[d_conv] = { 0.0f };
-    float w[d_conv] = { 0.0f };
-
     ggml_cuda_pdl_sync();
-#pragma unroll
-    for (size_t j = 0; j < d_conv; j++) {
-        w[j] = w_block[tid * stride_w + j];
-    }
-
-    float b = bias != nullptr ? bias[bidy * split_d_inner + tid] : 0.0f;
-
-    for (int64_t i = 0; i < n_t; i++) {
-        float sumf = 0.0f;
-
-        if (i == 0) {
-            for (size_t j = 0; j < d_conv; j++) {
-                x[j] = x_block[tid * stride_x + j];
-            }
-        } else {
-            x[(i - 1) % d_conv] = x_block[tid * stride_x + i + d_conv - 1];
-        }
-
-#pragma unroll
-        for (size_t j = 0; j < d_conv; j++) {
-            sumf += x[(i + j) % d_conv] * w[j];
-        }
-        sumf += b;
-        y_block[i * stride_y + tid] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
-    }
+    const float b = bias != nullptr ? bias[bidy * split_d_inner + tid] : 0.0f;
+    mk_ssm_conv_channel<apply_silu, d_conv>(w_block + tid * stride_w, b, n_t,
+        [&](const int64_t j) { return x_block[tid * stride_x + j]; },
+        [&](const int64_t i, const float v) { y_block[i * stride_y + tid] = v; });
 }
 
 template <bool apply_silu, size_t split_d_inner, size_t d_conv, int64_t split_n_t>
