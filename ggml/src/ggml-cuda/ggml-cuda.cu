@@ -82,6 +82,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/megakernel-host.cuh"
 #include "ggml.h"
 
 #include <unordered_map>
@@ -745,6 +746,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_mmb_release_all();
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+    ggml_cuda_mk_release(this);
 
     if (q8_1_arena != nullptr) {
         CUDA_CHECK(cudaFree(q8_1_arena));
@@ -7418,6 +7421,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    if (ggml_cuda_mk_enabled() && ggml_cuda_mk_try_compute(*cuda_ctx, cgraph, ggml_cuda_compute_forward)) {
+        return GGML_STATUS_SUCCESS;
+    }
 
     if (g_stream_dbg_on) {
         static int n = 0;

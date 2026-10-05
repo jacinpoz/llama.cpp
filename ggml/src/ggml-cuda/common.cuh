@@ -1541,6 +1541,8 @@ struct ggml_cuda_graph_key_hash {
     }
 };
 
+struct ggml_cuda_mk_state;
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1552,6 +1554,8 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
     int curr_stream_no = 0;
+
+    ggml_cuda_mk_state * mk_state = nullptr;
 
 #ifdef USE_CUDA_GRAPH
     // Map from (first_node_ptr, token count) to cuda_graph - allows multiple graphs per context

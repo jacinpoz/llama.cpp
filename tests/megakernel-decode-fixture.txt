@@ -1,0 +1,302 @@
+# Layers 0-3 (three GDN, one attention) and the output head of the T=1 decode graph dump (GGML_CUDA_OP_SEQ_TMP),
+# head renumbered 3938.. -> 248.. and rewired from l_out-63 to l_out-3.
+RAW    0 RMS_NORM       norm-0                     [5120,1,1,1] f32   <- ROCm0#model.input_embed#0(w) | - | -
+RAW    1 MUL            attn_norm-0                [5120,1,1,1] f32   <- norm-0 | blk.0.attn_norm.weight(w) | -
+RAW    2 RESHAPE        cache_r_l0 (reshaped)      [30720,1,1,1] f32   <- cache_r_l0(w) | - | -
+RAW    3 VIEW           cache_r_l0 (reshaped) (view) [0,1,1,1] f32   <- cache_r_l0 (reshaped) | - | -
+RAW    4 SCALE          cache_r_l0 (reshaped) (view) (view) [0,1,1,1] f32   <- cache_r_l0 (reshaped) (view) | - | -
+RAW    5 VIEW           rs_s_copy (view)           [1,1,1,1] i32   <- rs_s_copy(w) | - | -
+RAW    6 GET_ROWS       conv_states-0              [30720,1,1,1] f32   <- cache_r_l0 (reshaped) | ROCm0#rs_s_copy (view)#0(w) | -
+RAW    7 VIEW           rs_s_copy (view)           [0,1,1,1] i32   <- rs_s_copy(w) | - | -
+RAW    8 GET_ROWS       node_9                     [30720,0,1,1] f32   <- cache_r_l0 (reshaped) | ROCm0#rs_s_copy (view)#0(w) | -
+RAW    9 VIEW           cache_r_l0 (view)          [30720,0,1,1] f32   <- cache_r_l0(w) | - | -
+RAW   10 CPY            cache_r_l0 (view) (copy of ) [30720,0,1,1] f32   <- node_9 | cache_r_l0 (view) | -
+RAW   11 RESHAPE        conv_states_reshaped-0     [3,10240,1,1] f32   <- conv_states-0 | - | -
+RAW   12 MUL_MAT        node_13                    [10240,1,1,1] f32   <- blk.0.attn_qkv.weight(w) | attn_norm-0 | -
+RAW   13 RESHAPE        linear_attn_qkv_mixed-0    [10240,1,1,1] f32   <- node_13 | - | -
+RAW   14 TRANSPOSE      qkv_mixed_transposed-0     [1,10240,1,1] f32   <- linear_attn_qkv_mixed-0 | - | -
+RAW   15 CONCAT         conv_input-0               [4,10240,1,1] f32   <- conv_states_reshaped-0 | qkv_mixed_transposed-0 | -
+RAW   16 VIEW           conv_state_last-0          [3,10240,1,1] f32   <- conv_input-0 | - | -
+RAW   17 VIEW           conv_state_update-0        [30720,1,1,1] f32   <- cache_r_l0(w) | - | -
+RAW   18 CPY            conv_state_update-0 (copy of conv_state_last-0) [30720,1,1,1] f32   <- conv_state_last-0 | conv_state_update-0 | -
+RAW   19 RESHAPE        cache_s_l0 (reshaped)      [786432,1,1,1] f32   <- cache_s_l0(w) | - | -
+RAW   20 VIEW           cache_s_l0 (reshaped) (view) [0,1,1,1] f32   <- cache_s_l0 (reshaped) | - | -
+RAW   21 SCALE          cache_s_l0 (reshaped) (view) (view) [0,1,1,1] f32   <- cache_s_l0 (reshaped) (view) | - | -
+RAW   22 GET_ROWS       node_23                    [786432,1,1,1] f32   <- cache_s_l0 (reshaped) | ROCm0#rs_s_copy (view)#0(w) | -
+RAW   23 GET_ROWS       node_24                    [786432,0,1,1] f32   <- cache_s_l0 (reshaped) | ROCm0#rs_s_copy (view)#0(w) | -
+RAW   24 VIEW           cache_s_l0 (view)          [786432,0,1,1] f32   <- cache_s_l0(w) | - | -
+RAW   25 CPY            cache_s_l0 (view) (copy of ) [786432,0,1,1] f32   <- node_24 | cache_s_l0 (view) | -
+RAW   26 SSM_CONV       conv_output_raw-0          [10240,1,1,1] f32   <- conv_input-0 | blk.0.ssm_conv1d.weight(w) | -
+RAW   27 UNARY          conv_output_silu-0         [10240,1,1,1] f32   <- conv_output_raw-0 | - | -
+RAW   28 VIEW           q_conv-0                   [128,16,1,1] f32   <- conv_output_silu-0 | - | -
+RAW   29 RMS_NORM       node_30                    [128,16,1,1] f32   <- q_conv-0 | - | -
+RAW   30 SCALE          q_conv_predelta-0          [128,16,1,1] f32   <- node_30 | - | -
+RAW   31 VIEW           k_conv-0                   [128,16,1,1] f32   <- conv_output_silu-0 | - | -
+RAW   32 RMS_NORM       node_33                    [128,16,1,1] f32   <- k_conv-0 | - | -
+RAW   33 SCALE          k_conv_predelta-0          [128,16,1,1] f32   <- node_33 | - | -
+RAW   34 VIEW           v_conv_predelta-0          [128,48,1,1] f32   <- conv_output_silu-0 | - | -
+RAW   35 MUL_MAT        node_36                    [48,1,1,1] f32   <- blk.0.ssm_alpha.weight(w) | attn_norm-0 | -
+RAW   36 RESHAPE        alpha-0                    [48,1,1,1] f32   <- node_36 | - | -
+RAW   37 ADD            node_38                    [48,1,1,1] f32   <- alpha-0 | blk.0.ssm_dt.bias(w) | -
+RAW   38 UNARY          a_softplus-0               [48,1,1,1] f32   <- node_38 | - | -
+RAW   39 MUL            gate-0                     [48,1,1,1] f32   <- a_softplus-0 | blk.0.ssm_a(w) | -
+RAW   40 RESHAPE        gate-0 (reshaped)          [1,48,1,1] f32   <- gate-0 | - | -
+RAW   41 MUL_MAT        node_42                    [48,1,1,1] f32   <- blk.0.ssm_beta.weight(w) | attn_norm-0 | -
+RAW   42 RESHAPE        beta-0                     [1,48,1,1] f32   <- node_42 | - | -
+RAW   43 UNARY          beta_sigmoid-0             [1,48,1,1] f32   <- beta-0 | - | -
+RAW   44 RESHAPE        state_predelta-0           [128,128,48,1] f32   <- node_23 | - | -
+RAW   45 GATED_DELTA_NET node_46                    [6144,129,1,1] f32   <- q_conv_predelta-0 | k_conv_predelta-0 | v_conv_predelta-0
+RAW   46 VIEW           new_state-0                [128,128,48,1] f32   <- node_46 | - | -
+RAW   47 VIEW           cache_s_l0 (view)          [786432,1,1,1] f32   <- cache_s_l0(w) | - | -
+RAW   48 CPY            cache_s_l0 (view) (copy of new_state-0) [786432,1,1,1] f32   <- new_state-0 | cache_s_l0 (view) | -
+RAW   49 VIEW           attn_output-0              [128,48,1,1] f32   <- node_46 | - | -
+RAW   50 RMS_NORM       norm-0                     [128,48,1,1] f32   <- attn_output-0 | - | -
+RAW   51 MUL            node_52                    [128,48,1,1] f32   <- norm-0 | blk.0.ssm_norm.weight(w) | -
+RAW   52 MUL_MAT        z-0                        [6144,1,1,1] f32   <- blk.0.attn_gate.weight(w) | attn_norm-0 | -
+RAW   53 RESHAPE        z-0 (reshaped)             [128,48,1,1] f32   <- z-0 | - | -
+RAW   54 UNARY          node_55                    [128,48,1,1] f32   <- z-0 (reshaped) | - | -
+RAW   55 MUL            node_56                    [128,48,1,1] f32   <- node_52 | node_55 | -
+RAW   56 RESHAPE        final_output-0             [6144,1,1,1] f32   <- node_56 | - | -
+RAW   57 MUL_MAT        linear_attn_out-0          [5120,1,1,1] f32   <- blk.0.ssm_out.weight(w) | final_output-0 | -
+RAW   58 RESHAPE        linear_attn_out-0 (reshaped) [5120,1,1,1] f32   <- linear_attn_out-0 | - | -
+RAW   59 ADD            attn_residual-0            [5120,1,1,1] f32   <- linear_attn_out-0 (reshaped) | ROCm0#model.input_embed#0(w) | -
+RAW   60 RMS_NORM       norm-0                     [5120,1,1,1] f32   <- attn_residual-0 | - | -
+RAW   61 MUL            attn_post_norm-0           [5120,1,1,1] f32   <- norm-0 | blk.0.post_attention_norm.weight(w) | -
+RAW   62 MUL_MAT        ffn_gate-0                 [17408,1,1,1] f32   <- blk.0.ffn_gate.weight(w) | attn_post_norm-0 | -
+RAW   63 MUL_MAT        ffn_up-0                   [17408,1,1,1] f32   <- blk.0.ffn_up.weight(w) | attn_post_norm-0 | -
+RAW   64 GLU            ffn_swiglu-0               [17408,1,1,1] f32   <- ffn_gate-0 | ffn_up-0 | -
+RAW   65 MUL_MAT        ffn_out-0                  [5120,1,1,1] f32   <- blk.0.ffn_down.weight(w) | ffn_swiglu-0 | -
+RAW   66 ADD            l_out-0                    [5120,1,1,1] f32   <- ffn_out-0 | attn_residual-0 | -
+RAW   67 RMS_NORM       norm-1                     [5120,1,1,1] f32   <- l_out-0 | - | -
+RAW   68 MUL            attn_norm-1                [5120,1,1,1] f32   <- norm-1 | blk.1.attn_norm.weight(w) | -
+RAW   69 RESHAPE        cache_r_l1 (reshaped)      [30720,1,1,1] f32   <- cache_r_l1(w) | - | -
+RAW   70 VIEW           cache_r_l1 (reshaped) (view) [0,1,1,1] f32   <- cache_r_l1 (reshaped) | - | -
+RAW   71 SCALE          cache_r_l1 (reshaped) (view) (view) [0,1,1,1] f32   <- cache_r_l1 (reshaped) (view) | - | -
+RAW   72 GET_ROWS       conv_states-1              [30720,1,1,1] f32   <- cache_r_l1 (reshaped) | ROCm0#rs_s_copy (view)#0(w) | -
+RAW   73 GET_ROWS       node_74                    [30720,0,1,1] f32   <- cache_r_l1 (reshaped) | ROCm0#rs_s_copy (view)#0(w) | -
+RAW   74 VIEW           cache_r_l1 (view)          [30720,0,1,1] f32   <- cache_r_l1(w) | - | -
+RAW   75 CPY            cache_r_l1 (view) (copy of ) [30720,0,1,1] f32   <- node_74 | cache_r_l1 (view) | -
+RAW   76 RESHAPE        conv_states_reshaped-1     [3,10240,1,1] f32   <- conv_states-1 | - | -
+RAW   77 MUL_MAT        node_78                    [10240,1,1,1] f32   <- blk.1.attn_qkv.weight(w) | attn_norm-1 | -
+RAW   78 RESHAPE        linear_attn_qkv_mixed-1    [10240,1,1,1] f32   <- node_78 | - | -
+RAW   79 TRANSPOSE      qkv_mixed_transposed-1     [1,10240,1,1] f32   <- linear_attn_qkv_mixed-1 | - | -
+RAW   80 CONCAT         conv_input-1               [4,10240,1,1] f32   <- conv_states_reshaped-1 | qkv_mixed_transposed-1 | -
+RAW   81 VIEW           conv_state_last-1          [3,10240,1,1] f32   <- conv_input-1 | - | -
+RAW   82 VIEW           conv_state_update-1        [30720,1,1,1] f32   <- cache_r_l1(w) | - | -
+RAW   83 CPY            conv_state_update-1 (copy of conv_state_last-1) [30720,1,1,1] f32   <- conv_state_last-1 | conv_state_update-1 | -
+RAW   84 RESHAPE        cache_s_l1 (reshaped)      [786432,1,1,1] f32   <- cache_s_l1(w) | - | -
+RAW   85 VIEW           cache_s_l1 (reshaped) (view) [0,1,1,1] f32   <- cache_s_l1 (reshaped) | - | -
+RAW   86 SCALE          cache_s_l1 (reshaped) (view) (view) [0,1,1,1] f32   <- cache_s_l1 (reshaped) (view) | - | -
+RAW   87 GET_ROWS       node_88                    [786432,1,1,1] f32   <- cache_s_l1 (reshaped) | ROCm0#rs_s_copy (view)#0(w) | -
+RAW   88 GET_ROWS       node_89                    [786432,0,1,1] f32   <- cache_s_l1 (reshaped) | ROCm0#rs_s_copy (view)#0(w) | -
+RAW   89 VIEW           cache_s_l1 (view)          [786432,0,1,1] f32   <- cache_s_l1(w) | - | -
+RAW   90 CPY            cache_s_l1 (view) (copy of ) [786432,0,1,1] f32   <- node_89 | cache_s_l1 (view) | -
+RAW   91 SSM_CONV       conv_output_raw-1          [10240,1,1,1] f32   <- conv_input-1 | blk.1.ssm_conv1d.weight(w) | -
+RAW   92 UNARY          conv_output_silu-1         [10240,1,1,1] f32   <- conv_output_raw-1 | - | -
+RAW   93 VIEW           q_conv-1                   [128,16,1,1] f32   <- conv_output_silu-1 | - | -
+RAW   94 RMS_NORM       node_95                    [128,16,1,1] f32   <- q_conv-1 | - | -
+RAW   95 SCALE          q_conv_predelta-1          [128,16,1,1] f32   <- node_95 | - | -
+RAW   96 VIEW           k_conv-1                   [128,16,1,1] f32   <- conv_output_silu-1 | - | -
+RAW   97 RMS_NORM       node_98                    [128,16,1,1] f32   <- k_conv-1 | - | -
+RAW   98 SCALE          k_conv_predelta-1          [128,16,1,1] f32   <- node_98 | - | -
+RAW   99 VIEW           v_conv_predelta-1          [128,48,1,1] f32   <- conv_output_silu-1 | - | -
+RAW  100 MUL_MAT        node_101                   [48,1,1,1] f32   <- blk.1.ssm_alpha.weight(w) | attn_norm-1 | -
+RAW  101 RESHAPE        alpha-1                    [48,1,1,1] f32   <- node_101 | - | -
+RAW  102 ADD            node_103                   [48,1,1,1] f32   <- alpha-1 | blk.1.ssm_dt.bias(w) | -
+RAW  103 UNARY          a_softplus-1               [48,1,1,1] f32   <- node_103 | - | -
+RAW  104 MUL            gate-1                     [48,1,1,1] f32   <- a_softplus-1 | blk.1.ssm_a(w) | -
+RAW  105 RESHAPE        gate-1 (reshaped)          [1,48,1,1] f32   <- gate-1 | - | -
+RAW  106 MUL_MAT        node_107                   [48,1,1,1] f32   <- blk.1.ssm_beta.weight(w) | attn_norm-1 | -
+RAW  107 RESHAPE        beta-1                     [1,48,1,1] f32   <- node_107 | - | -
+RAW  108 UNARY          beta_sigmoid-1             [1,48,1,1] f32   <- beta-1 | - | -
+RAW  109 RESHAPE        state_predelta-1           [128,128,48,1] f32   <- node_88 | - | -
+RAW  110 GATED_DELTA_NET node_111                   [6144,129,1,1] f32   <- q_conv_predelta-1 | k_conv_predelta-1 | v_conv_predelta-1
+RAW  111 VIEW           new_state-1                [128,128,48,1] f32   <- node_111 | - | -
+RAW  112 VIEW           cache_s_l1 (view)          [786432,1,1,1] f32   <- cache_s_l1(w) | - | -
+RAW  113 CPY            cache_s_l1 (view) (copy of new_state-1) [786432,1,1,1] f32   <- new_state-1 | cache_s_l1 (view) | -
+RAW  114 VIEW           attn_output-1              [128,48,1,1] f32   <- node_111 | - | -
+RAW  115 RMS_NORM       norm-1                     [128,48,1,1] f32   <- attn_output-1 | - | -
+RAW  116 MUL            node_117                   [128,48,1,1] f32   <- norm-1 | blk.1.ssm_norm.weight(w) | -
+RAW  117 MUL_MAT        z-1                        [6144,1,1,1] f32   <- blk.1.attn_gate.weight(w) | attn_norm-1 | -
+RAW  118 RESHAPE        z-1 (reshaped)             [128,48,1,1] f32   <- z-1 | - | -
+RAW  119 UNARY          node_120                   [128,48,1,1] f32   <- z-1 (reshaped) | - | -
+RAW  120 MUL            node_121                   [128,48,1,1] f32   <- node_117 | node_120 | -
+RAW  121 RESHAPE        final_output-1             [6144,1,1,1] f32   <- node_121 | - | -
+RAW  122 MUL_MAT        linear_attn_out-1          [5120,1,1,1] f32   <- blk.1.ssm_out.weight(w) | final_output-1 | -
+RAW  123 RESHAPE        linear_attn_out-1 (reshaped) [5120,1,1,1] f32   <- linear_attn_out-1 | - | -
+RAW  124 ADD            attn_residual-1            [5120,1,1,1] f32   <- linear_attn_out-1 (reshaped) | l_out-0 | -
+RAW  125 RMS_NORM       norm-1                     [5120,1,1,1] f32   <- attn_residual-1 | - | -
+RAW  126 MUL            attn_post_norm-1           [5120,1,1,1] f32   <- norm-1 | blk.1.post_attention_norm.weight(w) | -
+RAW  127 MUL_MAT        ffn_gate-1                 [17408,1,1,1] f32   <- blk.1.ffn_gate.weight(w) | attn_post_norm-1 | -
+RAW  128 MUL_MAT        ffn_up-1                   [17408,1,1,1] f32   <- blk.1.ffn_up.weight(w) | attn_post_norm-1 | -
+RAW  129 GLU            ffn_swiglu-1               [17408,1,1,1] f32   <- ffn_gate-1 | ffn_up-1 | -
+RAW  130 MUL_MAT        ffn_out-1                  [5120,1,1,1] f32   <- blk.1.ffn_down.weight(w) | ffn_swiglu-1 | -
+RAW  131 ADD            l_out-1                    [5120,1,1,1] f32   <- ffn_out-1 | attn_residual-1 | -
+RAW  132 RMS_NORM       norm-2                     [5120,1,1,1] f32   <- l_out-1 | - | -
+RAW  133 MUL            attn_norm-2                [5120,1,1,1] f32   <- norm-2 | blk.2.attn_norm.weight(w) | -
+RAW  134 RESHAPE        cache_r_l2 (reshaped)      [30720,1,1,1] f32   <- cache_r_l2(w) | - | -
+RAW  135 VIEW           cache_r_l2 (reshaped) (view) [0,1,1,1] f32   <- cache_r_l2 (reshaped) | - | -
+RAW  136 SCALE          cache_r_l2 (reshaped) (view) (view) [0,1,1,1] f32   <- cache_r_l2 (reshaped) (view) | - | -
+RAW  137 GET_ROWS       conv_states-2              [30720,1,1,1] f32   <- cache_r_l2 (reshaped) | ROCm0#rs_s_copy (view)#0(w) | -
+RAW  138 GET_ROWS       node_139                   [30720,0,1,1] f32   <- cache_r_l2 (reshaped) | ROCm0#rs_s_copy (view)#0(w) | -
+RAW  139 VIEW           cache_r_l2 (view)          [30720,0,1,1] f32   <- cache_r_l2(w) | - | -
+RAW  140 CPY            cache_r_l2 (view) (copy of ) [30720,0,1,1] f32   <- node_139 | cache_r_l2 (view) | -
+RAW  141 RESHAPE        conv_states_reshaped-2     [3,10240,1,1] f32   <- conv_states-2 | - | -
+RAW  142 MUL_MAT        node_143                   [10240,1,1,1] f32   <- blk.2.attn_qkv.weight(w) | attn_norm-2 | -
+RAW  143 RESHAPE        linear_attn_qkv_mixed-2    [10240,1,1,1] f32   <- node_143 | - | -
+RAW  144 TRANSPOSE      qkv_mixed_transposed-2     [1,10240,1,1] f32   <- linear_attn_qkv_mixed-2 | - | -
+RAW  145 CONCAT         conv_input-2               [4,10240,1,1] f32   <- conv_states_reshaped-2 | qkv_mixed_transposed-2 | -
+RAW  146 VIEW           conv_state_last-2          [3,10240,1,1] f32   <- conv_input-2 | - | -
+RAW  147 VIEW           conv_state_update-2        [30720,1,1,1] f32   <- cache_r_l2(w) | - | -
+RAW  148 CPY            conv_state_update-2 (copy of conv_state_last-2) [30720,1,1,1] f32   <- conv_state_last-2 | conv_state_update-2 | -
+RAW  149 RESHAPE        cache_s_l2 (reshaped)      [786432,1,1,1] f32   <- cache_s_l2(w) | - | -
+RAW  150 VIEW           cache_s_l2 (reshaped) (view) [0,1,1,1] f32   <- cache_s_l2 (reshaped) | - | -
+RAW  151 SCALE          cache_s_l2 (reshaped) (view) (view) [0,1,1,1] f32   <- cache_s_l2 (reshaped) (view) | - | -
+RAW  152 GET_ROWS       node_153                   [786432,1,1,1] f32   <- cache_s_l2 (reshaped) | ROCm0#rs_s_copy (view)#0(w) | -
+RAW  153 GET_ROWS       node_154                   [786432,0,1,1] f32   <- cache_s_l2 (reshaped) | ROCm0#rs_s_copy (view)#0(w) | -
+RAW  154 VIEW           cache_s_l2 (view)          [786432,0,1,1] f32   <- cache_s_l2(w) | - | -
+RAW  155 CPY            cache_s_l2 (view) (copy of ) [786432,0,1,1] f32   <- node_154 | cache_s_l2 (view) | -
+RAW  156 SSM_CONV       conv_output_raw-2          [10240,1,1,1] f32   <- conv_input-2 | blk.2.ssm_conv1d.weight(w) | -
+RAW  157 UNARY          conv_output_silu-2         [10240,1,1,1] f32   <- conv_output_raw-2 | - | -
+RAW  158 VIEW           q_conv-2                   [128,16,1,1] f32   <- conv_output_silu-2 | - | -
+RAW  159 RMS_NORM       node_160                   [128,16,1,1] f32   <- q_conv-2 | - | -
+RAW  160 SCALE          q_conv_predelta-2          [128,16,1,1] f32   <- node_160 | - | -
+RAW  161 VIEW           k_conv-2                   [128,16,1,1] f32   <- conv_output_silu-2 | - | -
+RAW  162 RMS_NORM       node_163                   [128,16,1,1] f32   <- k_conv-2 | - | -
+RAW  163 SCALE          k_conv_predelta-2          [128,16,1,1] f32   <- node_163 | - | -
+RAW  164 VIEW           v_conv_predelta-2          [128,48,1,1] f32   <- conv_output_silu-2 | - | -
+RAW  165 MUL_MAT        node_166                   [48,1,1,1] f32   <- blk.2.ssm_alpha.weight(w) | attn_norm-2 | -
+RAW  166 RESHAPE        alpha-2                    [48,1,1,1] f32   <- node_166 | - | -
+RAW  167 ADD            node_168                   [48,1,1,1] f32   <- alpha-2 | blk.2.ssm_dt.bias(w) | -
+RAW  168 UNARY          a_softplus-2               [48,1,1,1] f32   <- node_168 | - | -
+RAW  169 MUL            gate-2                     [48,1,1,1] f32   <- a_softplus-2 | blk.2.ssm_a(w) | -
+RAW  170 RESHAPE        gate-2 (reshaped)          [1,48,1,1] f32   <- gate-2 | - | -
+RAW  171 MUL_MAT        node_172                   [48,1,1,1] f32   <- blk.2.ssm_beta.weight(w) | attn_norm-2 | -
+RAW  172 RESHAPE        beta-2                     [1,48,1,1] f32   <- node_172 | - | -
+RAW  173 UNARY          beta_sigmoid-2             [1,48,1,1] f32   <- beta-2 | - | -
+RAW  174 RESHAPE        state_predelta-2           [128,128,48,1] f32   <- node_153 | - | -
+RAW  175 GATED_DELTA_NET node_176                   [6144,129,1,1] f32   <- q_conv_predelta-2 | k_conv_predelta-2 | v_conv_predelta-2
+RAW  176 VIEW           new_state-2                [128,128,48,1] f32   <- node_176 | - | -
+RAW  177 VIEW           cache_s_l2 (view)          [786432,1,1,1] f32   <- cache_s_l2(w) | - | -
+RAW  178 CPY            cache_s_l2 (view) (copy of new_state-2) [786432,1,1,1] f32   <- new_state-2 | cache_s_l2 (view) | -
+RAW  179 VIEW           attn_output-2              [128,48,1,1] f32   <- node_176 | - | -
+RAW  180 RMS_NORM       norm-2                     [128,48,1,1] f32   <- attn_output-2 | - | -
+RAW  181 MUL            node_182                   [128,48,1,1] f32   <- norm-2 | blk.2.ssm_norm.weight(w) | -
+RAW  182 MUL_MAT        z-2                        [6144,1,1,1] f32   <- blk.2.attn_gate.weight(w) | attn_norm-2 | -
+RAW  183 RESHAPE        z-2 (reshaped)             [128,48,1,1] f32   <- z-2 | - | -
+RAW  184 UNARY          node_185                   [128,48,1,1] f32   <- z-2 (reshaped) | - | -
+RAW  185 MUL            node_186                   [128,48,1,1] f32   <- node_182 | node_185 | -
+RAW  186 RESHAPE        final_output-2             [6144,1,1,1] f32   <- node_186 | - | -
+RAW  187 MUL_MAT        linear_attn_out-2          [5120,1,1,1] f32   <- blk.2.ssm_out.weight(w) | final_output-2 | -
+RAW  188 RESHAPE        linear_attn_out-2 (reshaped) [5120,1,1,1] f32   <- linear_attn_out-2 | - | -
+RAW  189 ADD            attn_residual-2            [5120,1,1,1] f32   <- linear_attn_out-2 (reshaped) | l_out-1 | -
+RAW  190 RMS_NORM       norm-2                     [5120,1,1,1] f32   <- attn_residual-2 | - | -
+RAW  191 MUL            attn_post_norm-2           [5120,1,1,1] f32   <- norm-2 | blk.2.post_attention_norm.weight(w) | -
+RAW  192 MUL_MAT        ffn_gate-2                 [17408,1,1,1] f32   <- blk.2.ffn_gate.weight(w) | attn_post_norm-2 | -
+RAW  193 MUL_MAT        ffn_up-2                   [17408,1,1,1] f32   <- blk.2.ffn_up.weight(w) | attn_post_norm-2 | -
+RAW  194 GLU            ffn_swiglu-2               [17408,1,1,1] f32   <- ffn_gate-2 | ffn_up-2 | -
+RAW  195 MUL_MAT        ffn_out-2                  [5120,1,1,1] f32   <- blk.2.ffn_down.weight(w) | ffn_swiglu-2 | -
+RAW  196 ADD            l_out-2                    [5120,1,1,1] f32   <- ffn_out-2 | attn_residual-2 | -
+RAW  197 RMS_NORM       norm-3                     [5120,1,1,1] f32   <- l_out-2 | - | -
+RAW  198 MUL            attn_norm-3                [5120,1,1,1] f32   <- norm-3 | blk.3.attn_norm.weight(w) | -
+RAW  199 MUL_MAT        Qcur_full-3                [12288,1,1,1] f32   <- blk.3.attn_q.weight(w) | attn_norm-3 | -
+RAW  200 VIEW           Qcur_reshaped-3            [256,24,1,1] f32   <- Qcur_full-3 | - | -
+RAW  201 RMS_NORM       norm-3                     [256,24,1,1] f32   <- Qcur_reshaped-3 | - | -
+RAW  202 MUL            Qcur_normed-3              [256,24,1,1] f32   <- norm-3 | blk.3.attn_q_norm.weight(w) | -
+RAW  203 ROPE           Qcur-3                     [256,24,1,1] f32   <- Qcur_normed-3 | ROCm0#inp_pos#0(w) | -
+RAW  204 RESHAPE        Qcur-3 (reshaped)          [256,24,1,1] f32   <- Qcur-3 | - | -
+RAW  205 MUL_MAT        node_206                   [256,24,1,1] f32   <- ROCm0#attn_inp_k_rot#0(w) | Qcur-3 (reshaped) | -
+RAW  206 RESHAPE         (reshaped)                [256,24,1,1] f32   <- node_206 | - | -
+RAW  207 MUL_MAT        Vcur-3                     [1024,1,1,1] f32   <- blk.3.attn_v.weight(w) | attn_norm-3 | -
+RAW  208 RESHAPE        Vcur-3                     [256,4,1,1] f32   <- Vcur-3 | - | -
+RAW  209 RESHAPE        Vcur-3 (reshaped)          [64,16,1,1] f32   <- Vcur-3 | - | -
+RAW  210 MUL_MAT        node_211                   [64,16,1,1] f32   <- ROCm0#attn_inp_v_rot#0(w) | Vcur-3 (reshaped) | -
+RAW  211 RESHAPE         (reshaped)                [256,4,1,1] f32   <- node_211 | - | -
+RAW  212 MUL_MAT        Kcur-3                     [1024,1,1,1] f32   <- blk.3.attn_k.weight(w) | attn_norm-3 | -
+RAW  213 RESHAPE        Kcur-3 (reshaped)          [256,4,1,1] f32   <- Kcur-3 | - | -
+RAW  214 RMS_NORM       norm-3                     [256,4,1,1] f32   <- Kcur-3 (reshaped) | - | -
+RAW  215 MUL            Kcur_normed-3              [256,4,1,1] f32   <- norm-3 | blk.3.attn_k_norm.weight(w) | -
+RAW  216 ROPE           Kcur-3                     [256,4,1,1] f32   <- Kcur_normed-3 | ROCm0#inp_pos#0(w) | -
+RAW  217 RESHAPE        Kcur-3 (reshaped)          [256,4,1,1] f32   <- Kcur-3 | - | -
+RAW  218 MUL_MAT        node_219                   [256,4,1,1] f32   <- ROCm0#attn_inp_k_rot#0(w) | Kcur-3 (reshaped) | -
+RAW  219 RESHAPE         (reshaped)                [256,4,1,1] f32   <- node_219 | - | -
+RAW  220 VIEW            (reshaped) (view)         [1024,1,1,1] f32   <-  (reshaped) | - | -
+RAW  221 SET_ROWS       cache_k_l3 (view)          [1024,768,1,1] q5_0  <-  (reshaped) (view) | ROCm0#attn_inp_k_idxs#0(w) | cache_k_l3
+RAW  222 VIEW            (reshaped) (view)         [1024,1,1,1] f32   <-  (reshaped) | - | -
+RAW  223 SET_ROWS       cache_v_l3 (view)          [1024,768,1,1] q5_0  <-  (reshaped) (view) | ROCm0#attn_inp_v_idxs#0(w) | cache_v_l3
+RAW  224 VIEW            (reshaped) (view)         [256,24,1,1] f32   <-  (reshaped) | - | -
+RAW  225 PERMUTE         (reshaped) (view) (permuted) [256,1,24,1] f32   <-  (reshaped) (view) | - | -
+RAW  226 VIEW           cache_k_l3 (view)          [256,4,768,1] q5_0  <- cache_k_l3(w) | - | -
+RAW  227 PERMUTE        cache_k_l3 (view) (permuted) [256,768,4,1] q5_0  <- cache_k_l3 (view) | - | -
+RAW  228 VIEW           cache_v_l3 (view)          [256,4,768,1] q5_0  <- cache_v_l3(w) | - | -
+RAW  229 PERMUTE        cache_v_l3 (view) (permuted) [256,768,4,1] q5_0  <- cache_v_l3 (view) | - | -
+RAW  230 FLASH_ATTN_EXT node_231                   [256,24,1,1] f32   <-  (reshaped) (view) (permuted) | cache_k_l3 (view) (permuted) | cache_v_l3 (view) (permuted)
+RAW  231 RESHAPE        kqv_out-3                  [6144,1,1,1] f32   <- node_231 | - | -
+RAW  232 RESHAPE        kqv_out-3 (reshaped)       [64,96,1,1] f32   <- kqv_out-3 | - | -
+RAW  233 MUL_MAT        node_234                   [64,96,1,1] f32   <- ROCm0#attn_inp_v_rot#0(w) | kqv_out-3 (reshaped) | -
+RAW  234 RESHAPE        attn_pregate-3             [6144,1,1,1] f32   <- node_234 | - | -
+RAW  235 VIEW           Qcur_full-3 (view)         [256,24,1,1] f32   <- Qcur_full-3 | - | -
+RAW  236 CONT           gate_reshaped-3            [6144,1,1,1] f32   <- Qcur_full-3 (view) | - | -
+RAW  237 UNARY          gate_sigmoid-3             [6144,1,1,1] f32   <- gate_reshaped-3 | - | -
+RAW  238 MUL            attn_gated-3               [6144,1,1,1] f32   <- attn_pregate-3 | gate_sigmoid-3 | -
+RAW  239 MUL_MAT        attn_output-3              [5120,1,1,1] f32   <- blk.3.attn_output.weight(w) | attn_gated-3 | -
+RAW  240 ADD            attn_residual-3            [5120,1,1,1] f32   <- attn_output-3 | l_out-2 | -
+RAW  241 RMS_NORM       norm-3                     [5120,1,1,1] f32   <- attn_residual-3 | - | -
+RAW  242 MUL            attn_post_norm-3           [5120,1,1,1] f32   <- norm-3 | blk.3.post_attention_norm.weight(w) | -
+RAW  243 MUL_MAT        ffn_gate-3                 [17408,1,1,1] f32   <- blk.3.ffn_gate.weight(w) | attn_post_norm-3 | -
+RAW  244 MUL_MAT        ffn_up-3                   [17408,1,1,1] f32   <- blk.3.ffn_up.weight(w) | attn_post_norm-3 | -
+RAW  245 GLU            ffn_swiglu-3               [17408,1,1,1] f32   <- ffn_gate-3 | ffn_up-3 | -
+RAW  246 MUL_MAT        ffn_out-3                  [5120,1,1,1] f32   <- blk.3.ffn_down.weight(w) | ffn_swiglu-3 | -
+RAW  247 ADD            l_out-3                    [5120,1,1,1] f32   <- ffn_out-3 | attn_residual-3 | -
+RAW  248 RMS_NORM       norm                       [5120,1,1,1] f32   <- l_out-3 | - | -
+RAW  249 MUL            h_nextn                    [5120,1,1,1] f32   <- norm | output_norm.weight(w) | -
+RAW  250 GET_ROWS       result_norm                [5120,1,1,1] f32   <- h_nextn | ROCm0#out_ids#0(w) | -
+RAW  251 MUL_MAT        result_output              [248320,1,1,1] f32   <- output.weight(w) | result_norm | -
+SEQ     0 F RMS_NORM       norm-0                       [5120,1,1,1] f32
+SEQ    12 F MUL_MAT        node_13                      [10240,1,1,1] f32
+SEQ    26 F SSM_CONV       conv_output_raw-0            [10240,1,1,1] f32
+SEQ    29 F RMS_NORM       node_30                      [128,16,1,1] f32
+SEQ    35 F MUL_MAT        node_36                      [48,1,1,1] f32
+SEQ    45 F GATED_DELTA_NET node_46                      [6144,129,1,1] f32
+SEQ    50 F RMS_NORM       norm-0                       [128,48,1,1] f32
+SEQ    57 F MUL_MAT        linear_attn_out-0            [5120,1,1,1] f32
+SEQ    60 F RMS_NORM       norm-0                       [5120,1,1,1] f32
+SEQ    62 F MUL_MAT        ffn_gate-0                   [17408,1,1,1] f32
+SEQ    65 F MUL_MAT        ffn_out-0                    [5120,1,1,1] f32
+SEQ    67 F RMS_NORM       norm-1                       [5120,1,1,1] f32
+SEQ    77 F MUL_MAT        node_78                      [10240,1,1,1] f32
+SEQ    91 F SSM_CONV       conv_output_raw-1            [10240,1,1,1] f32
+SEQ    94 F RMS_NORM       node_95                      [128,16,1,1] f32
+SEQ   100 F MUL_MAT        node_101                     [48,1,1,1] f32
+SEQ   110 F GATED_DELTA_NET node_111                     [6144,129,1,1] f32
+SEQ   115 F RMS_NORM       norm-1                       [128,48,1,1] f32
+SEQ   122 F MUL_MAT        linear_attn_out-1            [5120,1,1,1] f32
+SEQ   125 F RMS_NORM       norm-1                       [5120,1,1,1] f32
+SEQ   127 F MUL_MAT        ffn_gate-1                   [17408,1,1,1] f32
+SEQ   130 F MUL_MAT        ffn_out-1                    [5120,1,1,1] f32
+SEQ   132 F RMS_NORM       norm-2                       [5120,1,1,1] f32
+SEQ   142 F MUL_MAT        node_143                     [10240,1,1,1] f32
+SEQ   156 F SSM_CONV       conv_output_raw-2            [10240,1,1,1] f32
+SEQ   159 F RMS_NORM       node_160                     [128,16,1,1] f32
+SEQ   165 F MUL_MAT        node_166                     [48,1,1,1] f32
+SEQ   175 F GATED_DELTA_NET node_176                     [6144,129,1,1] f32
+SEQ   180 F RMS_NORM       norm-2                       [128,48,1,1] f32
+SEQ   187 F MUL_MAT        linear_attn_out-2            [5120,1,1,1] f32
+SEQ   190 F RMS_NORM       norm-2                       [5120,1,1,1] f32
+SEQ   192 F MUL_MAT        ffn_gate-2                   [17408,1,1,1] f32
+SEQ   195 F MUL_MAT        ffn_out-2                    [5120,1,1,1] f32
+SEQ   197 F RMS_NORM       norm-3                       [5120,1,1,1] f32
+SEQ   199   MUL_MAT        Qcur_full-3                  [12288,1,1,1] f32
+SEQ   201 F RMS_NORM       norm-3                       [256,24,1,1] f32
+SEQ   207   MUL_MAT        Vcur-3                       [1024,1,1,1] f32
+SEQ   210 F MUL_MAT        node_211                     [64,16,1,1] f32
+SEQ   212   MUL_MAT        Kcur-3                       [1024,1,1,1] f32
+SEQ   214 F RMS_NORM       norm-3                       [256,4,1,1] f32
+SEQ   230 F FLASH_ATTN_EXT node_231                     [256,24,1,1] f32
+SEQ   239 F MUL_MAT        attn_output-3                [5120,1,1,1] f32
+SEQ   241 F RMS_NORM       norm-3                       [5120,1,1,1] f32
+SEQ   243 F MUL_MAT        ffn_gate-3                   [17408,1,1,1] f32
+SEQ   246 F MUL_MAT        ffn_out-3                    [5120,1,1,1] f32
+SEQ   248 F RMS_NORM       norm                         [5120,1,1,1] f32
+SEQ   250   GET_ROWS       result_norm                  [5120,1,1,1] f32
+SEQ   251   MUL_MAT        result_output                [248320,1,1,1] f32
