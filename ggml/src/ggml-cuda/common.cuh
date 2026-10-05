@@ -2756,6 +2756,9 @@ bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 
 // Whether a dense MUL_MAT over a quantized src0 will run as MMQ (defined in ggml-cuda.cu).
 bool ggml_cuda_mul_mat_takes_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+// GGML_CUDA_VERIFY_NORM_Q8 and the matmuls that read a norm's Q8_1 output from the quantize cache (defined in ggml-cuda.cu).
+bool ggml_cuda_verify_norm_q8();
+bool ggml_cuda_norm_q8_1_consumer(ggml_backend_cuda_context & ctx, const ggml_tensor * mm);
 
 // Upstream gate+up+GLU / shared-expert matcher predicate (defined in ggml-cuda.cu).
 bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,

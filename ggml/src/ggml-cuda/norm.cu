@@ -991,8 +991,9 @@ static void rms_norm_q8_1_cuda(
 
 // Residual ADD + rms_norm + weight mul + Q8_1 quantize (the verify band, where the ADD is not
 // folded into the preceding mmvq epilogue as it is for one token).  Writes the ADD output, the MUL
-// output and the Q8_1 cache; the values are those of the unfused k_bin_bcast + rms_norm_q8_1 pair.
-bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * norm_node, const ggml_tensor * mul_node) {
+// output and, if quantize, the Q8_1 cache; the values are those of the unfused k_bin_bcast + rms_norm_q8_1 pair.
+bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * norm_node, const ggml_tensor * mul_node,
+        const bool quantize) {
     const ggml_tensor * a = add_node->src[0];
     const ggml_tensor * b = add_node->src[1];
     const ggml_tensor * dst = mul_node;
@@ -1013,21 +1014,25 @@ bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor
     const int ncols = dst->ne[0];
     const int64_t s01 = add_node->nb[1] / sizeof(float);
     const int64_t ne10_padded = GGML_PAD(ncols, MATRIX_ROW_PADDING);
-    const size_t q8_1_size = dst->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
-    bool found = false;
-    void * q8_1 = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, q8_1_size,
-                                      ncols, dst->ne[1], dst->ne[2], dst->ne[3],
-                                      dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), dst->nb[3]/sizeof(float), found);
+    block_q8_1 * y = nullptr;
+    if (quantize) {
+        const size_t q8_1_size = dst->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+        bool found = false;
+        void * q8_1 = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, q8_1_size,
+                                          ncols, dst->ne[1], dst->ne[2], dst->ne[3],
+                                          dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), dst->nb[3]/sizeof(float), found);
+        y = y;
+    }
     const dim3 blocks_num(dst->ne[1], 1, 1);
     const auto launch = [&](auto bs_c) {
         constexpr int BS = decltype(bs_c)::value;
-        rms_norm_q8_1_record((const float *) add_node->data, (float *) dst->data, found ? nullptr : (block_q8_1 *) q8_1,
+        rms_norm_q8_1_record((const float *) add_node->data, (float *) dst->data, y,
             (const float *) weight->data, ncols, s01, 0, 0, 0, (int) ne10_padded, eps, (const float *) a->data, (const float *) b->data,
             blocks_num, BS);
         const dim3 block_dims(BS, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, BS > WARP_SIZE ? 32 * sizeof(float) : 0, ctx.stream()};
         ggml_cuda_kernel_launch(rms_norm_q8_1_f32<BS, true>, launch_params, (const float *) add_node->data, (float *) dst->data,
-            found ? nullptr : (block_q8_1 *) q8_1, (const float *) weight->data, ncols, s01, (int64_t) 0, (int64_t) 0,
+            y, (const float *) weight->data, ncols, s01, (int64_t) 0, (int64_t) 0,
             (int64_t) 0, (int) ne10_padded, eps, (const float *) a->data, (const float *) b->data);
     };
     if (ncols < 1024) {
@@ -1387,11 +1392,13 @@ int ggml_cuda_add_rms_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_
     if (!fuse_add_rms_q8 || node->op != GGML_OP_ADD || i + 2 >= cgraph->n_nodes ||
             node->ne[1] > MMVQ_MAX_BATCH_SIZE ||
             cgraph->nodes[i + 1]->op != GGML_OP_RMS_NORM || cgraph->nodes[i + 1]->src[0] != node ||
-            cgraph->nodes[i + 2]->op != GGML_OP_MUL || cgraph->nodes[i + 2]->src[0] != cgraph->nodes[i + 1]) {
+            cgraph->nodes[i + 2]->op != GGML_OP_MUL || cgraph->nodes[i + 2]->src[0] != cgraph->nodes[i + 1] ||
+            ggml_node_get_use_count(cgraph, i + 1) != 1 || (cgraph->nodes[i + 1]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }
     ggml_tensor * norm = cgraph->nodes[i + 1];
     const ggml_tensor * mul = cgraph->nodes[i + 2];
+    bool quantize = false;
     const int scan_end = std::min(cgraph->n_nodes, i + 33);
     for (int j = i + 3; j < scan_end; ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
@@ -1402,11 +1409,12 @@ int ggml_cuda_add_rms_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_
         if (!(n->src[0] == mul || n_src1 == mul)) {
             continue;
         }
-        if (n->op == GGML_OP_MUL_MAT && ggml_cuda_should_fuse_mul_mat_vec_q(n, true) &&
-                ggml_cuda_op_add_rms_norm_q8_1(ctx, node, norm, mul)) {
-            return 2;
-        }
+        quantize = n->op == GGML_OP_MUL_MAT && ggml_cuda_norm_q8_1_consumer(ctx, n);
         break;
+    }
+    // GGML_CUDA_VERIFY_NORM_Q8: without an mmvq consumer (the final norm feeds GET_ROWS) the ADD still folds into the norm.
+    if ((quantize || (ggml_cuda_verify_norm_q8() && node->ne[1] > 1)) && ggml_cuda_op_add_rms_norm_q8_1(ctx, node, norm, mul, quantize)) {
+        return 2;
     }
     return 0;
 }
@@ -1416,11 +1424,12 @@ int ggml_cuda_add_rms_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_
 int ggml_cuda_norm_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
     static const bool disable_norm_q8_1 = [] { const char * e = getenv("GGML_CUDA_DISABLE_NORM_Q8_1"); return e != nullptr && std::atoi(e); }();
     ggml_tensor * node = cgraph->nodes[i];
-    if (disable_norm_q8_1 || node->op != GGML_OP_RMS_NORM || i + 1 >= cgraph->n_nodes) {
+    if (disable_norm_q8_1 || node->op != GGML_OP_RMS_NORM || i + 1 >= cgraph->n_nodes ||
+            ggml_node_get_use_count(cgraph, i) != 1 || (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }
     const ggml_tensor * mul = cgraph->nodes[i + 1];
-    if (mul->op != GGML_OP_MUL || mul->src[0] != node) {
+    if (mul->op != GGML_OP_MUL || mul->src[0] != node || mul->src[1]->ne[0] != node->ne[0]) {
         return 0;
     }
     const int scan_end = std::min(cgraph->n_nodes, i + 32);
@@ -1437,7 +1446,7 @@ int ggml_cuda_norm_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgr
         const bool mmid_single = n->op != GGML_OP_MUL_MAT_ID || n->ne[2] == 1;
         if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) &&
                 node->ne[0] % QK8_1 == 0 &&
-                ggml_cuda_should_fuse_mul_mat_vec_q(n, true) &&
+                ggml_cuda_norm_q8_1_consumer(ctx, n) &&
                 mmid_single) {
             ggml_cuda_op_rms_norm_q8_1(ctx, node, mul);
             return 1;

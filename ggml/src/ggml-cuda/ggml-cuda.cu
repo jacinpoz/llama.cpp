@@ -5443,36 +5443,64 @@ bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_tensor *
     return ggml_cuda_mmq_fusion_is_efficient(x_up->type, x_up->ne[1], y->ne[1], y->ne[2]*y->ne[3], device);
 }
 
-// True iff ggml_cuda_mul_mat() below would run this MUL_MAT through ggml_cuda_mul_mat_q: the same
+enum ggml_cuda_mm_kernel {
+    GGML_CUDA_MM_OTHER,
+    GGML_CUDA_MM_MMVQ,
+    GGML_CUDA_MM_MMQ,
+};
+
+// The kernel ggml_cuda_mul_mat() below runs this MUL_MAT through (OTHER may be conservative): the same
 // predicate chain in the same order.  Keep the two in sync.
-bool ggml_cuda_mul_mat_takes_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+static ggml_cuda_mm_kernel ggml_cuda_mul_mat_kernel(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
-        return false;
+        return GGML_CUDA_MM_OTHER;
     }
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        return false;
+        return GGML_CUDA_MM_OTHER;
     }
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
     const int64_t ne11 = src1->ne[1];
     if (ggml_cuda_mmb_supported_mm(src0, src1, dst)) {
-        return false;
+        return GGML_CUDA_MM_OTHER;
     }
     const int64_t ne11_mmvf = ne11 <= MMVF_MAX_BATCH_SIZE_FLAT ? 1 : ne11;
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11_mmvf) || src0->ne[1] == 1) {
-        return false;
+        return GGML_CUDA_MM_OTHER;
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
-        return false;
+        return GGML_CUDA_MM_OTHER;
     }
     bool use_mmvq = ggml_cuda_should_use_mmvq(src0->type, cc, ne11);
     static const bool dense_band_off = getenv("GGML_CUDA_DISABLE_MMVQ_DENSE_BAND") != nullptr;
     if (!use_mmvq && !dense_band_off && (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) && ggml_is_quantized(src0->type) && ne11 <= MMVQ_MOE_MAX_BATCH_SIZE && src0->ne[1] % 128 != 0) {
         use_mmvq = true;
     }
-    return !use_mmvq && ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0);
+    if (use_mmvq) {
+        return GGML_CUDA_MM_MMVQ;
+    }
+    return ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0) ? GGML_CUDA_MM_MMQ : GGML_CUDA_MM_OTHER;
+}
+
+bool ggml_cuda_mul_mat_takes_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return ggml_cuda_mul_mat_kernel(ctx, src0, src1, dst) == GGML_CUDA_MM_MMQ;
+}
+
+bool ggml_cuda_verify_norm_q8() {
+    static const bool enabled = getenv("GGML_CUDA_VERIFY_NORM_Q8") != nullptr && atoi(getenv("GGML_CUDA_VERIFY_NORM_Q8")) != 0;
+    return enabled;
+}
+
+// A matmul that will read a norm's Q8_1 output from the quantize cache.  GGML_CUDA_VERIFY_NORM_Q8=1 extends
+// the verify band (2..MMVQ_MAX_BATCH_SIZE tokens) to every arch whose matmul takes the mmvq launch.
+bool ggml_cuda_norm_q8_1_consumer(ggml_backend_cuda_context & ctx, const ggml_tensor * mm) {
+    if (ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)) {
+        return true;
+    }
+    return ggml_cuda_verify_norm_q8() && mm->op == GGML_OP_MUL_MAT && mm->ne[1] > 1 && mm->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
+        mm->ne[2] == 1 && mm->ne[3] == 1 && ggml_cuda_mul_mat_kernel(ctx, mm->src[0], mm->src[1], mm) == GGML_CUDA_MM_MMVQ;
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
