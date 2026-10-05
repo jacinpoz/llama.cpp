@@ -889,6 +889,12 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
+    // GGML_SCHED_ASYNC_INPUTS: per-backend pinned staging for user inputs, see sched_copy_input_async
+    struct {
+        ggml_backend_buffer_t buf;
+        size_t used;
+    } input_stage[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+
     // Op-offload H2D staging ring (issue #50 WIP): overlap host->device weight uploads with compute.
     // GGML_SCHED_STAGE=1 enables it; a stage-capable backend is required.  stage_consumed is the
     // per-split list of staged inputs produced by sched_stage_issue and drained by the input loop.
@@ -1963,6 +1969,53 @@ static void sched_stage_issue(ggml_backend_sched_t sched, struct ggml_backend_sc
                    __func__, (long long) sched_stage_batch_tokens(split), split->n_inputs, sched->stage_consumed_n);
 }
 
+static void sched_wait_copy(ggml_backend_sched_t sched, int backend_id) {
+    if (sched->events[backend_id][sched->cur_copy] != NULL) {
+        ggml_backend_event_synchronize(sched->events[backend_id][sched->cur_copy]);
+    } else {
+        ggml_backend_synchronize(sched->backends[backend_id]);
+    }
+}
+
+// Copies a user input through pinned staging with an async upload, so there is no host sync per input.
+// Staging is per pipeline copy, and the first call per split waits for that copy's previous use.
+static bool sched_copy_input_async(ggml_backend_sched_t sched, int backend_id, const ggml_tensor * input, ggml_tensor * input_cpy, bool * synced) {
+    static const bool enabled = GGML_ENV_STR("GGML_SCHED_ASYNC_INPUTS") != nullptr;
+    ggml_backend_t backend = sched->backends[backend_id];
+    if (!enabled || backend->iface.set_tensor_async == NULL || backend->iface.event_wait == NULL ||
+        input->buffer == NULL || !ggml_backend_buffer_is_host(input->buffer) || ggml_backend_buffer_is_host(input_cpy->buffer) ||
+        !ggml_is_contiguous(input)) {
+        return false;
+    }
+    auto & stage = sched->input_stage[backend_id][sched->cur_copy];
+    if (!*synced) {
+        sched_wait_copy(sched, backend_id);
+        stage.used = 0;
+        *synced = true;
+    }
+    const size_t size = ggml_nbytes(input);
+    size_t offset = GGML_PAD(stage.used, 64);
+    if (stage.buf == NULL || offset + size > ggml_backend_buffer_get_size(stage.buf)) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : NULL;
+        if (host_buft == NULL) {
+            return false;
+        }
+        ggml_backend_synchronize(backend);
+        ggml_backend_buffer_free(stage.buf);
+        stage.buf = ggml_backend_buft_alloc_buffer(host_buft, std::max<size_t>(2*(offset + size), 1u << 20));
+        if (stage.buf == NULL) {
+            return false;
+        }
+        offset = 0;
+    }
+    char * dst = (char *) ggml_backend_buffer_get_base(stage.buf) + offset;
+    memcpy(dst, input->data, size);
+    ggml_backend_tensor_set_async(backend, input_cpy, dst, 0, size);
+    stage.used = offset + size;
+    return true;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1992,18 +2045,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend
         const int64_t t_inp = GGML_ENV_STR("GGML_SCHED_SYNCDBG") ? ggml_time_us() : 0;
+        bool input_synced = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-                // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
+                if (sched_copy_input_async(sched, split_backend_id, input, input_cpy, &input_synced)) {
+                    continue;
                 }
+                // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                sched_wait_copy(sched, split_backend_id);
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
                 // staged input (issue #50 WIP): wait on the ring slot's upload event, D2D it into the
@@ -2386,6 +2439,12 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         for (int s = 0; s < GGML_SCHED_STAGE_SLOTS; s++) {
             ggml_backend_event_free(sched->stage_done_ev[b][s]);
             ggml_backend_event_free(sched->stage_free_ev[b][s]);
+        }
+        for (int c = 0; c < GGML_SCHED_MAX_COPIES; c++) {
+            if (sched->input_stage[b][c].buf != NULL) {
+                ggml_backend_synchronize(sched->backends[b]);
+            }
+            ggml_backend_buffer_free(sched->input_stage[b][c].buf);
         }
     }
     ggml_gallocr_free(sched->galloc);
