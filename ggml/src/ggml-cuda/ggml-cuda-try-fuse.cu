@@ -2338,6 +2338,12 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
     if (cuda_ctx->gdn_norm_pending != nullptr && i < cuda_ctx->gdn_norm_gate_at) {
         return 0;
     }
+    if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+        const int r = ggml_cuda_try_mmvq_triple(*cuda_ctx, cgraph, i);
+        if (r != 0) {
+            return r;
+        }
+    }
     if (const int n_cont_gate = ggml_cuda_cont_gate_q8_1_try_fuse(cuda_ctx, cgraph, i)) {
         return n_cont_gate;
     }

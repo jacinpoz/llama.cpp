@@ -107,4 +107,9 @@ void ggml_cuda_mmvq_set_capture(ggml_cuda_mmvq_capture * cap); // nullptr: launc
 bool ggml_cuda_mmvq_pair_supported(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b);
 // Restores the tensors an early (paired) output was redirected for; the graph loop calls it after the evaluation.
 void ggml_cuda_restore_early_outputs();
+// GGML_CUDA_MULTI_OP: the attention q/k/v projections at q's node as one launch; -1 when done (k, v precomputed).
+int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i);
 void ggml_cuda_mmvq_launch_pair(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, cudaStream_t stream);
+bool ggml_cuda_mmvq_triple_supported(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, const ggml_cuda_mmvq_capture & c);
+void ggml_cuda_mmvq_launch_triple(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, const ggml_cuda_mmvq_capture & c,
+                                  cudaStream_t stream);
