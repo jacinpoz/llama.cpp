@@ -2382,8 +2382,8 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
-// RDNA3_5 (Strix Halo, gfx1151): the dense gate+up+GLU mmvq fusion is single-token-only
-// (mmvq.cu restricts fusion to ncols_dst == 1) and its fused kernel does not reproduce the
+// RDNA3_5 (Strix Halo, gfx1151): the dense gate+up+GLU mmvq fusion (single-token unless
+// GGML_CUDA_VERIFY_GLU is set) and its fused kernel does not reproduce the
 // standalone mul_mat_vec_q arithmetic, so a 1-token decode and an n-token speculative verify
 // batch of the same layer are not bit-identical - the decode==verify invariant greedy MTP
 // depends on.  Measured 2026-09-12: W=1 8abc6206... vs W=8 453eaa61...; skipping it (together
@@ -2431,7 +2431,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 // and leave the matmul itself unchanged.  Their kernels are row-generic, so on RDNA4 the verify band
 // (2..8 tokens) takes them too; the quantized values are the ones quantize_q8_1 would write, so W = 1..8
 // stay bit-identical.  GGML_CUDA_FUSE_Q8_1_VERIFY=0 turns it off.
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band = false) {
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band = false, const int64_t max_ncols = 1) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -2448,9 +2448,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, cons
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1 (the RDNA4 verify band too for verify_band callers)
+    //fusion is limited to max_ncols columns (the RDNA4 verify band too for verify_band callers)
     static const bool q8_1_verify = getenv("GGML_CUDA_FUSE_Q8_1_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_Q8_1_VERIFY")) != 0;
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 &&
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] > max_ncols &&
             !(verify_band && q8_1_verify && GGML_CUDA_CC_IS_RDNA4(cc) && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE)) {
         return false;
     }
@@ -2463,36 +2463,59 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, cons
 }
 
 
-// True iff ggml_cuda_mul_mat() below would run this MUL_MAT through ggml_cuda_mul_mat_q: the same
-// predicate chain in the same order.  Keep the two in sync.
-static bool ggml_cuda_mul_mat_takes_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+enum ggml_cuda_dense_mm_kernel {
+    GGML_CUDA_DENSE_MM_OTHER,
+    GGML_CUDA_DENSE_MM_MMVQ,
+    GGML_CUDA_DENSE_MM_MMQ,
+};
+
+// Which of mmvq / mmq ggml_cuda_mul_mat() below would run this MUL_MAT through: the same predicate chain in the
+// same order.  Keep the two in sync.
+static ggml_cuda_dense_mm_kernel ggml_cuda_mul_mat_dense_kernel(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
-        return false;
+        return GGML_CUDA_DENSE_MM_OTHER;
     }
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        return false;
+        return GGML_CUDA_DENSE_MM_OTHER;
     }
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
     const int64_t ne11 = src1->ne[1];
     if (ggml_cuda_mmb_supported_mm(src0, src1, dst)) {
-        return false;
+        return GGML_CUDA_DENSE_MM_OTHER;
     }
     const int64_t ne11_mmvf = ne11 <= MMVF_MAX_BATCH_SIZE_FLAT ? 1 : ne11;
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11_mmvf) || src0->ne[1] == 1) {
-        return false;
+        return GGML_CUDA_DENSE_MM_OTHER;
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
-        return false;
+        return GGML_CUDA_DENSE_MM_OTHER;
     }
     bool use_mmvq = ggml_cuda_should_use_mmvq(src0->type, cc, ne11);
     static const bool dense_band_off = getenv("GGML_CUDA_DISABLE_MMVQ_DENSE_BAND") != nullptr;
     if (!use_mmvq && !dense_band_off && (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) && ggml_is_quantized(src0->type) && ne11 <= MMVQ_MOE_MAX_BATCH_SIZE && src0->ne[1] % 128 != 0) {
         use_mmvq = true;
     }
-    return !use_mmvq && ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0);
+    if (use_mmvq) {
+        return GGML_CUDA_DENSE_MM_MMVQ;
+    }
+    return ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0) ? GGML_CUDA_DENSE_MM_MMQ : GGML_CUDA_DENSE_MM_OTHER;
+}
+
+static bool ggml_cuda_mul_mat_takes_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return ggml_cuda_mul_mat_dense_kernel(ctx, src0, src1, dst) == GGML_CUDA_DENSE_MM_MMQ;
+}
+
+// With GGML_CUDA_VERIFY_GLU set, 2..MMVQ_MAX_BATCH_SIZE tokens fuse only where the unfused gate and up would run as the ksplit mmvq, which keeps each column's reduction order.
+static bool ggml_cuda_should_fuse_mul_mat_vec_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * up) {
+    static const bool verify_glu = getenv("GGML_CUDA_VERIFY_GLU") != nullptr && atoi(getenv("GGML_CUDA_VERIFY_GLU")) != 0;
+    if (!ggml_cuda_should_fuse_mul_mat_vec_q(up, false, verify_glu ? MMVQ_MAX_BATCH_SIZE : 1)) {
+        return false;
+    }
+    return up->op != GGML_OP_MUL_MAT || up->ne[1] == 1 ||
+           ggml_cuda_mul_mat_dense_kernel(ctx, up->src[0], up->src[1], up) == GGML_CUDA_DENSE_MM_MMVQ;
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -6222,7 +6245,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q_glu(*cuda_ctx, up) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);

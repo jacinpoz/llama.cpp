@@ -7662,6 +7662,46 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+struct test_ffn_swiglu_down : public test_case {
+    const ggml_type type;
+    const int64_t n_ff;
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    test_ffn_swiglu_down(ggml_type type, int64_t n_ff, int64_t n_embd, int64_t n_tokens)
+        : type(type), n_ff(n_ff), n_embd(n_embd), n_tokens(n_tokens) {}
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_ff, n_embd, n_tokens);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FFN_SWIGLU_DOWN";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * gate = ggml_new_tensor_2d(ctx, type, n_embd, n_ff);
+        ggml_tensor * up   = ggml_new_tensor_2d(ctx, type, n_embd, n_ff);
+        ggml_tensor * down = ggml_new_tensor_2d(ctx, type, n_ff, n_embd);
+
+        ggml_tensor * ffn_gate = ggml_mul_mat(ctx, gate, cur);
+        ggml_tensor * ffn_up   = ggml_mul_mat(ctx, up, cur);
+        ggml_tensor * glu      = ggml_swiglu_split(ctx, ffn_gate, ffn_up);
+        ggml_tensor * out      = ggml_mul_mat(ctx, down, glu);
+
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    double max_nmse_err() override {
+        return 5e-3;
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -12020,6 +12060,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         for (int64_t t = 1; t <= 8; ++t) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, t, 5120, {1, 1}, {1, 1})); // lm_head
+        }
+        // n_ff = 768 is not a multiple of 512, so the GLU Q8_1 output stays off there.
+        for (ggml_type type : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+            for (int64_t t = 1; t <= 8; ++t) {
+                test_cases.emplace_back(new test_ffn_swiglu_down(type, 17408, 5120, t));
+                test_cases.emplace_back(new test_ffn_swiglu_down(type, 1024, 256, t));
+                test_cases.emplace_back(new test_ffn_swiglu_down(type, 768, 256, t));
+            }
         }
         test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {248320, 8, 1, 1}));
     }
