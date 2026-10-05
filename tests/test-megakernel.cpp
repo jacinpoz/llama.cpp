@@ -624,7 +624,28 @@ __global__ void __launch_bounds__(MK_THREADS, 1) k_split_dyn(const mk_op_params<
         if (tile >= n_tiles) {
             break;
         }
+        if (p.ncols_x == 0xFFFFFFFFu) {
+            continue; // never true; keeps the empty-body variant comparable
+        }
         Op::block(p, tile, 0, 0, local % 32, local / 32, true, my_lds);
+    }
+}
+
+// The claim loop alone, to tell a scheduling hang from an op hang.
+__global__ void __launch_bounds__(MK_THREADS, 1) k_claim_only(int n_tiles, uint32_t * claim, uint32_t * done) {
+    const int local = threadIdx.x % 32;
+    while (true) {
+        int tile = 0;
+        if (local == 0) {
+            tile = (int) __hip_atomic_fetch_add(claim, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
+        tile = __shfl(tile, 0, 32);
+        if (tile >= n_tiles) {
+            break;
+        }
+        if (local == 0) {
+            __hip_atomic_fetch_add(done, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
     }
 }
 
@@ -816,6 +837,13 @@ static bool test_ffn(hipStream_t stream, int n_blocks, bool timing) {
         k_direct<Op32, 1><<<nt, 32, 0, stream>>>(p0);
         sync_bounded(stream, 10000, "dyn ref");
         CUDA_CHECK(hipMemcpy(a.data(), dst, nt*4, hipMemcpyDeviceToHost));
+        if (getenv("MK_DYN_CLAIM_ONLY")) {
+            uint32_t * done; CUDA_CHECK(hipMalloc(&done, 4)); CUDA_CHECK(hipMemset(done, 0, 4)); CUDA_CHECK(hipMemset(claim, 0, 4));
+            k_claim_only<<<n_blocks, MK_THREADS, 0, stream>>>(nt, claim, done);
+            sync_bounded(stream, 3000, "claim only");
+            uint32_t d = 0, c = 0; CUDA_CHECK(hipMemcpy(&d, done, 4, hipMemcpyDeviceToHost)); CUDA_CHECK(hipMemcpy(&c, claim, 4, hipMemcpyDeviceToHost));
+            printf("dyn claim only: done %u of %d, claims %u\n", d, nt, c);
+        }
         if (getenv("MK_DYN_SMALL")) {
             CUDA_CHECK(hipMemsetAsync(claim, 0, 4, stream));
             k_split_dyn<OpK><<<1, MK_THREADS, 0, stream>>>(p0, 64, claim);
