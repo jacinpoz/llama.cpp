@@ -1393,7 +1393,7 @@ int ggml_cuda_add_rms_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_
             node->ne[1] > MMVQ_MAX_BATCH_SIZE ||
             cgraph->nodes[i + 1]->op != GGML_OP_RMS_NORM || cgraph->nodes[i + 1]->src[0] != node ||
             cgraph->nodes[i + 2]->op != GGML_OP_MUL || cgraph->nodes[i + 2]->src[0] != cgraph->nodes[i + 1] ||
-            ggml_node_get_use_count(cgraph, i + 1) != 1 || (cgraph->nodes[i + 1]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            !ggml_node_has_n_uses(cgraph, i + 1, 1)) {
         return 0;
     }
     ggml_tensor * norm = cgraph->nodes[i + 1];
@@ -1424,12 +1424,12 @@ int ggml_cuda_add_rms_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_
 int ggml_cuda_norm_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
     static const bool disable_norm_q8_1 = [] { const char * e = getenv("GGML_CUDA_DISABLE_NORM_Q8_1"); return e != nullptr && std::atoi(e); }();
     ggml_tensor * node = cgraph->nodes[i];
-    if (disable_norm_q8_1 || node->op != GGML_OP_RMS_NORM || i + 1 >= cgraph->n_nodes ||
-            ggml_node_get_use_count(cgraph, i) != 1 || (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+    if (disable_norm_q8_1 || node->op != GGML_OP_RMS_NORM || i + 1 >= cgraph->n_nodes) {
         return 0;
     }
     const ggml_tensor * mul = cgraph->nodes[i + 1];
-    if (mul->op != GGML_OP_MUL || mul->src[0] != node || mul->src[1]->ne[0] != node->ne[0]) {
+    if (mul->op != GGML_OP_MUL || mul->src[0] != node || mul->src[1]->ne[0] != node->ne[0] ||
+            !ggml_node_has_n_uses(cgraph, i, 1)) {
         return 0;
     }
     const int scan_end = std::min(cgraph->n_nodes, i + 32);
@@ -1446,8 +1446,8 @@ int ggml_cuda_norm_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgr
         const bool mmid_single = n->op != GGML_OP_MUL_MAT_ID || n->ne[2] == 1;
         if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) &&
                 node->ne[0] % QK8_1 == 0 &&
-                ggml_cuda_norm_q8_1_consumer(ctx, n) &&
-                mmid_single) {
+                mmid_single &&
+                ggml_cuda_norm_q8_1_consumer(ctx, n)) {
             ggml_cuda_op_rms_norm_q8_1(ctx, node, mul);
             return 1;
         }
