@@ -5079,7 +5079,7 @@ static void ggml_cuda_redirect_early_output(ggml_cgraph * cgraph, ggml_tensor * 
     }
     auto & buf = buffers[g_redirect_slot++];
     if (buf.second < nbytes) {
-        GGML_ASSERT(buf.first == nullptr && "early-output buffer size changed for a slot");
+        // a wider batch needs more; the old buffer stays allocated because captured graphs may still use it
         CUDA_CHECK(cudaMalloc(&buf.first, nbytes));
         buf.second = nbytes;
     }
