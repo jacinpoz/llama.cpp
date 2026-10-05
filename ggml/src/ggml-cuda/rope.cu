@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "rope.cuh"
 #include "cpy-utils.cuh"
+#include "mk-ops-attn.cuh"
 
 // The ROPE -> VIEW -> SET_ROWS fusion (ggml_cuda_should_fuse_rope_set_rows, upstream #16884) is
 // selected by ggml_cuda_check_fusion_memory_ranges(), i.e. by buffer addresses, so its fused
@@ -14,43 +15,6 @@
 // chain they replace.  The unfused chain's rounding moves to the contracted-off form as well
 // (both agree on the new value); the 4B same-seed gate and the width probe are unchanged.
 #pragma clang fp contract(off)
-
-struct rope_corr_dims {
-    float v[2];
-};
-
-
-struct mrope_sections {
-    int v[4];
-};
-
-static __device__ float rope_yarn_ramp(const float low, const float high, const int i0) {
-    const float y = (i0 / 2 - low) / max(0.001f, high - low);
-    return 1.0f - min(1.0f, max(0.0f, y));
-}
-
-// YaRN algorithm based on LlamaYaRNScaledRotaryEmbedding.py from https://github.com/jquesnelle/yarn
-// MIT licensed. Copyright (c) 2023 Jeffrey Quesnelle and Bowen Peng.
-template<bool forward>
-static __device__ void rope_yarn(
-        const float theta_extrap, const float freq_scale, const rope_corr_dims corr_dims, const int64_t i0, const float ext_factor,
-        float mscale, float & cos_theta, float & sin_theta) {
-    // Get n-d rotational scaling corrected for extrapolation
-    float theta_interp = freq_scale * theta_extrap;
-    float theta = theta_interp;
-    if (ext_factor != 0.0f) {
-        float ramp_mix = rope_yarn_ramp(corr_dims.v[0], corr_dims.v[1], i0) * ext_factor;
-        theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
-
-        // Get n-d magnitude scaling corrected for interpolation
-        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
-    }
-    cos_theta = cosf(theta) * mscale;
-    sin_theta = sinf(theta) * mscale;
-    if (!forward) {
-        sin_theta *= -1.0f;
-    }
-}
 
 template <bool forward, bool has_ff, typename T, typename D>
 static __global__ void rope_norm(const T *            x,
@@ -206,46 +170,6 @@ static __global__ void rope_neox(const T *            x,
 
     dst[idst + n_offs/2 + 0]          = ggml_cuda_cast<D>(x0 * cos_theta - x1 * sin_theta);
     dst[idst + n_offs/2 + n_dims / 2] = ggml_cuda_cast<D>(x0 * sin_theta + x1 * cos_theta);
-}
-
-// cos/sin of the rotation for relative channel pair iw of token i2 (mrope / imrope sections); shared by rope_multi
-// and the fused attention head-prep kernel below, so both compute the same values.
-template <bool forward, bool has_ff>
-static __device__ __forceinline__ void rope_multi_cos_sin(
-        const int iw, const int32_t * pos, const uint32_t i2, const int ne02, const mrope_sections sections,
-        const bool is_imrope, const float theta_scale, const float * freq_factors, const float freq_scale,
-        const rope_corr_dims corr_dims, const float ext_factor, const float attn_factor,
-        float & cos_theta, float & sin_theta) {
-    const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
-    const int sec_w = sections.v[1] + sections.v[0];
-    const int sector = (iw / 2) % sect_dims;
-
-    float theta_base = 0.0;
-    if (is_imrope) {
-        if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
-        } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
-        } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
-            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
-        } else {
-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
-        }
-    } else {
-        if (sector < sections.v[0]) {
-            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
-        } else if (sector >= sections.v[0] && sector < sec_w) {
-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
-        } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
-        } else if (sector >= sec_w + sections.v[2]) {
-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
-        }
-    }
-
-    const float freq_factor = has_ff ? freq_factors[iw/2] : 1.0f;
-
-    rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor, cos_theta, sin_theta);
 }
 
 template <bool forward, bool has_ff, typename T, typename D>
@@ -991,169 +915,18 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
     }
 }
 
-// Attention head prep for one (head, token) row of 256 (the Qwen3.5/3.8 Q and K paths at decode/verify widths):
-// RMS_NORM * weight -> ROPE (mrope) -> 256-point Hadamard, then either written out (Q) or quantized to q5_0 into the
-// cache row idx[token] (K: the SET_ROWS). Each stage is the code of the kernel it replaces (rms_norm_f32<256>'s
-// reduction, rope_multi_cos_sin, fwht_cuda<256>'s layout and stage order, quantize_f32_q5_0_block), so the result is
-// bit-identical.
-struct attn_head_prep_params {
-    const float *   x;            // [256] rows, head stride sx1, token stride sx2 (floats)
-    int64_t         sx1, sx2;
-    const float *   w;            // norm weight [256]
-    float           eps;
-    int             n_dims, n_offs;
-    const int32_t * pos;
-    int             n_tok;        // rope ne02 (pos is [n_tok * 4] for mrope)
-    mrope_sections  sections;
-    bool            is_imrope;
-    float           theta_scale, freq_scale, ext_factor, attn_factor;
-    rope_corr_dims  corr_dims;
-    const float *   freq_factors;
-    float *         out;          // [256, n_head, n_tok] contiguous, or nullptr
-    char *          cache;        // q5_0 cache view data, or nullptr
-    int64_t         cache_nb1;
-    const void *    idx;          // set_rows row index per token
-    bool            idx_i64;
-};
-
+// Attention head prep and the V Hadamard + SET_ROWS: the megakernel ops in mk-ops-attn.cuh, one sub-tile per block.
 template <bool has_ff>
-static __global__ void __launch_bounds__(256, 1) k_attn_head_prep(const attn_head_prep_params p) {
-    const int head = blockIdx.x;
-    const int tok  = blockIdx.y;
-    const int tid  = threadIdx.x;
-
-    __shared__ float s_sum[32];
-    __shared__ float y[256];
-    __shared__ float r[256];
-
-    const float xi = p.x[tok*p.sx2 + head*p.sx1 + tid];
-    float tmp = xi * xi;
-    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
-    const float mean  = tmp / 256;
-    const float scale = rsqrtf(mean + p.eps);
-    y[tid] = scale * xi * p.w[tid];
-    __syncthreads();
-
-    if (tid < 128) {
-        const int i0 = 2*tid;
-        if (i0 < p.n_offs || i0 >= p.n_offs + p.n_dims) {
-            r[i0 + 0] = y[i0 + 0];
-            r[i0 + 1] = y[i0 + 1];
-        } else {
-            const int iw = i0 - p.n_offs;
-            float cos_theta;
-            float sin_theta;
-            rope_multi_cos_sin<true, has_ff>(iw, p.pos, tok, p.n_tok, p.sections, p.is_imrope, p.theta_scale, p.freq_factors,
-                                             p.freq_scale, p.corr_dims, p.ext_factor, p.attn_factor, cos_theta, sin_theta);
-            const float x0 = y[i0/2 + p.n_offs/2 + 0];
-            const float x1 = y[i0/2 + p.n_offs/2 + p.n_dims/2];
-            r[i0/2 + p.n_offs/2 + 0]          = x0*cos_theta - x1*sin_theta;
-            r[i0/2 + p.n_offs/2 + p.n_dims/2] = x0*sin_theta + x1*cos_theta;
-        }
-    }
-    __syncthreads();
-
-    // fwht_cuda<256>: one wave, element i*32 + lane in reg[i]
-    if (tid < WARP_SIZE) {
-        constexpr int el_w = 256 / WARP_SIZE;
-        const int lane = tid;
-        float reg[el_w];
-#pragma unroll
-        for (int i = 0; i < el_w; ++i) {
-            reg[i] = r[i*WARP_SIZE + lane] * (1.0f / 16.0f);
-        }
-#pragma unroll
-        for (int h = 1; h < WARP_SIZE; h *= 2) {
-#pragma unroll
-            for (int j = 0; j < el_w; j++) {
-                const float val  = reg[j];
-                const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, WARP_SIZE);
-                reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
-            }
-        }
-#pragma unroll
-        for (int h = WARP_SIZE; h < 256; h *= 2) {
-            const int step = h / WARP_SIZE;
-#pragma unroll
-            for (int j = 0; j < el_w; j += 2 * step) {
-#pragma unroll
-                for (int k = 0; k < step; k++) {
-                    const float x = reg[j + k];
-                    const float z = reg[j + k + step];
-                    reg[j + k]        = x + z;
-                    reg[j + k + step] = x - z;
-                }
-            }
-        }
-#pragma unroll
-        for (int i = 0; i < el_w; ++i) {
-            y[i*WARP_SIZE + lane] = reg[i];
-        }
-    }
-    __syncthreads();
-
-    if (p.out != nullptr) {
-        p.out[((int64_t) tok*gridDim.x + head)*256 + tid] = y[tid];
-    }
-    if (p.cache != nullptr && tid < 256/QK5_0) {
-        const int64_t row = p.idx_i64 ? ((const int64_t *) p.idx)[tok] : (int64_t) ((const int32_t *) p.idx)[tok];
-        block_q5_0 * dst = (block_q5_0 *) (p.cache + row*p.cache_nb1) + head*(256/QK5_0) + tid;
-        quantize_f32_q5_0_block(&y[tid*QK5_0], dst);
-    }
+static __global__ void __launch_bounds__(256, 1) k_attn_head_prep(const mk_attn_prep_params p) {
+    using op = mk_attn_prep<256>;
+    __shared__ __attribute__((aligned(16))) char lds[op::lds_bytes];
+    op::run(p, has_ff, blockIdx.y*gridDim.x + blockIdx.x, true, lds);
 }
 
-// V path: fwht_cuda<64> over the four 64-chunks of one (head, token) row of 256, then quantized to q5_0 into cache row
-// idx[token] (the SET_ROWS). Bit-identical to the two kernels it replaces.
-static __global__ void __launch_bounds__(4*WARP_SIZE, 1) k_hadamard64_set_rows_q5_0(
-        const float * x, const int64_t sx1, const int64_t sx2, char * cache, const int64_t cache_nb1,
-        const void * idx, const bool idx_i64) {
-    const int head = blockIdx.x;
-    const int tok  = blockIdx.y;
-    const int lane = threadIdx.x % WARP_SIZE;
-    const int w    = threadIdx.x / WARP_SIZE;
-
-    __shared__ float y[256];
-
-    constexpr int el_w = 64 / WARP_SIZE;
-    const float * src = x + tok*sx2 + head*sx1 + w*64;
-    float reg[el_w];
-#pragma unroll
-    for (int i = 0; i < el_w; ++i) {
-        reg[i] = src[i*WARP_SIZE + lane] * 0.125f;
-    }
-#pragma unroll
-    for (int h = 1; h < WARP_SIZE; h *= 2) {
-#pragma unroll
-        for (int j = 0; j < el_w; j++) {
-            const float val  = reg[j];
-            const float val2 = __shfl_xor_sync(0xFFFFFFFF, val, h, WARP_SIZE);
-            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
-        }
-    }
-#pragma unroll
-    for (int h = WARP_SIZE; h < 64; h *= 2) {
-        const int step = h / WARP_SIZE;
-#pragma unroll
-        for (int j = 0; j < el_w; j += 2 * step) {
-#pragma unroll
-            for (int k = 0; k < step; k++) {
-                const float a = reg[j + k];
-                const float b = reg[j + k + step];
-                reg[j + k]        = a + b;
-                reg[j + k + step] = a - b;
-            }
-        }
-    }
-#pragma unroll
-    for (int i = 0; i < el_w; ++i) {
-        y[w*64 + i*WARP_SIZE + lane] = reg[i];
-    }
-    __syncthreads();
-    if (threadIdx.x < 256/QK5_0) {
-        const int64_t row = idx_i64 ? ((const int64_t *) idx)[tok] : (int64_t) ((const int32_t *) idx)[tok];
-        block_q5_0 * dst = (block_q5_0 *) (cache + row*cache_nb1) + head*(256/QK5_0) + threadIdx.x;
-        quantize_f32_q5_0_block(&y[threadIdx.x*QK5_0], dst);
-    }
+static __global__ void __launch_bounds__(4*WARP_SIZE, 1) k_hadamard64_set_rows_q5_0(const mk_v_had_set_rows_params p) {
+    using op = mk_v_had_set_rows<4*WARP_SIZE>;
+    __shared__ __attribute__((aligned(16))) char lds[op::lds_bytes];
+    op::run(p, 0, blockIdx.y*gridDim.x + blockIdx.x, true, lds);
 }
 
 static bool attn_set_rows_ok(const ggml_tensor * set_rows, const int64_t n_head, const int64_t n_tok) {
@@ -1184,7 +957,7 @@ bool ggml_cuda_op_attn_head_prep(ggml_backend_cuda_context & ctx, const ggml_ten
         return false;
     }
 
-    attn_head_prep_params p{};
+    mk_attn_prep_params p{};
     p.x   = (const float *) x->data;
     p.sx1 = x->nb[1]/sizeof(float);
     p.sx2 = x->nb[2]/sizeof(float);
@@ -1208,6 +981,7 @@ bool ggml_cuda_op_attn_head_prep(ggml_backend_cuda_context & ctx, const ggml_ten
     p.freq_factors = rope->src[2] ? (const float *) rope->src[2]->data : nullptr;
     p.pos          = (const int32_t *) rope->src[1]->data;
     p.n_tok        = (int) n_tok;
+    p.n_head       = (int) n_head;
 
     if (set_rows != nullptr) {
         p.cache     = (char *) set_rows->data;
@@ -1239,9 +1013,17 @@ bool ggml_cuda_op_hadamard64_set_rows(ggml_backend_cuda_context & ctx, const ggm
         return false;
     }
     const dim3 grid((unsigned) n_head, (unsigned) n_tok, 1);
-    k_hadamard64_set_rows_q5_0<<<grid, 4*WARP_SIZE, 0, ctx.stream()>>>(
-        (const float *) src->data, 256, 256*n_head, (char *) set_rows->data, set_rows->nb[1],
-        set_rows->src[1]->data, set_rows->src[1]->type == GGML_TYPE_I64);
+    mk_v_had_set_rows_params p{};
+    p.x         = (const float *) src->data;
+    p.sx1       = 256;
+    p.sx2       = 256*n_head;
+    p.cache     = (char *) set_rows->data;
+    p.cache_nb1 = set_rows->nb[1];
+    p.idx       = set_rows->src[1]->data;
+    p.idx_i64   = set_rows->src[1]->type == GGML_TYPE_I64;
+    p.n_head    = (int) n_head;
+    p.n_tok     = (int) n_tok;
+    k_hadamard64_set_rows_q5_0<<<grid, 4*WARP_SIZE, 0, ctx.stream()>>>(p);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
