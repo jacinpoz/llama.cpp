@@ -2856,49 +2856,45 @@ static const ggml_tensor * ggml_cuda_find_conv_state_cpy(const ggml_cgraph * cgr
     return nullptr;
 }
 
+static bool ggml_cuda_multi_op() {
+    static const bool enabled = getenv("GGML_CUDA_MULTI_OP") != nullptr;
+    return enabled;
+}
+
+static bool ggml_cuda_fuse_debug() {
+    static const bool enabled = getenv("GGML_CUDA_FUSE_DEBUG") != nullptr;
+    return enabled;
+}
+
 // An output computed before its node goes to a private buffer: the graph allocator may still be using the
 // tensor's own bytes for other tensors until that node. The tensor and its views point at the private buffer
 // for the rest of this evaluation (kernels launched or captured from here on read it) and are restored after.
 static thread_local std::vector<std::pair<ggml_tensor *, void *>> g_redirected;
 static thread_local int g_redirect_slot = 0;
 
-static void ggml_cuda_redirect_early_output(ggml_cgraph * cgraph, ggml_tensor * t) {
-    static std::vector<std::pair<void *, size_t>> buffers; // per slot, kept: captured graphs keep using them
+// `from` is the current node: t and its views (view_src is always the root) all come after it.
+static void ggml_cuda_redirect_early_output(ggml_cgraph * cgraph, int from, ggml_tensor * t) {
+    static std::vector<std::pair<void *, size_t>> buffers[GGML_CUDA_MAX_DEVICES]; // kept: captured graphs keep using them
+    const int device = ggml_cuda_get_device();
     const size_t nbytes = ggml_nbytes(t);
-    if ((size_t) g_redirect_slot >= buffers.size()) {
-        buffers.emplace_back(nullptr, 0);
+    if ((size_t) g_redirect_slot >= buffers[device].size()) {
+        buffers[device].emplace_back(nullptr, 0);
     }
-    auto & buf = buffers[g_redirect_slot++];
+    auto & buf = buffers[device][g_redirect_slot++];
     if (buf.second < nbytes) {
         // a wider batch needs more; the old buffer stays allocated because captured graphs may still use it
-        CUDA_CHECK(cudaMalloc(&buf.first, nbytes));
+        CUDA_CHECK(ggml_cuda_device_malloc(&buf.first, nbytes, device));
         buf.second = nbytes;
     }
     char * old_base = (char *) t->data;
     auto patch = [&](ggml_tensor * v) {
-        if (v == nullptr) {
-            return;
-        }
-        const ggml_tensor * root = v;
-        while (root->view_src != nullptr) {
-            root = root->view_src;
-        }
-        if (root != t && v != t) {
-            return;
-        }
-        for (const auto & r : g_redirected) {
-            if (r.first == v) {
-                return;
-            }
-        }
         g_redirected.emplace_back(v, v->data);
         v->data = (char *) buf.first + ((char *) v->data - old_base);
     };
     patch(t);
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        patch(cgraph->nodes[i]);
-        for (int sidx = 0; sidx < GGML_MAX_SRC; ++sidx) {
-            patch(cgraph->nodes[i]->src[sidx]);
+    for (int k = from; k < cgraph->n_nodes; ++k) {
+        if (cgraph->nodes[k]->view_src == t) {
+            patch(cgraph->nodes[k]);
         }
     }
 }
@@ -2915,7 +2911,7 @@ void ggml_cuda_restore_early_outputs() {
 // launch at the qkv node. Returns z's node index, or -1. z is then written early into a private buffer
 // (ggml_cuda_redirect_early_output), since the graph allocator reuses z's own bytes until z's node.
 static int ggml_cuda_find_mmvq_pair(const ggml_cgraph * cgraph, const int i_qkv, const int i_last_fused) {
-    static const bool enabled = getenv("GGML_CUDA_MULTI_OP") != nullptr;
+    const bool enabled = ggml_cuda_multi_op();
     static const bool dbg = getenv("GGML_CUDA_MULTI_OP_DEBUG") != nullptr;
     const ggml_tensor * qkv = cgraph->nodes[i_qkv];
     if (!enabled || (qkv->src[0]->type != GGML_TYPE_Q6_K && qkv->src[0]->type != GGML_TYPE_IQ4_XS) ||
@@ -3000,7 +2996,7 @@ int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_c
         ggml_cuda_mmvq_capture cap_qkv, cap_z;
         ggml_cuda_mmvq_set_capture(&cap_qkv);
         ggml_cuda_mul_mat_vec_q(ctx, node->src[0], node->src[1], node->src[2], qkv_dst, fusion);
-        ggml_cuda_redirect_early_output(const_cast<ggml_cgraph *>(cgraph), z);
+        ggml_cuda_redirect_early_output(const_cast<ggml_cgraph *>(cgraph), i, z);
         ggml_cuda_mmvq_set_capture(&cap_z);
         ggml_cuda_mul_mat_vec_q(ctx, z->src[0], z->src[1], z->src[2], z, nullptr);
         ggml_cuda_mmvq_set_capture(nullptr);
@@ -3027,10 +3023,8 @@ int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_c
         ggml_cuda_mul_mat_vec_q(ctx, node->src[0], node->src[1], node->src[2], qkv_dst, fusion);
     }
     if (conv_fused) {
-        // Path F: the gate projections read the same normed input, so they can share the conv launch.
-        static const bool multi_op = getenv("GGML_CUDA_MULTI_OP") != nullptr;
         int g = -1;
-        for (int k = j + 1; multi_op && k < std::min(cgraph->n_nodes - 8, j + 48); ++k) {
+        for (int k = j + 1; ggml_cuda_multi_op() && k < std::min(cgraph->n_nodes - 8, j + 48); ++k) {
             const ggml_tensor * n = cgraph->nodes[k];
             if (n->op == GGML_OP_MUL_MAT && n->src[1] == node->src[1] && (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
                 g = k;
@@ -3038,13 +3032,11 @@ int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_c
             }
         }
         mk_gdn_gates_params gates_p;
-        int gates_blocks = 0;
-        if (g >= 0) {
-            // outputs first: the gates are written before their nodes, into private buffers
-            ggml_cuda_redirect_early_output(const_cast<ggml_cgraph *>(cgraph), cgraph->nodes[g + 4]);
-            ggml_cuda_redirect_early_output(const_cast<ggml_cgraph *>(cgraph), cgraph->nodes[g + 8]);
-        }
-        if (g >= 0 && ggml_cuda_gdn_gates_prepare(cgraph, g, gates_p, gates_blocks)) {
+        if (g >= 0 && ggml_cuda_gdn_gates_prepare(cgraph, g, gates_p)) {
+            ggml_cuda_redirect_early_output(const_cast<ggml_cgraph *>(cgraph), i, cgraph->nodes[g + 4]);
+            ggml_cuda_redirect_early_output(const_cast<ggml_cgraph *>(cgraph), i, cgraph->nodes[g + 8]);
+            gates_p.gate = (float *) cgraph->nodes[g + 4]->data;
+            gates_p.beta = (float *) cgraph->nodes[g + 8]->data;
             ggml_cuda_gdn_conv_gates(conv_plan.p, gates_p, ctx.stream());
             for (int k = g; k <= g + 8; ++k) {
                 g_precomputed_nodes.insert(cgraph->nodes[k]);
@@ -3613,6 +3605,23 @@ void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph 
 }
 
 
+// Block blk of a multi-op launch runs BLOCK/Op::threads one-row tiles of Op.
+template <int BLOCK, typename Op>
+static __device__ __forceinline__ void mmvq_multi_tile(const mk_mmvq_params & p, const uint32_t nt, const uint32_t blk, char * lds) {
+    constexpr int nsub = BLOCK / Op::threads;
+    const int sub   = threadIdx.x / Op::threads;
+    const int local = threadIdx.x % Op::threads;
+    const uint32_t tile = __builtin_amdgcn_readfirstlane(blk*nsub + sub);
+    Op::block(p, tile < nt ? tile : nt - 1, 0, 0, local % WARP_SIZE, __builtin_amdgcn_readfirstlane(local / WARP_SIZE),
+              tile < nt, lds + sub*Op::lds_bytes);
+}
+
+// block counts come from the launcher's own block sizes (host code cannot see the device mmvq table)
+static uint32_t mmvq_multi_blocks(const ggml_cuda_mmvq_capture & c, const int block) {
+    const int per_block = block / c.threads;
+    return (c.grid_x + per_block - 1) / per_block;
+}
+
 // Two independent decode matvecs in one launch: the first blocks run op A, the rest op B, each block taking
 // BLOCK/threads one-row tiles of its op. (BLOCK, 1) bounds and direct block coordinates keep the matvec codegen
 // as in the standalone kernels; each op's arithmetic is unchanged.
@@ -3621,19 +3630,10 @@ static __global__ void __launch_bounds__(BLOCK, 1) mmvq_pair(
         const mk_mmvq_params pa, const uint32_t nta, const uint32_t nba, const mk_mmvq_params pb, const uint32_t ntb) {
     constexpr int lds_a = BLOCK/OpA::threads*OpA::lds_bytes, lds_b = BLOCK/OpB::threads*OpB::lds_bytes;
     __shared__ __align__(16) char lds[(lds_a > lds_b ? lds_a : lds_b) + 16];
-    auto go = [&](auto op, const mk_mmvq_params & p, const uint32_t nt, const uint32_t blk) {
-        using Op = decltype(op);
-        constexpr int nsub = BLOCK / Op::threads;
-        const int sub   = threadIdx.x / Op::threads;
-        const int local = threadIdx.x % Op::threads;
-        const uint32_t tile = __builtin_amdgcn_readfirstlane(blk*nsub + sub);
-        Op::block(p, tile < nt ? tile : nt - 1, 0, 0, local % WARP_SIZE, __builtin_amdgcn_readfirstlane(local / WARP_SIZE),
-                  tile < nt, lds + sub*Op::lds_bytes);
-    };
     if (blockIdx.x < nba) {
-        go(OpA{}, pa, nta, blockIdx.x);
+        mmvq_multi_tile<BLOCK, OpA>(pa, nta, blockIdx.x, lds);
     } else {
-        go(OpB{}, pb, ntb, blockIdx.x - nba);
+        mmvq_multi_tile<BLOCK, OpB>(pb, ntb, blockIdx.x - nba, lds);
     }
 }
 
@@ -3666,8 +3666,8 @@ void ggml_cuda_mmvq_launch_pair(const ggml_cuda_mmvq_capture & a, const ggml_cud
     memcpy(&pb, b.params, sizeof(pb));
     auto launch = [&](auto block_c, auto op_a, auto op_b) {
         constexpr int BLOCK = decltype(block_c)::value;
-        const uint32_t nba = (a.grid_x + BLOCK/a.threads - 1) / (BLOCK/a.threads);
-        const uint32_t nbb = (b.grid_x + BLOCK/b.threads - 1) / (BLOCK/b.threads);
+        const uint32_t nba = mmvq_multi_blocks(a, BLOCK);
+        const uint32_t nbb = mmvq_multi_blocks(b, BLOCK);
         mmvq_pair<BLOCK, decltype(op_a), decltype(op_b)><<<nba + nbb, BLOCK, 0, stream>>>(pa, a.grid_x, nba, pb, b.grid_x);
     };
     using I32 = std::integral_constant<int, 32>;
@@ -3692,21 +3692,12 @@ static __global__ void __launch_bounds__(BLOCK, 1) mmvq_triple(
     constexpr int la = BLOCK/OpA::threads*OpA::lds_bytes, lb = BLOCK/OpB::threads*OpB::lds_bytes, lc = BLOCK/OpC::threads*OpC::lds_bytes;
     constexpr int lab = la > lb ? la : lb;
     __shared__ __align__(16) char lds[(lab > lc ? lab : lc) + 16];
-    auto go = [&](auto op, const mk_mmvq_params & p, const uint32_t nt, const uint32_t blk) {
-        using Op = decltype(op);
-        constexpr int nsub = BLOCK / Op::threads;
-        const int sub   = threadIdx.x / Op::threads;
-        const int local = threadIdx.x % Op::threads;
-        const uint32_t tile = __builtin_amdgcn_readfirstlane(blk*nsub + sub);
-        Op::block(p, tile < nt ? tile : nt - 1, 0, 0, local % WARP_SIZE, __builtin_amdgcn_readfirstlane(local / WARP_SIZE),
-                  tile < nt, lds + sub*Op::lds_bytes);
-    };
     if (blockIdx.x < nba) {
-        go(OpA{}, pa, nta, blockIdx.x);
+        mmvq_multi_tile<BLOCK, OpA>(pa, nta, blockIdx.x, lds);
     } else if (blockIdx.x < nba + nbb) {
-        go(OpB{}, pb, ntb, blockIdx.x - nba);
+        mmvq_multi_tile<BLOCK, OpB>(pb, ntb, blockIdx.x - nba, lds);
     } else {
-        go(OpC{}, pc, ntc, blockIdx.x - nba - nbb);
+        mmvq_multi_tile<BLOCK, OpC>(pc, ntc, blockIdx.x - nba - nbb, lds);
     }
 }
 
@@ -3737,10 +3728,9 @@ void ggml_cuda_mmvq_launch_triple(const ggml_cuda_mmvq_capture & a, const ggml_c
     memcpy(&pb, b.params, sizeof(pb));
     memcpy(&pc, c.params, sizeof(pc));
     constexpr int BLOCK = 256;
-    // block counts come from the launcher's own block sizes (host code cannot see the device mmvq table)
-    const uint32_t nba = (a.grid_x + BLOCK/a.threads - 1) / (BLOCK/a.threads);
-    const uint32_t nbb = (b.grid_x + BLOCK/b.threads - 1) / (BLOCK/b.threads);
-    const uint32_t nbc = (c.grid_x + BLOCK/c.threads - 1) / (BLOCK/c.threads);
+    const uint32_t nba = mmvq_multi_blocks(a, BLOCK);
+    const uint32_t nbb = mmvq_multi_blocks(b, BLOCK);
+    const uint32_t nbc = mmvq_multi_blocks(c, BLOCK);
     auto launch = [&](auto t_c) {
         constexpr int T = decltype(t_c)::value;
         using OpA = mk_mmvq<BLOCK, GGML_TYPE_IQ4_XS, T, false, false, 0, true>;
@@ -3764,9 +3754,8 @@ void ggml_cuda_mmvq_launch_triple(const ggml_cuda_mmvq_capture & a, const ggml_c
 // Path F: the attention q (IQ4_XS) projection and the k and v (Q8_0) projections read the same normed input;
 // at q's node all three run as one launch, k and v into private buffers (they are written before their nodes).
 int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
-    static const bool enabled = getenv("GGML_CUDA_MULTI_OP") != nullptr;
     ggml_tensor * q = cgraph->nodes[i];
-    if (!enabled || q->op != GGML_OP_MUL_MAT || q->src[0]->type != GGML_TYPE_IQ4_XS || q->ne[1] < 1 || q->ne[1] > MMVQ_MAX_BATCH_SIZE ||
+    if (!ggml_cuda_multi_op() || q->op != GGML_OP_MUL_MAT || q->src[0]->type != GGML_TYPE_IQ4_XS || q->ne[1] > MMVQ_MAX_BATCH_SIZE ||
             q->ne[2] != 1 || q->src[2] != nullptr) {
         return 0;
     }
@@ -3781,13 +3770,17 @@ int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
             kv[n_kv++] = n;
         }
     }
-    if (n_kv != 2 || ggml_cuda_mul_mat_kernel(ctx, q->src[0], q->src[1], q) != GGML_CUDA_MM_MMVQ) {
-        static const bool dbg = getenv("GGML_CUDA_FUSE_DEBUG") != nullptr;
-        if (dbg) { fprintf(stderr, "fuse-debug: triple at %s rejected: n_kv %d kernel %d\n", q->name, n_kv, (int) ggml_cuda_mul_mat_kernel(ctx, q->src[0], q->src[1], q)); }
+    const auto is_mmvq = [&](const ggml_tensor * m) {
+        return ggml_cuda_mul_mat_kernel(ctx, m->src[0], m->src[1], m) == GGML_CUDA_MM_MMVQ;
+    };
+    if (n_kv != 2 || !is_mmvq(q) || !is_mmvq(kv[0]) || !is_mmvq(kv[1])) {
+        if (ggml_cuda_fuse_debug()) {
+            fprintf(stderr, "fuse-debug: triple at %s rejected: n_kv %d q mmvq %d\n", q->name, n_kv, (int) is_mmvq(q));
+        }
         return 0;
     }
-    ggml_cuda_redirect_early_output(cgraph, kv[0]);
-    ggml_cuda_redirect_early_output(cgraph, kv[1]);
+    ggml_cuda_redirect_early_output(cgraph, i, kv[0]);
+    ggml_cuda_redirect_early_output(cgraph, i, kv[1]);
     ggml_cuda_mmvq_capture cap[3];
     ggml_tensor * mm[3] = { q, kv[0], kv[1] };
     for (int m = 0; m < 3; ++m) {
