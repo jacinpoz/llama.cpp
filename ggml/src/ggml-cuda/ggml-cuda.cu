@@ -5204,11 +5204,60 @@ static int ggml_cuda_try_fuse_gdn_out_gate(ggml_backend_cuda_context & ctx, ggml
     return 5;
 }
 
+// Path F: the attention q (IQ4_XS) projection and the k and v (Q8_0) projections read the same normed input;
+// at q's node all three run as one launch, k and v into private buffers (they are written before their nodes).
+static int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
+    static const bool enabled = getenv("GGML_CUDA_MULTI_OP") != nullptr;
+    ggml_tensor * q = cgraph->nodes[i];
+    if (!enabled || q->op != GGML_OP_MUL_MAT || q->src[0]->type != GGML_TYPE_IQ4_XS || q->ne[1] != 1 || q->src[2] != nullptr) {
+        return 0;
+    }
+    ggml_tensor * kv[2] = { nullptr, nullptr };
+    int n_kv = 0;
+    for (int k = i + 1; k < std::min(cgraph->n_nodes, i + 24) && n_kv < 2; ++k) {
+        ggml_tensor * n = cgraph->nodes[k];
+        if (n->op == GGML_OP_MUL_MAT && n->src[1] == q->src[1] && (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            if (n->src[0]->type != GGML_TYPE_Q8_0 || n->ne[1] != 1 || n->src[2] != nullptr) {
+                return 0;
+            }
+            kv[n_kv++] = n;
+        }
+    }
+    if (n_kv != 2 || !ggml_cuda_should_fuse_mul_mat_vec_q(q)) {
+        return 0;
+    }
+    ggml_cuda_redirect_early_output(cgraph, kv[0]);
+    ggml_cuda_redirect_early_output(cgraph, kv[1]);
+    ggml_cuda_mmvq_capture cap[3];
+    ggml_tensor * mm[3] = { q, kv[0], kv[1] };
+    for (int m = 0; m < 3; ++m) {
+        ggml_cuda_mmvq_set_capture(&cap[m]);
+        ggml_cuda_mul_mat_vec_q(ctx, mm[m]->src[0], mm[m]->src[1], mm[m]->src[2], mm[m], nullptr);
+    }
+    ggml_cuda_mmvq_set_capture(nullptr);
+    if (ggml_cuda_mmvq_triple_supported(cap[0], cap[1], cap[2])) {
+        ggml_cuda_mmvq_launch_triple(cap[0], cap[1], cap[2], ctx.stream());
+    } else {
+        // only reached if the launcher's dispatch changed: none of the three may be half-captured
+        GGML_ASSERT(!cap[0].valid && !cap[1].valid && !cap[2].valid && "mmvq triple: unsupported captured shapes");
+    }
+    g_precomputed_nodes.insert(kv[0]);
+    g_precomputed_nodes.insert(kv[1]);
+    return -1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
         return 0;
+    }
+
+    if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+        const int r = ggml_cuda_try_mmvq_triple(*cuda_ctx, cgraph, i);
+        if (r != 0) {
+            return r;
+        }
     }
 
     // fused gate+up+GLU MMQ (prefill): hard opt-out for A/B and regression testing

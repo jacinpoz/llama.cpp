@@ -2470,3 +2470,55 @@ void ggml_cuda_mmvq_launch_pair(const ggml_cuda_mmvq_capture & a, const ggml_cud
     }
     CUDA_CHECK(cudaGetLastError());
 }
+
+// Three independent decode matvecs in one launch: the attention q (+gate) projection (IQ4_XS, one wave per row)
+// and the v and k projections (Q8_0, one 256-thread block per row), all reading the same normed input.
+template <int BLOCK, typename OpA, typename OpB, typename OpC>
+static __global__ void __launch_bounds__(BLOCK, 1) mmvq_triple(
+        const mk_mmvq_params pa, const uint32_t nta, const uint32_t nba,
+        const mk_mmvq_params pb, const uint32_t ntb, const uint32_t nbb,
+        const mk_mmvq_params pc, const uint32_t ntc) {
+    constexpr int la = BLOCK/OpA::threads*OpA::lds_bytes, lb = BLOCK/OpB::threads*OpB::lds_bytes, lc = BLOCK/OpC::threads*OpC::lds_bytes;
+    constexpr int lab = la > lb ? la : lb;
+    __shared__ __align__(16) char lds[(lab > lc ? lab : lc) + 16];
+    auto go = [&](auto op, const mk_mmvq_params & p, const uint32_t nt, const uint32_t blk) {
+        using Op = decltype(op);
+        constexpr int nsub = BLOCK / Op::threads;
+        const int sub   = threadIdx.x / Op::threads;
+        const int local = threadIdx.x % Op::threads;
+        const uint32_t tile = __builtin_amdgcn_readfirstlane(blk*nsub + sub);
+        Op::block(p, tile < nt ? tile : nt - 1, 0, 0, local % WARP_SIZE, __builtin_amdgcn_readfirstlane(local / WARP_SIZE),
+                  tile < nt, lds + sub*Op::lds_bytes);
+    };
+    if (blockIdx.x < nba) {
+        go(OpA{}, pa, nta, blockIdx.x);
+    } else if (blockIdx.x < nba + nbb) {
+        go(OpB{}, pb, ntb, blockIdx.x - nba);
+    } else {
+        go(OpC{}, pc, ntc, blockIdx.x - nba - nbb);
+    }
+}
+
+bool ggml_cuda_mmvq_triple_supported(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, const ggml_cuda_mmvq_capture & c) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    auto one_row = [](const ggml_cuda_mmvq_capture & x) { return x.valid && x.grid_y == 1 && x.grid_z == 1; };
+    return one_row(a) && one_row(b) && one_row(c) && get_device_table_id(cc) == MMVQ_PARAMETERS_RDNA3_0 &&
+           a.variant == mk_mmvq_variant(GGML_TYPE_IQ4_XS, 1, false, true) && a.threads == 32 &&
+           b.variant == mk_mmvq_variant(GGML_TYPE_Q8_0, 1, false, true) && b.threads == 256 &&
+           c.variant == mk_mmvq_variant(GGML_TYPE_Q8_0, 1, false, true) && c.threads == 256;
+}
+
+void ggml_cuda_mmvq_launch_triple(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, const ggml_cuda_mmvq_capture & c,
+        cudaStream_t stream) {
+    mk_mmvq_params pa, pb, pc;
+    memcpy(&pa, a.params, sizeof(pa));
+    memcpy(&pb, b.params, sizeof(pb));
+    memcpy(&pc, c.params, sizeof(pc));
+    constexpr int BLOCK = 256;
+    using OpA = mk_mmvq<BLOCK, GGML_TYPE_IQ4_XS, 1, false, false, 0, true>;
+    using OpQ8 = mk_mmvq<BLOCK, GGML_TYPE_Q8_0, 1, false, false, 0, true>;
+    const uint32_t nba = (a.grid_x + BLOCK/a.threads - 1) / (BLOCK/a.threads);
+    const uint32_t nbb = b.grid_x, nbc = c.grid_x;
+    mmvq_triple<BLOCK, OpA, OpQ8, OpQ8><<<nba + nbb + nbc, BLOCK, 0, stream>>>(pa, a.grid_x, nba, pb, b.grid_x, nbb, pc, c.grid_x);
+    CUDA_CHECK(cudaGetLastError());
+}
