@@ -349,6 +349,13 @@ if (GGML_HIP AND NOT GGML_BACKEND_DL)
     endif()
 endif()
 
+# host-only: the megakernel stream builder, validator and graph matcher as plain C++, no GPU backend
+add_executable(test-megakernel-host test-megakernel-host.cpp)
+target_link_libraries(test-megakernel-host PRIVATE ggml-base)
+target_include_directories(test-megakernel-host PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+target_compile_definitions(test-megakernel-host PRIVATE MK_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/megakernel-decode-fixture.txt")
+add_test(NAME test-megakernel-host COMMAND $<TARGET_FILE:test-megakernel-host>)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
