@@ -25,7 +25,7 @@
 #endif
 
 template <typename Op>
-static __device__ __forceinline__ void mk_exec(const mk_instr & in, const uint8_t * __restrict__ params, char * lds) {
+static __device__ __noinline__ void mk_exec(const mk_instr & in, const uint8_t * __restrict__ params, char * lds) {
     using P = mk_op_params<Op>;
     constexpr int threads = Op::threads;
     constexpr int nsub    = MK_THREADS / threads;
@@ -58,23 +58,28 @@ static __device__ __forceinline__ bool mk_dispatch(const mk_stream_desc & d, con
         MK_CASE(MK_OP_TEST_ADD,  mk_test_add);
         MK_CASE(MK_OP_TEST_SPIN, mk_test_spin);
 #ifdef MK_HAVE_OPS_FFN
-        MK_CASE(MK_OP_RMSNORM_Q8_1,   mk_rmsnorm_q8_1);
-        MK_CASE(MK_OP_MMVQ,           mk_mmvq);
-        MK_CASE(MK_OP_LM_HEAD_ARGMAX, mk_lm_head_argmax);
+#define MK_CASE_DISPATCH(opc, dispatch) case opc: \
+            dispatch<MK_THREADS>(in.variant, [&](auto op) { mk_exec<decltype(op)>(in, d.params, lds); }); return true
+        MK_CASE_DISPATCH(MK_OP_RMSNORM_Q8_1, mk_rmsnorm_q8_1_dispatch);
+        MK_CASE_DISPATCH(MK_OP_RMSNORM_F32,  mk_rmsnorm_f32_dispatch);
+        MK_CASE_DISPATCH(MK_OP_MMVQ,         mk_mmvq_dispatch);
+#undef MK_CASE_DISPATCH
+        MK_CASE(MK_OP_QUANTIZE_Q8_1,  mk_quantize_q8_1);
+        MK_CASE(MK_OP_LM_HEAD_ARGMAX, mk_argmax_partial);
         MK_CASE(MK_OP_ARGMAX_COMBINE, mk_argmax_combine);
 #endif
 #ifdef MK_HAVE_OPS_GDN
-        MK_CASE(MK_OP_GDN_GATES,    mk_gdn_gates);
-        MK_CASE(MK_OP_GDN_CONV,     mk_gdn_conv);
-        MK_CASE(MK_OP_GDN_STEP,     mk_gdn_step);
-        MK_CASE(MK_OP_GDN_OUT_GATE, mk_gdn_out_gate);
+        MK_CASE(MK_OP_GDN_GATES, mk_gdn_gates);
+        MK_CASE(MK_OP_GDN_CONV,  mk_gdn_conv);
+        MK_CASE(MK_OP_GDN_STEP,  mk_gdn_step);
+        case MK_OP_GDN_OUT_GATE: mk_exec<mk_gdn_out_gate<MK_THREADS, 128>>(in, d.params, lds); return true;
 #endif
 #ifdef MK_HAVE_OPS_ATTN
-        MK_CASE(MK_OP_ATTN_PREP_Q,     mk_attn_prep_q);
-        MK_CASE(MK_OP_ATTN_PREP_K,     mk_attn_prep_k);
-        MK_CASE(MK_OP_V_HAD_SET_ROWS,  mk_v_had_set_rows);
-        MK_CASE(MK_OP_ATTN_PARTIAL,    mk_attn_partial);
-        MK_CASE(MK_OP_ATTN_COMBINE,    mk_attn_combine);
+        // ATTN_PARTIAL runs as its own kernel between segments: 32 sub-tiles need more than 64 KiB of LDS.
+        MK_CASE(MK_OP_ATTN_PREP_Q,    mk_attn_prep);
+        MK_CASE(MK_OP_ATTN_PREP_K,    mk_attn_prep);
+        MK_CASE(MK_OP_V_HAD_SET_ROWS, mk_v_had_set_rows);
+        MK_CASE(MK_OP_ATTN_COMBINE,   mk_attn_combine);
 #endif
         default:
             if (threadIdx.x == 0) {
