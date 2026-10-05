@@ -5354,6 +5354,8 @@ static int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgrap
         }
     }
     if (n_kv != 2 || ggml_cuda_mul_mat_kernel(ctx, q->src[0], q->src[1], q) != GGML_CUDA_MM_MMVQ) {
+        static const bool dbg = getenv("GGML_CUDA_FUSE_DEBUG") != nullptr;
+        if (dbg) { fprintf(stderr, "fuse-debug: triple at %s rejected: n_kv %d kernel %d\n", q->name, n_kv, (int) ggml_cuda_mul_mat_kernel(ctx, q->src[0], q->src[1], q)); }
         return 0;
     }
     ggml_cuda_redirect_early_output(cgraph, kv[0]);
@@ -5661,6 +5663,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if ((quantize || ggml_cuda_verify_norm_q8()) && ggml_cuda_op_add_rms_norm_q8_1(*cuda_ctx, node, norm, mul, quantize)) {
             return 2;
         }
+        static const bool dbg_v1 = getenv("GGML_CUDA_FUSE_DEBUG") != nullptr;
+        if (dbg_v1) { fprintf(stderr, "fuse-debug: add+norm %s not fused (quantize %d, verify_norm_q8 %d)\n", node->name, (int) quantize, (int) ggml_cuda_verify_norm_q8()); }
     }
 
     // rms_norm + norm-weight MUL whose output feeds an mmvq matmul: fold the
