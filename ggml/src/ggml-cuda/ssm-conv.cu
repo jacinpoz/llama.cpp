@@ -37,6 +37,7 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
 static __global__ void k_gdn_conv(const mk_gdn_conv_params p) {
     constexpr int threads = mk_gdn_conv<1>::threads;
     __shared__ float lds[mk_gdn_conv<threads>::lds_bytes/sizeof(float)];
+    ggml_cuda_pdl_sync();
     mk_gdn_conv<threads>::run(p, 0, blockIdx.x, true, (char *) lds);
 }
 
