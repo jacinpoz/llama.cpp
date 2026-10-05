@@ -24,26 +24,45 @@
 #define GGML_CUDA_MK_PREFETCH 1
 #endif
 
+template <typename T>
+static __device__ __forceinline__ T mk_uniform(T v) {
+    static_assert(sizeof(T) == 4 || sizeof(T) == 8, "mk_uniform takes 32- or 64-bit values");
+    if constexpr (sizeof(T) == 4) {
+        return __builtin_bit_cast(T, __builtin_amdgcn_readfirstlane(__builtin_bit_cast(int32_t, v)));
+    } else {
+        const uint64_t u = __builtin_bit_cast(uint64_t, v);
+        const uint32_t lo = __builtin_amdgcn_readfirstlane((uint32_t) u);
+        const uint32_t hi = __builtin_amdgcn_readfirstlane((uint32_t) (u >> 32));
+        return __builtin_bit_cast(T, (uint64_t) hi << 32 | lo);
+    }
+}
+
+// Call arguments arrive in VGPRs, so the uniform values are re-scalarized here; otherwise every param
+// read in the op's inner loops becomes a per-lane vector load.
 template <typename Op>
-static __device__ __noinline__ void mk_exec(const mk_instr & in, const uint8_t * __restrict__ params, char * lds) {
+static __device__ __noinline__ void mk_exec(const mk_instr & in_ref, const uint8_t * __restrict__ params_ref, char * lds) {
     using P = mk_op_params<Op>;
     constexpr int threads = Op::threads;
     constexpr int nsub    = MK_THREADS / threads;
     static_assert(MK_THREADS % threads == 0, "op threads must divide MK_THREADS");
     static_assert(nsub*Op::lds_bytes <= MK_OP_LDS_BYTES, "op LDS does not fit the megakernel");
 
-    const P & p   = *reinterpret_cast<const P *>(params + in.params_off);
+    const int tile_begin = mk_uniform(in_ref.tile_begin);
+    const int tile_end   = mk_uniform(in_ref.tile_end);
+    const int variant    = mk_uniform((int) in_ref.variant);
+    const P * pp = mk_uniform(reinterpret_cast<const P *>(mk_uniform(params_ref) + mk_uniform(in_ref.params_off)));
+    const P   p  = *pp;
     const int sub = threadIdx.x / threads;
     char * lds_sub = lds + sub*Op::lds_bytes;
 
-    for (int t0 = in.tile_begin; t0 < in.tile_end; t0 += nsub) {
+    for (int t0 = tile_begin; t0 < tile_end; t0 += nsub) {
         // Separates the previous step's LDS reads from this step's writes.
-        if (Op::lds_bytes > 0 && t0 != in.tile_begin) {
+        if (Op::lds_bytes > 0 && t0 != tile_begin) {
             __syncthreads();
         }
         const int  tile  = t0 + sub;
-        const bool valid = tile < in.tile_end;
-        Op::run(p, in.variant, valid ? tile : in.tile_end - 1, valid, lds_sub);
+        const bool valid = tile < tile_end;
+        Op::run(p, variant, valid ? tile : tile_end - 1, valid, lds_sub);
     }
 }
 

@@ -538,17 +538,27 @@ static bool build_stream_from_records(const std::vector<mk_recorded_op> & recs, 
         memcpy(h.params.data() + off, r.params.data(), r.params.size());
 
         const int counter = h.add_counter();
-        const int per_block = (r.n_tiles + n_blocks - 1) / n_blocks;
         uint32_t signals = 0;
-        for (int b = 0; b < n_blocks; ++b) {
-            const int t0 = b*per_block;
-            const int t1 = std::min<int>(r.n_tiles, t0 + per_block);
-            if (t0 >= t1) {
-                break;
+        static const int chunk = getenv("MK_CHUNK") ? atoi(getenv("MK_CHUNK")) : 0;
+        if (chunk > 0) {
+            // Round-robin chunks: at any moment the blocks work on neighbouring tiles, like hardware dispatch.
+            for (int t0 = 0, b = 0; t0 < r.n_tiles; t0 += chunk, b = (b + 1) % n_blocks) {
+                h.push(b, r.opcode, t0, std::min<int>(r.n_tiles, t0 + chunk), prev_counter, prev_signals, counter, off);
+                h.queues[b].back().variant = r.variant;
+                signals++;
             }
-            h.push(b, r.opcode, t0, t1, prev_counter, prev_signals, counter, off);
-            h.queues[b].back().variant = r.variant;
-            signals++;
+        } else {
+            const int per_block = (r.n_tiles + n_blocks - 1) / n_blocks;
+            for (int b = 0; b < n_blocks; ++b) {
+                const int t0 = b*per_block;
+                const int t1 = std::min<int>(r.n_tiles, t0 + per_block);
+                if (t0 >= t1) {
+                    break;
+                }
+                h.push(b, r.opcode, t0, t1, prev_counter, prev_signals, counter, off);
+                h.queues[b].back().variant = r.variant;
+                signals++;
+            }
         }
         prev_counter = counter;
         prev_signals = signals;
@@ -584,6 +594,15 @@ static bool test_ffn(hipStream_t stream, int n_blocks, bool timing) {
     }
     printf("\n");
 
+    // MK_FFN_OPS=i,j,... keeps only those recorded launches (timing experiments; the bit check then fails by design).
+    if (const char * sel = getenv("MK_FFN_OPS")) {
+        std::vector<mk_recorded_op> keep;
+        for (const char * c = sel; *c; ) {
+            keep.push_back(recs.at(strtol(c, (char **) &c, 10)));
+            if (*c == ',') { c++; }
+        }
+        recs = keep;
+    }
     mk_host_stream h(n_blocks);
     if (recs.empty() || !build_stream_from_records(recs, n_blocks, h)) {
         printf("ffn: FAILED (no usable records)\n");
@@ -614,6 +633,9 @@ static bool test_ffn(hipStream_t stream, int n_blocks, bool timing) {
         ok = false;
     }
 
+    if (getenv("MK_FFN_OPS")) {
+        ok = true;
+    }
     if (timing && ok) {
         for (int rep = 0; rep < reps; ++rep) {
             ggml_backend_synchronize(fc.backend);
