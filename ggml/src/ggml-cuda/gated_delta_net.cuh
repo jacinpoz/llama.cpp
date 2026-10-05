@@ -19,6 +19,7 @@ struct ggml_cuda_gdn_state_src {
     const float *   base;       // cache rows
     const int32_t * ids;        // device row index per sequence
     int64_t         row_stride; // in floats
+    float *         state_pre;  // nullptr: none. Receives the input state (the pre-batch rollback slot).
 };
 
 void ggml_cuda_gdn_clear_state_srcs();

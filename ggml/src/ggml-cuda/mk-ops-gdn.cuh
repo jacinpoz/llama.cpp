@@ -338,6 +338,7 @@ struct mk_gdn_step_params {
     int             K;
     const int32_t * state_ids;
     int64_t         state_row_stride;
+    float         * state_pre;         // nullptr: none. Receives the input state (the pre-batch rollback slot).
     const mk_launch_params * launch;
 };
 
@@ -386,6 +387,15 @@ static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params
     for (int r = 0; r < rows_per_lane; r++) {
         const int i = r * warp_size + lane;
         s_shard[r]  = curr_state[i];
+    }
+
+    // The column is fully loaded before any write, so the slot may alias the row it was read from.
+    if (p.state_pre != nullptr) {
+        float * pre = p.state_pre + state_out_offset + col * S_v;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            pre[r * warp_size + lane] = s_shard[r];
+        }
     }
 
     for (int t = 0; t < n_tokens; t++) {
