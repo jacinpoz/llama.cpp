@@ -380,6 +380,27 @@ struct mk_quantize_q8_1_params {
     uint32_t nblocks_x;
 };
 
+// One Q8_1 block from the 32 lanes of a wave, lane iqs holding value iqs. Shared by quantize_q8_1 and the
+// mmvq GLU epilogue so both quantize identically.
+static __device__ __forceinline__ void mk_quantize_q8_1_group(const float xi, block_q8_1 * yb, const int iqs) {
+    float amax = fabsf(xi);
+    float sum = xi;
+
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    yb->qs[iqs] = q;
+
+    if (iqs > 0) {
+        return;
+    }
+
+    yb->ds = make_half2(d, sum);
+}
+
 template <int BLOCK>
 struct mk_quantize_q8_1 {
     static constexpr int threads   = 256;
@@ -416,22 +437,7 @@ struct mk_quantize_q8_1 {
         const int64_t iqs = i_cont % QK8_1;
 
         const float xi = i0 < p.ne00 ? x[i03*p.s03 + i02*p.s02 + i01*p.s01 + i00] : 0.0f;
-        float amax = fabsf(xi);
-        float sum = xi;
-
-        amax = warp_reduce_max<QK8_1>(amax);
-        sum  = warp_reduce_sum<QK8_1>(sum);
-
-        const float  d = amax / 127.0f;
-        const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
-
-        y[ib].qs[iqs] = q;
-
-        if (iqs > 0) {
-            return;
-        }
-
-        y[ib].ds = make_half2(d, sum);
+        mk_quantize_q8_1_group(xi, y + ib, iqs);
     }
 };
 
@@ -830,6 +836,27 @@ struct mk_mmvq {
             }
         }
 
+        if constexpr (has_fusion && ncols_dst == 1 && rows_per_cuda_block == 1) {
+            if (fusion.q8_1_out != nullptr) {
+                // Publish this row, then count it in its 32-row group; the wave that completes the group
+                // quantizes it, reading the other waves' rows after an acquire.
+                __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+                const uint32_t group = row0 / QK8_1;
+                uint32_t prev = 0;
+                if (lane == 0) {
+                    prev = __hip_atomic_fetch_add(fusion.q8_1_group_done + group, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+                }
+                prev = __builtin_amdgcn_readfirstlane(prev);
+                if (prev == QK8_1 - 1) {
+                    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+                    const float xi = __hip_atomic_load(dst - row0 % QK8_1 + lane, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                    mk_quantize_q8_1_group(xi, (block_q8_1 *) fusion.q8_1_out + group, lane);
+                    if (lane == 0) {
+                        fusion.q8_1_group_done[group] = 0;
+                    }
+                }
+            }
+        }
         if constexpr (!has_fusion) {
             GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, use_dst_gate, use_conv_input, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate, dst_gate, conv_input, conv_states, conv_kernel_size);
         }
