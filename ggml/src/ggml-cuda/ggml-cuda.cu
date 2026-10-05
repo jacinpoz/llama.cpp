@@ -7360,6 +7360,22 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             total += v;
         }
         GGML_LOG_INFO("%s: op timing: total %.2f ms over %zu nodes:\n", __func__, total, op_nodes.size());
+        if (getenv("GGML_CUDA_OP_SEQ_TMP")) {
+            if (getenv("GGML_CUDA_OP_RAW_TMP")) {
+                for (int k = 0; k < cgraph->n_nodes; ++k) {
+                    const ggml_tensor * n = cgraph->nodes[k];
+                    fprintf(stderr, "RAW %4d %-14s %-26s [%lld,%lld,%lld,%lld] %-5s <- %s%s | %s%s | %s\n", k, ggml_op_name(n->op), n->name,
+                        (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3], ggml_type_name(n->type),
+                        n->src[0] ? n->src[0]->name : "-", n->src[0] ? (n->src[0]->op == GGML_OP_NONE ? "(w)" : "") : "",
+                        n->src[1] ? n->src[1]->name : "-", n->src[1] ? (n->src[1]->op == GGML_OP_NONE ? "(w)" : "") : "",
+                        n->src[2] ? n->src[2]->name : "-");
+                }
+            }
+            for (const auto & [node, idx, fused] : op_nodes) {
+                fprintf(stderr, "SEQ %5d %s %-14s %-28s [%lld,%lld,%lld,%lld] %s\n", idx, fused ? "F" : " ", ggml_op_name(node->op), node->name,
+                    (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3], ggml_type_name(node->type));
+            }
+        }
         for (const auto & [k, v] : sorted) {
             GGML_LOG_INFO("  %8.3f ms %5.1f%%  x%-4d %s\n", v, 100.0 * v / total, op_cnt[k], k.c_str());
         }
