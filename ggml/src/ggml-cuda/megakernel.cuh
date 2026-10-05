@@ -2,12 +2,17 @@
 
 // One block of MK_THREADS per WGP. 1024 threads give 8 waves per SIMD, so VGPRs must stay <= MK_MAX_VGPRS.
 
+#include "common.cuh"
+
 #include <cstdint>
 
 #define MK_THREADS     1024
 #define MK_MAX_VGPRS   192
 #define MK_LDS_BYTES   (64*1024)
 #define MK_PARAM_ALIGN 16
+
+// LDS left to ops; the persistent kernel keeps the rest.
+#define MK_OP_LDS_BYTES (MK_LDS_BYTES - 16)
 
 enum mk_opcode : uint16_t {
     MK_OP_NOP = 0,
@@ -35,6 +40,10 @@ enum mk_opcode : uint16_t {
     MK_OP_ATTN_COMBINE,        // + gated tail
 
     MK_OP_COUNT,
+
+    // WS-D: mk-ops-test.cuh, used by test-megakernel
+    MK_OP_TEST_ADD = 0xF000,
+    MK_OP_TEST_SPIN,
 };
 
 struct mk_instr {
@@ -50,7 +59,13 @@ struct mk_instr {
 };
 static_assert(sizeof(mk_instr) == 32, "mk_instr must stay 32 bytes");
 
-// Counters are never reset: pass e waits for e*S_c + rel. The compare is wrap-safe.
+// What prefetch_off points at in the param blob (MK_PARAM_ALIGN-aligned). Read one dword per 128-byte line during the wait.
+struct mk_prefetch_desc {
+    const void * ptr;
+    uint64_t     bytes;
+};
+
+// Counters are not reset between passes: pass e waits for e*S_c + rel. The compare is wrap-safe.
 static __host__ __device__ __forceinline__ uint32_t mk_counter_target(uint32_t epoch, uint32_t signals_per_pass, uint32_t rel) {
     return epoch*signals_per_pass + rel;
 }
@@ -70,12 +85,12 @@ struct mk_stream_desc {
     const int32_t        * queue_begin;     // [n_blocks + 1]
     const uint8_t        * params;          // param blob
     const uint32_t       * signals_per_pass;// [n_counters]
-    uint32_t             * counters;        // [n_counters], device memory, never reset
+    uint32_t             * counters;        // [n_counters], device memory, reset only after an error
     int32_t              * error;           // 0 = ok; set by the watchdog or an op
     const mk_launch_params * launch;
     int32_t                n_blocks;
     int32_t                n_counters;
-    uint64_t               watchdog_cycles; // s_memrealtime ticks a wait may spin before aborting
+    uint64_t               watchdog_cycles; // wall_clock64() ticks a wait may spin before aborting
 };
 
 enum mk_error : int32_t {
@@ -90,3 +105,16 @@ enum mk_error : int32_t {
 // The __global__ wrapper runs one sub-tile per block; the megakernel runs MK_THREADS/threads.
 // Every thread hits the same __syncthreads() sequence whatever its tile or valid flag.
 // Lane = threadIdx.x % threads; no blockIdx or gridDim in run(). Results must be bit-identical.
+
+template <typename F> struct mk_run_signature;
+template <typename P> struct mk_run_signature<void (*)(const P &, int, int, bool, char *)> {
+    using params = P;
+};
+template <typename Op> using mk_op_params = typename mk_run_signature<decltype(&Op::run)>::params;
+
+// Host API (megakernel.cu). Launches are async and never sync, so segments can be queued back to back.
+// A set *error makes later waits abort until take_error clears it; then reset the counters and restart at epoch 0.
+// A captured launch replays one epoch.
+void    ggml_cuda_mk_launch(const mk_stream_desc & desc, cudaStream_t stream);
+int32_t ggml_cuda_mk_take_error(int32_t * error, cudaStream_t stream); // syncs the stream, returns and clears *error
+void    ggml_cuda_mk_reset_counters(const mk_stream_desc & desc, cudaStream_t stream);
