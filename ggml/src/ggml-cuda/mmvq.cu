@@ -1589,7 +1589,7 @@ void ggml_cuda_mul_mat_vec_q(
     if (glu_q8_1 && fusion && fusion->gate && fusion->glu_op == GGML_GLU_OP_SWIGLU && !fusion->dst_gate && !ids &&
             !fusion->x_bias && !fusion->conv_input && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE && dst->ne[2] == 1 && dst->ne[3] == 1 &&
             dst->ne[0] == GGML_PAD(dst->ne[0], MATRIX_ROW_PADDING) && dst->ne[0]/QK8_1 <= glu_q8_1_max_groups &&
-            ggml_is_contiguous(dst) && dst->view_src == nullptr) {
+            ggml_is_contiguous(dst) && dst->view_src == nullptr && ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == QK8_1) {
         static std::array<unsigned int *, GGML_CUDA_MAX_DEVICES> group_done = {};
         const int id = ggml_cuda_get_device();
         if (group_done[id] == nullptr) {

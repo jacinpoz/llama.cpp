@@ -2539,7 +2539,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q_glu(ggml_backend_cuda_context & 
         return false;
     }
     return up->op != GGML_OP_MUL_MAT || up->ne[1] == 1 ||
-           ggml_cuda_mul_mat_kernel(ctx, up->src[0], up->src[1], up) == GGML_CUDA_MM_MMVQ;
+           (up->ne[2] == 1 && up->ne[3] == 1 && ggml_cuda_mul_mat_kernel(ctx, up->src[0], up->src[1], up) == GGML_CUDA_MM_MMVQ);
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -4781,7 +4781,7 @@ static bool ggml_cuda_try_elide_gdn_state_gather(const ggml_cgraph * cgraph, con
 // launch at the qkv node. Returns z's node index, or -1. z is then written early into a private buffer
 // (ggml_cuda_redirect_early_output), since the graph allocator reuses z's own bytes until z's node.
 static int ggml_cuda_find_mmvq_pair(const ggml_cgraph * cgraph, const int i_qkv, const int i_last_fused) {
-    const bool enabled = ggml_cuda_multi_op();
+    const bool enabled = ggml_cuda_multi_op() && g_verify_gdn_single_stream;
     static const bool dbg = getenv("GGML_CUDA_MULTI_OP_DEBUG") != nullptr;
     const ggml_tensor * qkv = cgraph->nodes[i_qkv];
     if (!enabled || (qkv->src[0]->type != GGML_TYPE_Q6_K && qkv->src[0]->type != GGML_TYPE_IQ4_XS) ||
@@ -5175,7 +5175,7 @@ static thread_local int g_redirect_slot = 0;
 
 // `from` is the current node: t and its views (view_src is always the root) all come after it.
 static void ggml_cuda_redirect_early_output(ggml_cgraph * cgraph, int from, ggml_tensor * t) {
-    static std::vector<std::pair<void *, size_t>> buffers[GGML_CUDA_MAX_DEVICES]; // kept: captured graphs keep using them
+    static thread_local std::vector<std::pair<void *, size_t>> buffers[GGML_CUDA_MAX_DEVICES]; // kept: captured graphs keep using them
     const int device = ggml_cuda_get_device();
     const size_t nbytes = ggml_nbytes(t);
     if ((size_t) g_redirect_slot >= buffers[device].size()) {
@@ -5333,7 +5333,7 @@ static int ggml_cuda_try_fuse_gdn_out_gate(ggml_backend_cuda_context & ctx, ggml
 // at q's node all three run as one launch, k and v into private buffers (they are written before their nodes).
 static int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
     ggml_tensor * q = cgraph->nodes[i];
-    if (!ggml_cuda_multi_op() || q->op != GGML_OP_MUL_MAT || q->src[0]->type != GGML_TYPE_IQ4_XS || q->ne[1] > MMVQ_MAX_BATCH_SIZE ||
+    if (!ggml_cuda_multi_op() || !g_verify_gdn_single_stream || q->op != GGML_OP_MUL_MAT || q->src[0]->type != GGML_TYPE_IQ4_XS || q->ne[1] > MMVQ_MAX_BATCH_SIZE ||
             q->ne[2] != 1 || q->src[2] != nullptr) {
         return 0;
     }
@@ -5369,8 +5369,12 @@ static int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgrap
     if (ggml_cuda_mmvq_triple_supported(cap[0], cap[1], cap[2])) {
         ggml_cuda_mmvq_launch_triple(cap[0], cap[1], cap[2], ctx.stream());
     } else {
-        // only reached if the launcher's dispatch changed: none of the three may be half-captured
-        GGML_ASSERT(!cap[0].valid && !cap[1].valid && !cap[2].valid && "mmvq triple: unsupported captured shapes");
+        // a captured launch did not run
+        for (int m = 0; m < 3; ++m) {
+            if (cap[m].valid) {
+                ggml_cuda_mul_mat_vec_q(ctx, mm[m]->src[0], mm[m]->src[1], mm[m]->src[2], mm[m], nullptr);
+            }
+        }
     }
     g_precomputed_nodes.insert(kv[0]);
     g_precomputed_nodes.insert(kv[1]);
@@ -5659,7 +5663,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             break;
         }
         // With GGML_CUDA_VERIFY_NORM_Q8=1 the ADD folds into the norm even without an mmvq consumer (final norm via GET_ROWS).
-        if ((quantize || ggml_cuda_verify_norm_q8()) && ggml_cuda_op_add_rms_norm_q8_1(*cuda_ctx, node, norm, mul, quantize)) {
+        if ((quantize || (ggml_cuda_verify_norm_q8() && ggml_cuda_fuse_q8_1_verify())) && ggml_cuda_op_add_rms_norm_q8_1(*cuda_ctx, node, norm, mul, quantize)) {
             return 2;
         }
         if (ggml_cuda_fuse_debug()) { fprintf(stderr, "fuse-debug: add+norm %s not fused (quantize %d, verify_norm_q8 %d)\n", node->name, (int) quantize, (int) ggml_cuda_verify_norm_q8()); }
@@ -6027,23 +6031,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_mmvq_set_capture(nullptr);
                 if (ggml_cuda_mmvq_pair_supported(cap_qkv, cap_z)) {
                     ggml_cuda_mmvq_launch_pair(cap_qkv, cap_z, cuda_ctx->stream());
-                    g_precomputed_nodes.insert(z);
-                    qkv_done = true;
-                } else if (!cap_qkv.valid && !cap_z.valid) {
-                    // neither went through the capturable launcher, so both already ran normally
-                    g_precomputed_nodes.insert(z);
-                    qkv_done = true;
                 } else {
-                    GGML_ASSERT(cap_qkv.valid && cap_z.valid && "mmvq pair: only one of the two launches was captured");
-                    // captured but not pairable: nothing ran yet, so run qkv the normal way and leave z in place
+                    // a captured launch did not run
+                    if (cap_qkv.valid) {
+                        ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], node->src[2], qkv_dst, fusion);
+                    }
+                    if (cap_z.valid) {
+                        ggml_cuda_mul_mat_vec_q(*cuda_ctx, z->src[0], z->src[1], z->src[2], z, nullptr);
+                    }
                 }
+                g_precomputed_nodes.insert(z);
+                qkv_done = true;
             }
             if (!qkv_done) {
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], node->src[2], qkv_dst, fusion);
             }
             if (conv_fused) {
                 int g = -1;
-                for (int k = j + 1; ggml_cuda_multi_op() && k < std::min(cgraph->n_nodes - 8, j + 48); ++k) {
+                for (int k = j + 1; ggml_cuda_multi_op() && g_verify_gdn_single_stream && k < std::min(cgraph->n_nodes - 8, j + 48); ++k) {
                     const ggml_tensor * n = cgraph->nodes[k];
                     if (n->op == GGML_OP_MUL_MAT && n->src[1] == node->src[1] && (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
                         g = k;
