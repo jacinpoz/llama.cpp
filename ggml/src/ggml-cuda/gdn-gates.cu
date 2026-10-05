@@ -15,10 +15,10 @@ static bool gdn_gates_is_f32_vec(const ggml_tensor * t, const int64_t n) {
     return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == n;
 }
 
-int ggml_cuda_try_fuse_gdn_gates(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+bool ggml_cuda_gdn_gates_prepare(const ggml_cgraph * cgraph, const int i, mk_gdn_gates_params & p_out, int & n_blocks_out) {
     static const bool disabled = getenv("GGML_CUDA_DISABLE_GDN_GATES_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_GDN_GATES_FUSION")) != 0;
     if (disabled || i + 8 >= cgraph->n_nodes) {
-        return 0;
+        return false;
     }
     // MUL_MAT(alpha) RESHAPE ADD(dt) SOFTPLUS MUL(A) RESHAPE MUL_MAT(beta) RESHAPE SIGMOID
     static const ggml_op ops[] = {
@@ -27,7 +27,7 @@ int ggml_cuda_try_fuse_gdn_gates(ggml_backend_cuda_context & ctx, const ggml_cgr
     };
     for (int k = 0; k < 9; ++k) {
         if (cgraph->nodes[i + k]->op != ops[k]) {
-            return 0;
+            return false;
         }
     }
     ggml_tensor * mm_a  = cgraph->nodes[i + 0];
@@ -38,13 +38,13 @@ int ggml_cuda_try_fuse_gdn_gates(ggml_backend_cuda_context & ctx, const ggml_cgr
     ggml_tensor * sig   = cgraph->nodes[i + 8];
 
     if (ggml_get_unary_op(sp) != GGML_UNARY_OP_SOFTPLUS || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID) {
-        return 0;
+        return false;
     }
     const ggml_tensor * w_a = mm_a->src[0];
     const ggml_tensor * w_b = mm_b->src[0];
     const ggml_tensor * x   = mm_a->src[1];
     if (mm_b->src[1] != x || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1) {
-        return 0;
+        return false;
     }
     const int64_t K = x->ne[0];
     const int64_t T = x->ne[1];
@@ -52,7 +52,7 @@ int ggml_cuda_try_fuse_gdn_gates(ggml_backend_cuda_context & ctx, const ggml_cgr
     if (T < 1 || T > 8 || K % 4 != 0 || w_a->type != GGML_TYPE_F32 || w_b->type != GGML_TYPE_F32 ||
             w_a->ne[0] != K || w_b->ne[0] != K || w_b->ne[1] != H || w_a->ne[2] != 1 || w_b->ne[2] != 1 ||
             w_a->nb[0] != sizeof(float) || w_b->nb[0] != sizeof(float) || w_a->nb[1] % 16 != 0 || w_b->nb[1] % 16 != 0) {
-        return 0;
+        return false;
     }
     // chain wiring: ADD(reshape(mm_a), dt), SOFTPLUS(add), MUL(sp, A), SIGMOID(reshape(mm_b))
     const ggml_tensor * dt = add->src[0] == cgraph->nodes[i + 1] ? add->src[1] : add->src[1] == cgraph->nodes[i + 1] ? add->src[0] : nullptr;
@@ -60,23 +60,33 @@ int ggml_cuda_try_fuse_gdn_gates(ggml_backend_cuda_context & ctx, const ggml_cgr
     if (cgraph->nodes[i + 1]->src[0] != mm_a || sp->src[0] != add || cgraph->nodes[i + 5]->src[0] != mul ||
             cgraph->nodes[i + 7]->src[0] != mm_b || sig->src[0] != cgraph->nodes[i + 7] ||
             dt == nullptr || A == nullptr || !gdn_gates_is_f32_vec(dt, H) || !gdn_gates_is_f32_vec(A, H)) {
-        return 0;
+        return false;
     }
     if (!ggml_is_contiguous(mul) || !ggml_is_contiguous(sig) || ggml_nelements(mul) != H*T || ggml_nelements(sig) != H*T ||
             mul->type != GGML_TYPE_F32 || sig->type != GGML_TYPE_F32) {
-        return 0;
+        return false;
     }
     const int outputs[] = { i + 5, i + 8 };
     if (!ggml_can_fuse_subgraph(cgraph, i, 9, ops, outputs, 2)) {
-        return 0;
+        return false;
     }
 
-    const mk_gdn_gates_params p = {
+    p_out = {
         (const char *) w_a->data, (const char *) w_b->data, (const float *) x->data, (const float *) dt->data,
         (const float *) A->data, (float *) mul->data, (float *) sig->data, (int) K, (int) H,
         (int64_t) w_a->nb[1], (int64_t) w_b->nb[1], (int64_t) (x->nb[1]/sizeof(float)), H, H, (int) T, nullptr,
     };
-    k_gdn_gates<<<dim3((unsigned) (2*H), (unsigned) T), mk_gdn_gates<256>::threads, 0, ctx.stream()>>>(p);
+    n_blocks_out = (int) (2*H*T);
+    return true;
+}
+
+int ggml_cuda_try_fuse_gdn_gates(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    mk_gdn_gates_params p;
+    int n_blocks = 0;
+    if (!ggml_cuda_gdn_gates_prepare(cgraph, i, p, n_blocks)) {
+        return 0;
+    }
+    k_gdn_gates<<<dim3((unsigned) (2*p.H), (unsigned) p.n_tokens), mk_gdn_gates<256>::threads, 0, ctx.stream()>>>(p);
     CUDA_CHECK(cudaGetLastError());
     return 8;
 }

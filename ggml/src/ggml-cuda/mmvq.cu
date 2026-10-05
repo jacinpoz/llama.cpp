@@ -15,6 +15,7 @@
 #include "ggml-cuda-try-fuse.cuh"
 #include "megakernel-host.cuh"
 #include "ssm-conv.cuh"
+#include "gdn-gates.cuh"
 
 // Per-architecture maximum batch size for which MMVQ should be used for MUL_MAT_ID.
 // Returns a value <= MMVQ_MAX_BATCH_SIZE. Default is MMVQ_MAX_BATCH_SIZE.
@@ -3009,7 +3010,31 @@ int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_c
         ggml_cuda_mul_mat_vec_q(ctx, node->src[0], node->src[1], node->src[2], qkv_dst, fusion);
     }
     if (conv_fused) {
-        ggml_cuda_gdn_conv(conv_plan.p, ctx.stream());
+        // Path F: the gate projections read the same normed input, so they can share the conv launch.
+        static const bool multi_op = getenv("GGML_CUDA_MULTI_OP") != nullptr;
+        int g = -1;
+        for (int k = j + 1; multi_op && k < std::min(cgraph->n_nodes - 8, j + 48); ++k) {
+            const ggml_tensor * n = cgraph->nodes[k];
+            if (n->op == GGML_OP_MUL_MAT && n->src[1] == node->src[1] && (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                g = k;
+                break;
+            }
+        }
+        mk_gdn_gates_params gates_p;
+        int gates_blocks = 0;
+        if (g >= 0) {
+            // outputs first: the gates are written before their nodes, into private buffers
+            ggml_cuda_redirect_early_output(const_cast<ggml_cgraph *>(cgraph), cgraph->nodes[g + 4]);
+            ggml_cuda_redirect_early_output(const_cast<ggml_cgraph *>(cgraph), cgraph->nodes[g + 8]);
+        }
+        if (g >= 0 && ggml_cuda_gdn_gates_prepare(cgraph, g, gates_p, gates_blocks)) {
+            ggml_cuda_gdn_conv_gates(conv_plan.p, gates_p, ctx.stream());
+            for (int k = g; k <= g + 8; ++k) {
+                g_precomputed_nodes.insert(cgraph->nodes[k]);
+            }
+        } else {
+            ggml_cuda_gdn_conv(conv_plan.p, ctx.stream());
+        }
     }
     return j - i;
 }

@@ -49,6 +49,33 @@ void ggml_cuda_gdn_conv(const mk_gdn_conv_params & p, cudaStream_t stream) {
     ggml_cuda_kernel_launch(k_gdn_conv, launch_params, p);
 }
 
+// Path F: the conv op and the independent GDN gate projections in one launch. Blocks [0, nbc) run two 128-thread
+// conv tiles each, the rest one gates tile each; every op keeps its own arithmetic.
+static __global__ void __launch_bounds__(256, 1) k_gdn_conv_gates(
+        const mk_gdn_conv_params pc, const int nbc, const int ntc, const mk_gdn_gates_params pg) {
+    using conv  = mk_gdn_conv<256>;
+    using gates = mk_gdn_gates<256>;
+    constexpr int lds_conv = 256/conv::threads*conv::lds_bytes;
+    __shared__ __align__(16) char lds[(lds_conv > gates::lds_bytes ? lds_conv : gates::lds_bytes) + 16];
+    if ((int) blockIdx.x < nbc) {
+        const int sub  = threadIdx.x / conv::threads;
+        const int tile = blockIdx.x*(256/conv::threads) + sub;
+        conv::run(pc, 0, tile < ntc ? tile : ntc - 1, tile < ntc, lds + sub*conv::lds_bytes);
+    } else {
+        gates::run(pg, 0, blockIdx.x - nbc, true, lds);
+    }
+}
+
+void ggml_cuda_gdn_conv_gates(const mk_gdn_conv_params & pc, const mk_gdn_gates_params & pg, cudaStream_t stream) {
+    constexpr int threads = mk_gdn_conv<1>::threads;
+    GGML_ASSERT(pc.C % threads == 0 && 2*pc.n_qk_heads*threads <= pc.C && pc.n_tokens >= 1 && pc.n_tokens <= MK_GDN_MAX_T);
+    const int ntc = pc.C / threads;
+    const int nbc = (ntc + 256/threads - 1) / (256/threads);
+    const int ntg = 2*pg.H*pg.n_tokens;
+    k_gdn_conv_gates<<<nbc + ntg, 256, 0, stream>>>(pc, nbc, ntc, pg);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 template <bool apply_silu, size_t split_d_inner, size_t d_conv, int64_t split_n_t>
 static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, const float * __restrict__ src1,
                                                const float * __restrict__ bias,
