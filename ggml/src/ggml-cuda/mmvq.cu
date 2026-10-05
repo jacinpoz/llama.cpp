@@ -874,6 +874,12 @@ static void mul_mat_vec_q_switch_fusion(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
 }
 
+static thread_local ggml_cuda_mmvq_capture * g_mmvq_capture = nullptr;
+
+void ggml_cuda_mmvq_set_capture(ggml_cuda_mmvq_capture * cap) {
+    g_mmvq_capture = cap;
+}
+
 template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false>
 static void mul_mat_vec_q_switch_fusion_ksplit(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -913,6 +919,18 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
     p.nchannels_dst      = block_nums.y;
 
     const bool fused = c_ncols_dst == 1 && has_fusion;
+    if (g_mmvq_capture != nullptr && !small_k && !halve_iters && rows_per_block == 0) {
+        static_assert(sizeof(p) <= sizeof(g_mmvq_capture->params), "capture buffer too small");
+        g_mmvq_capture->valid   = true;
+        g_mmvq_capture->variant = mk_mmvq_variant(type, c_ncols_dst, fused, long_k);
+        g_mmvq_capture->grid_x  = block_nums.x;
+        g_mmvq_capture->grid_y  = block_nums.y;
+        g_mmvq_capture->grid_z  = block_nums.z;
+        g_mmvq_capture->threads = block_dims.x*block_dims.y;
+        memcpy(g_mmvq_capture->params, &p, sizeof(p));
+        GGML_UNUSED(ids_stride);
+        return;
+    }
     mk_record(MK_OP_MMVQ, mk_mmvq_variant(type, c_ncols_dst, fused, long_k),
               !small_k && !halve_iters && rows_per_block == 0 ? (int64_t) block_nums.x*block_nums.y*block_nums.z : -1,
               (int) (block_dims.x*block_dims.y), p);
@@ -2356,4 +2374,73 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
             nrows, nblocks, (int) (w->nb[1] / ggml_type_size(w->type)),
             (int) (w->nb[2] / ggml_type_size(w->type)), nblocks);
     }
+}
+
+// Two independent decode matvecs in one launch: the first blocks run op A, the rest op B, each block taking
+// BLOCK/threads one-row tiles of its op. (BLOCK, 1) bounds and direct block coordinates keep the matvec codegen
+// as in the standalone kernels; each op's arithmetic is unchanged.
+template <int BLOCK, typename OpA, typename OpB>
+static __global__ void __launch_bounds__(BLOCK, 1) mmvq_pair(
+        const mk_mmvq_params pa, const uint32_t nta, const uint32_t nba, const mk_mmvq_params pb, const uint32_t ntb) {
+    constexpr int lds_a = BLOCK/OpA::threads*OpA::lds_bytes, lds_b = BLOCK/OpB::threads*OpB::lds_bytes;
+    __shared__ __align__(16) char lds[(lds_a > lds_b ? lds_a : lds_b) + 16];
+    auto go = [&](auto op, const mk_mmvq_params & p, const uint32_t nt, const uint32_t blk) {
+        using Op = decltype(op);
+        constexpr int nsub = BLOCK / Op::threads;
+        const int sub   = threadIdx.x / Op::threads;
+        const int local = threadIdx.x % Op::threads;
+        const uint32_t tile = __builtin_amdgcn_readfirstlane(blk*nsub + sub);
+        Op::block(p, tile < nt ? tile : nt - 1, 0, 0, local % WARP_SIZE, __builtin_amdgcn_readfirstlane(local / WARP_SIZE),
+                  tile < nt, lds + sub*Op::lds_bytes);
+    };
+    if (blockIdx.x < nba) {
+        go(OpA{}, pa, nta, blockIdx.x);
+    } else {
+        go(OpB{}, pb, ntb, blockIdx.x - nba);
+    }
+}
+
+// Supported pairs: the Qwen3.5/3.8 GDN qkv projection (IQ4_XS, or Q6_K in one layer; with or without the conv
+// epilogue) with the z projection (IQ4_XS), all one token.
+static int mmvq_pair_kind(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b) {
+    if (!a.valid || !b.valid || a.grid_y != 1 || a.grid_z != 1 || b.grid_y != 1 || b.grid_z != 1 ||
+            b.variant != mk_mmvq_variant(GGML_TYPE_IQ4_XS, 1, false, true) || b.threads != 32) {
+        return -1;
+    }
+    for (const bool fused : { false, true }) {
+        if (a.variant == mk_mmvq_variant(GGML_TYPE_IQ4_XS, 1, fused, true) && a.threads == 32) {
+            return fused ? 1 : 0;
+        }
+        if (a.variant == mk_mmvq_variant(GGML_TYPE_Q6_K, 1, fused, true) && a.threads == 256) {
+            return fused ? 3 : 2;
+        }
+    }
+    return -1;
+}
+
+bool ggml_cuda_mmvq_pair_supported(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return mmvq_pair_kind(a, b) >= 0 && get_device_table_id(cc) == MMVQ_PARAMETERS_RDNA3_0;
+}
+
+void ggml_cuda_mmvq_launch_pair(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, cudaStream_t stream) {
+    mk_mmvq_params pa, pb;
+    memcpy(&pa, a.params, sizeof(pa));
+    memcpy(&pb, b.params, sizeof(pb));
+    auto launch = [&](auto block_c, auto op_a, auto op_b) {
+        constexpr int BLOCK = decltype(block_c)::value;
+        const uint32_t nba = (a.grid_x + BLOCK/a.threads - 1) / (BLOCK/a.threads);
+        const uint32_t nbb = (b.grid_x + BLOCK/b.threads - 1) / (BLOCK/b.threads);
+        mmvq_pair<BLOCK, decltype(op_a), decltype(op_b)><<<nba + nbb, BLOCK, 0, stream>>>(pa, a.grid_x, nba, pb, b.grid_x);
+    };
+    using I32 = std::integral_constant<int, 32>;
+    using I256 = std::integral_constant<int, 256>;
+    switch (mmvq_pair_kind(a, b)) {
+        case 0: launch(I32{},  mk_mmvq<32,  GGML_TYPE_IQ4_XS, 1, false, false, 0, true>{}, mk_mmvq<32,  GGML_TYPE_IQ4_XS, 1, false, false, 0, true>{}); break;
+        case 1: launch(I32{},  mk_mmvq<32,  GGML_TYPE_IQ4_XS, 1, true,  false, 0, true>{}, mk_mmvq<32,  GGML_TYPE_IQ4_XS, 1, false, false, 0, true>{}); break;
+        case 2: launch(I256{}, mk_mmvq<256, GGML_TYPE_Q6_K,   1, false, false, 0, true>{}, mk_mmvq<256, GGML_TYPE_IQ4_XS, 1, false, false, 0, true>{}); break;
+        case 3: launch(I256{}, mk_mmvq<256, GGML_TYPE_Q6_K,   1, true,  false, 0, true>{}, mk_mmvq<256, GGML_TYPE_IQ4_XS, 1, false, false, 0, true>{}); break;
+        default: GGML_ABORT("mmvq pair: unsupported pair");
+    }
+    CUDA_CHECK(cudaGetLastError());
 }

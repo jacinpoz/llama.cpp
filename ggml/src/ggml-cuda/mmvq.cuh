@@ -54,3 +54,17 @@ bool ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(const ggml_tensor * experts, const
 void ggml_cuda_mul_mat_id_weighted_rdna3_5(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
+
+// Path F: run independent matvecs over the same input as one launch. While a capture is set, the ksplit
+// launcher stores its params instead of launching; ggml_cuda_mmvq_launch_pair then runs two captures together.
+struct ggml_cuda_mmvq_capture {
+    bool     valid = false;
+    int      variant = 0;
+    uint32_t grid_x = 0, grid_y = 0, grid_z = 0;
+    uint32_t threads = 0;
+    alignas(16) unsigned char params[512];
+};
+
+void ggml_cuda_mmvq_set_capture(ggml_cuda_mmvq_capture * cap); // nullptr: launch normally again
+bool ggml_cuda_mmvq_pair_supported(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b);
+void ggml_cuda_mmvq_launch_pair(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, cudaStream_t stream);
