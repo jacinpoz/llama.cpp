@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -388,7 +389,7 @@ static void test_timing(hipStream_t stream, int n_blocks) {
     build(h1, 0, K);
     build(h2a, 0, K/2);
     build(h2b, K/2 + 1, K);
-    mk_dev_stream s1(h1, watchdog, iters + 1), s2a(h2a, watchdog, iters + 1), s2b(h2b, watchdog, iters + 1);
+    mk_dev_stream s1(h1, watchdog, iters + 2), s2a(h2a, watchdog, iters + 2), s2b(h2b, watchdog, iters + 2);
 
     auto normal = [&](int k) {
         const mk_test_add_params p = { bufs[k + 1], bufs[k], bufs.n, 0 };
@@ -404,6 +405,21 @@ static void test_timing(hipStream_t stream, int n_blocks) {
         epoch2++;
     };
     auto eager = [&] { for (int k = 0; k < K; ++k) { normal(k); } };
+    // Same chain with NOP instructions: the interpreter's own per-hand-off cost.
+    mk_host_stream hn(n_blocks);
+    {
+        int prev = -1;
+        for (int k = 0; k < K; ++k) {
+            const int c = hn.add_counter();
+            for (int blk = 0; blk < n_blocks; ++blk) {
+                hn.push(blk, MK_OP_NOP, 0, 1, prev, n_blocks, c);
+            }
+            prev = c;
+        }
+    }
+    mk_dev_stream sn(hn, watchdog, iters + 2);
+    uint32_t epochn = 0;
+    auto mk_nop = [&] { mk_run(sn, epochn++, stream); };
 
     auto time_us = [&](auto && f, const char * name) {
         f();
@@ -423,7 +439,7 @@ static void test_timing(hipStream_t stream, int n_blocks) {
             printf("timing: %-36s capture failed: %s\n", name, hipGetErrorString(err_ins));
             (void) hipGetLastError();
         } else {
-            time_us([&] { CUDA_CHECK(hipGraphLaunch(exec, stream)); }, name);
+    time_us([&] { CUDA_CHECK(hipGraphLaunch(exec, stream)); }, name);
         }
         if (exec) {
             CUDA_CHECK(hipGraphExecDestroy(exec));
@@ -434,6 +450,7 @@ static void test_timing(hipStream_t stream, int n_blocks) {
     };
 
     time_us(eager, "normal launches, eager");
+    time_us(mk_nop, "megakernel, NOP chain");
     time_graph(eager, "normal launches, HIP graph");
     time_us(mk_one, "megakernel, 1 segment");
     time_us(mk_two, "megakernel, 2 segments + 1 kernel");
@@ -557,6 +574,14 @@ static bool build_stream_from_records(const std::vector<mk_recorded_op> & recs, 
                 }
                 h.push(b, r.opcode, t0, t1, prev_counter, prev_signals, counter, off);
                 h.queues[b].back().variant = r.variant;
+                if (getenv("MK_PREFETCH") && r.opcode == MK_OP_MMVQ && prev_counter >= 0) {
+                    // Weight rows of this block's tiles (and of the gate matrix for GLU), warmed while it waits.
+                    mk_mmvq_params mp;
+                    memcpy(&mp, r.params.data(), sizeof(mp));
+                    const size_t row_bytes = (size_t) mp.stride_row_x*ggml_type_size(ggml_type(r.variant & 0xFF));
+                    const mk_prefetch_desc pf = { (const char *) mp.vx + (size_t) t0*row_bytes, (uint64_t) (t1 - t0)*row_bytes };
+                    h.queues[b].back().prefetch_off = h.add_params(pf);
+                }
                 signals++;
             }
         }
@@ -573,6 +598,38 @@ static const char * mk_opname(uint16_t opc) {
         case MK_OP_MMVQ:         return "MMVQ";
         case MK_OP_QUANTIZE_Q8_1:return "QUANTIZE_Q8_1";
         default:                 return "?";
+    }
+}
+
+
+struct mk_param_blob { alignas(16) uint8_t b[256]; };
+
+// One recorded op as a plain 1024-thread kernel: same tile split as the stream builder, params by value
+// in kernarg. Separates the persistent machinery from the 1024-block op structure.
+__global__ void __launch_bounds__(MK_THREADS, 1) k_split_op(const mk_param_blob blob, int opcode, int variant, int n_tiles) {
+    __shared__ __align__(16) char lds[MK_OP_LDS_BYTES];
+    const int per_block = (n_tiles + (int) gridDim.x - 1) / (int) gridDim.x;
+    const int tb = (int) blockIdx.x*per_block;
+    const int te = min(n_tiles, tb + per_block);
+    auto exec = [&](auto op) {
+        using Op = decltype(op);
+        using P  = mk_op_params<Op>;
+        const P & p = *reinterpret_cast<const P *>(blob.b);
+        constexpr int nsub = MK_THREADS / Op::threads;
+        const int sub = threadIdx.x / Op::threads;
+        for (int t0 = tb; t0 < te; t0 += nsub) {
+            if (Op::lds_bytes > 0 && t0 != tb) {
+                __syncthreads();
+            }
+            const int tile = t0 + sub;
+            Op::run(p, variant, tile < te ? tile : te - 1, tile < te, lds + sub*Op::lds_bytes);
+        }
+    };
+    switch (opcode) {
+        case MK_OP_RMSNORM_Q8_1:  mk_rmsnorm_q8_1_dispatch<MK_THREADS>(variant, exec); break;
+        case MK_OP_MMVQ:          mk_mmvq_dispatch<MK_THREADS>(variant, exec); break;
+        case MK_OP_QUANTIZE_Q8_1: exec(mk_quantize_q8_1<MK_THREADS>{}); break;
+        default: break;
     }
 }
 
@@ -617,8 +674,10 @@ static bool test_ffn(hipStream_t stream, int n_blocks, bool timing) {
     constexpr int iters = 2000;
     constexpr int reps  = 3;
     // Counters are never reset, so every launch needs a fresh epoch.
-    mk_dev_stream s(h, 1000*ticks_per_ms(), 1 + reps*iters);
-    mk_run(s, 0, stream);
+    mk_dev_stream s(h, 1000*ticks_per_ms(), 1 + reps*iters + 300);
+    // Counters are never reset, so epochs must be consecutive.
+    uint32_t epoch = 0;
+    mk_run(s, epoch++, stream);
     sync_bounded(stream, 10000, "ffn");
     bool ok = expect_error(stream, s, MK_ERR_NONE, "ffn");
     std::vector<float> got(ffn_case::n_embd);
@@ -633,6 +692,63 @@ static bool test_ffn(hipStream_t stream, int n_blocks, bool timing) {
         ok = false;
     }
 
+    if (getenv("MK_TRACE")) {
+        // Per instruction: wait start, op start, op end (wall clock). Printed per op as spread across blocks.
+        size_t n_instr = 0;
+        for (const auto & q : h.queues) { n_instr += q.size(); }
+        uint64_t * tr_d = nullptr;
+        CUDA_CHECK(hipMalloc(&tr_d, 3*n_instr*sizeof(uint64_t)));
+        CUDA_CHECK(hipMemset(tr_d, 0, 3*n_instr*sizeof(uint64_t)));
+        // Warm the clocks with back-to-back passes, then trace the last one.
+        for (int i = 0; i < 300; ++i) {
+            if (i == 299) {
+                s.desc.trace = tr_d;
+            }
+            mk_run(s, epoch++, stream);
+        }
+        sync_bounded(stream, 10000, "ffn trace");
+        s.desc.trace = nullptr;
+        std::vector<uint64_t> tr(3*n_instr);
+        CUDA_CHECK(hipMemcpy(tr.data(), tr_d, tr.size()*sizeof(uint64_t), hipMemcpyDeviceToHost));
+        CUDA_CHECK(hipFree(tr_d));
+        const double tpus = ticks_per_ms()/1000.0;
+        uint64_t t_first = UINT64_MAX;
+        for (size_t i = 0; i < n_instr; ++i) { t_first = std::min(t_first, tr[3*i]); }
+        // group by signal counter = recorded op index
+        std::map<int, std::vector<size_t>> by_op;
+        size_t q = 0;
+        for (const auto & qu : h.queues) { for (const auto & in : qu) { by_op[in.signal_counter].push_back(q++); } }
+        for (auto & [op, idx] : by_op) {
+            double ws_min = 1e30, ws_max = 0, os_min = 1e30, os_max = 0, oe_min = 1e30, oe_max = 0, dur_sum = 0, dur_max = 0;
+            for (size_t i : idx) {
+                const double w0 = (tr[3*i] - t_first)/tpus, o0 = (tr[3*i+1] - t_first)/tpus, o1 = (tr[3*i+2] - t_first)/tpus;
+                ws_min = std::min(ws_min, w0); ws_max = std::max(ws_max, w0);
+                os_min = std::min(os_min, o0); os_max = std::max(os_max, o0);
+                oe_min = std::min(oe_min, o1); oe_max = std::max(oe_max, o1);
+                dur_sum += o1 - o0; dur_max = std::max(dur_max, o1 - o0);
+            }
+            printf("trace op %d (%zu blocks): op start %.1f..%.1f us, op end %.1f..%.1f us, op time mean %.1f max %.1f us\n",
+                   op, idx.size(), os_min, os_max, oe_min, oe_max, dur_sum/idx.size(), dur_max);
+        }
+    }
+    if (getenv("MK_SPLIT")) {
+        auto run_split = [&] {
+            for (const auto & r : recs) {
+                mk_param_blob blob = {};
+                memcpy(blob.b, r.params.data(), r.params.size());
+                k_split_op<<<n_blocks, MK_THREADS, 0, stream>>>(blob, r.opcode, r.variant, r.n_tiles);
+            }
+        };
+        ggml_backend_tensor_set(fc.out, poison.data(), 0, ggml_nbytes(fc.out));
+        ggml_backend_synchronize(fc.backend);
+        run_split();
+        sync_bounded(stream, 10000, "ffn split");
+        std::vector<float> got2(ffn_case::n_embd);
+        ggml_backend_tensor_get(fc.out, got2.data(), 0, ggml_nbytes(fc.out));
+        printf("ffn split: %s\n", memcmp(got2.data(), ref.data(), ggml_nbytes(fc.out)) == 0 ? "bit-identical" : "DIFFERS");
+        const float ms = gpu_time_ms(stream, 60000, "ffn split", [&] { for (int i = 0; i < 2000; ++i) { run_split(); } });
+        printf("ffn split: %.1f us per pass (4 plain 1024-thread launches)\n", 1000.0f*ms/2000);
+    }
     if (getenv("MK_FFN_OPS")) {
         ok = true;
     }
@@ -648,7 +764,7 @@ static bool test_ffn(hipStream_t stream, int n_blocks, bool timing) {
 
             const float ms = gpu_time_ms(stream, 60000, "ffn timing", [&] {
                 for (int i = 0; i < iters; ++i) {
-                    mk_run(s, (uint32_t) (1 + rep*iters + i), stream);
+                    mk_run(s, epoch++, stream);
                 }
             });
             const double us_mk = 1000.0*ms/iters;
@@ -706,7 +822,7 @@ int main(int argc, char ** argv) {
         ok = run_passes(t, stream, soak, watchdog, "soak") && ok;
     }
     if (timing) {
-        test_timing(stream, n_blocks);
+        if (!getenv("MK_FFN_ONLY")) { test_timing(stream, n_blocks); }
     }
 #if __has_include("mk-ops-ffn.cuh")
     if (ffn || timing) {
