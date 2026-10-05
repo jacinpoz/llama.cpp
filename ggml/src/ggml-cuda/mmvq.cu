@@ -9,6 +9,7 @@
 #include <type_traits>
 
 #include "mmvq-common.cuh"
+#include "mk-ops-ffn.cuh"
 
 // Per-architecture maximum batch size for which MMVQ should be used for MUL_MAT_ID.
 // Returns a value <= MMVQ_MAX_BATCH_SIZE. Default is MMVQ_MAX_BATCH_SIZE.
@@ -784,6 +785,34 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
                             fusion.conv_input != nullptr;
+    if (g_mk_recording != nullptr) {
+        mk_mmvq_params p;
+        p.vx                 = vx;
+        p.vy                 = vy;
+        p.ids                = ids;
+        p.dst                = dst;
+        p.fusion             = fusion;
+        p.nchannels_y        = nchannels_y;
+        p.channel_ratio      = channel_ratio;
+        p.sample_ratio       = sample_ratio;
+        p.ncols_x            = ncols_x;
+        p.stride_row_x       = stride_row_x;
+        p.stride_col_y       = stride_col_y;
+        p.stride_col_dst     = stride_col_dst;
+        p.stride_channel_x   = stride_channel_x;
+        p.stride_channel_y   = stride_channel_y;
+        p.stride_channel_dst = stride_channel_dst;
+        p.stride_sample_x    = stride_sample_x;
+        p.stride_sample_y    = stride_sample_y;
+        p.stride_sample_dst  = stride_sample_dst;
+        p.nblocks_x          = block_nums.x;
+        p.nchannels_dst      = block_nums.y;
+        // the megakernel op has no small_m, row loop or row concat form: those launches are recorded as not replayable
+        const bool replayable = !small_k && !halve_iters && rows_per_block == 0 && !small_m && nrows_loop == 0 &&
+                                fusion.cat_dst[0] == nullptr;
+        mk_record(MK_OP_MMVQ, mk_mmvq_variant(type, c_ncols_dst, c_ncols_dst == 1 && has_fusion, long_k),
+                  replayable ? (int64_t) block_nums.x*block_nums.y*block_nums.z : -1, p);
+    }
     if constexpr (c_ncols_dst == 1) {
         if (fusion.cat_dst[0] != nullptr) {
             GGML_ASSERT(!has_fusion);

@@ -830,7 +830,12 @@ template <int BLOCK, ggml_type type, int ncols_dst, bool has_fusion, bool long_k
 static __device__ __forceinline__ void mk_mmvq_call(F && f) {
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr bool lk = long_k || calc_nwarps_weight(type, ncols_dst, table_id, false) == calc_nwarps_weight(type, ncols_dst, table_id, true);
-    mk_call<mk_mmvq<BLOCK, type, ncols_dst, has_fusion, false, 0, lk>>(f);
+    using op = mk_mmvq<BLOCK, type, ncols_dst, has_fusion, false, 0, lk>;
+    // r217's RDNA3 rows-per-block rules give some wide variants more LDS than a megakernel sub-block has; the
+    // dispatch reports those as a bad opcode
+    if constexpr (BLOCK / op::threads * op::lds_bytes <= MK_OP_LDS_BYTES) {
+        mk_call<op>(f);
+    }
 }
 
 template <int BLOCK, ggml_type type, bool long_k, typename F>

@@ -523,60 +523,118 @@ struct ffn_case {
     }
 };
 
-// TODO: RMSNORM_Q8_1 on one block, MMVQ gate/up + GLU and MMVQ down + add over all blocks, writing mk_out.
-static bool build_ffn_stream(const ffn_case & /*fc*/, int /*n_blocks*/, mk_host_stream & /*h*/, float * /*mk_out*/) {
-    return false;
+// One instruction per recorded launch, each waiting for the whole previous op. Tiles go to blocks in
+// contiguous runs rounded to the op's sub-tile step, so a block's steps stay full.
+static bool build_stream_from_records(const std::vector<mk_recorded_op> & recs, int n_blocks, mk_host_stream & h) {
+    int prev_counter = -1;
+    uint32_t prev_signals = 0;
+    for (const mk_recorded_op & r : recs) {
+        if (r.n_tiles <= 0) {
+            fprintf(stderr, "records: opcode %u has no megakernel form\n", r.opcode);
+            return false;
+        }
+        const uint32_t off = (uint32_t) GGML_PAD(h.params.size(), MK_PARAM_ALIGN);
+        h.params.resize(off + r.params.size());
+        memcpy(h.params.data() + off, r.params.data(), r.params.size());
+
+        const int counter = h.add_counter();
+        const int per_block = (r.n_tiles + n_blocks - 1) / n_blocks;
+        uint32_t signals = 0;
+        for (int b = 0; b < n_blocks; ++b) {
+            const int t0 = b*per_block;
+            const int t1 = std::min<int>(r.n_tiles, t0 + per_block);
+            if (t0 >= t1) {
+                break;
+            }
+            h.push(b, r.opcode, t0, t1, prev_counter, prev_signals, counter, off);
+            h.queues[b].back().variant = r.variant;
+            signals++;
+        }
+        prev_counter = counter;
+        prev_signals = signals;
+    }
+    return true;
+}
+
+static const char * mk_opname(uint16_t opc) {
+    switch (opc) {
+        case MK_OP_RMSNORM_Q8_1: return "RMSNORM_Q8_1";
+        case MK_OP_RMSNORM_F32:  return "RMSNORM_F32";
+        case MK_OP_MMVQ:         return "MMVQ";
+        case MK_OP_QUANTIZE_Q8_1:return "QUANTIZE_Q8_1";
+        default:                 return "?";
+    }
 }
 
 static bool test_ffn(hipStream_t stream, int n_blocks, bool timing) {
     ffn_case fc;
+
+    std::vector<mk_recorded_op> recs;
+    ggml_cuda_mk_set_recording(&recs);
     GGML_ASSERT(ggml_backend_graph_compute(fc.backend, fc.gf) == GGML_STATUS_SUCCESS);
+    ggml_cuda_mk_set_recording(nullptr);
+    ggml_backend_synchronize(fc.backend);
+
     std::vector<float> ref(ffn_case::n_embd);
     ggml_backend_tensor_get(fc.out, ref.data(), 0, ggml_nbytes(fc.out));
 
-    if (timing) {
-        constexpr int iters = 100;
-        const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < iters; ++i) {
-            ggml_backend_graph_compute(fc.backend, fc.gf);
-        }
-        ggml_backend_synchronize(fc.backend);
-        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
-        printf("ffn: reference graph %.1f us per pass (host timed)\n", us);
+    printf("ffn: %zu recorded launches:", recs.size());
+    for (const auto & r : recs) {
+        printf(" %s(v=0x%x,%d)", mk_opname(r.opcode), r.variant, r.n_tiles);
     }
+    printf("\n");
 
-    float * mk_out = nullptr;
-    CUDA_CHECK(hipMalloc(&mk_out, ggml_nbytes(fc.out)));
     mk_host_stream h(n_blocks);
-    if (!build_ffn_stream(fc, n_blocks, h, mk_out)) {
-        printf("ffn: stream builder not implemented, comparison skipped\n");
-        CUDA_CHECK(hipFree(mk_out));
-        return true;
+    if (recs.empty() || !build_stream_from_records(recs, n_blocks, h)) {
+        printf("ffn: FAILED (no usable records)\n");
+        return false;
     }
 
-    mk_dev_stream s(h, 1000*ticks_per_ms(), 101);
+    // The stream writes the same buffers as the graph: poison the output so a skipped write shows.
+    std::vector<float> poison(ffn_case::n_embd, NAN);
+    ggml_backend_tensor_set(fc.out, poison.data(), 0, ggml_nbytes(fc.out));
+    ggml_backend_synchronize(fc.backend);
+
+    constexpr int iters = 2000;
+    constexpr int reps  = 3;
+    // Counters are never reset, so every launch needs a fresh epoch.
+    mk_dev_stream s(h, 1000*ticks_per_ms(), 1 + reps*iters);
     mk_run(s, 0, stream);
     sync_bounded(stream, 10000, "ffn");
     bool ok = expect_error(stream, s, MK_ERR_NONE, "ffn");
     std::vector<float> got(ffn_case::n_embd);
-    CUDA_CHECK(hipMemcpy(got.data(), mk_out, ggml_nbytes(fc.out), hipMemcpyDeviceToHost));
+    ggml_backend_tensor_get(fc.out, got.data(), 0, ggml_nbytes(fc.out));
     if (memcmp(got.data(), ref.data(), ggml_nbytes(fc.out)) != 0) {
-        fprintf(stderr, "ffn: megakernel output differs from the reference\n");
+        int nbad = 0;
+        for (int i = 0; i < ffn_case::n_embd; ++i) {
+            nbad += memcmp(&got[i], &ref[i], sizeof(float)) != 0;
+        }
+        fprintf(stderr, "ffn: megakernel output differs from the reference in %d of %d values (e.g. [0] %.9g vs %.9g)\n",
+                nbad, ffn_case::n_embd, got[0], ref[0]);
         ok = false;
     }
 
     if (timing && ok) {
-        constexpr int iters = 100;
-        const float ms = gpu_time_ms(stream, 60000, "ffn timing", [&] {
-            for (int i = 1; i <= iters; ++i) {
-                mk_run(s, (uint32_t) i, stream);
+        for (int rep = 0; rep < reps; ++rep) {
+            ggml_backend_synchronize(fc.backend);
+            auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < iters; ++i) {
+                ggml_backend_graph_compute_async(fc.backend, fc.gf);
             }
-        });
-        printf("ffn: megakernel %.1f us per pass\n", 1000.0f*ms/iters);
+            ggml_backend_synchronize(fc.backend);
+            const double us_ref = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
+
+            const float ms = gpu_time_ms(stream, 60000, "ffn timing", [&] {
+                for (int i = 0; i < iters; ++i) {
+                    mk_run(s, (uint32_t) (1 + rep*iters + i), stream);
+                }
+            });
+            const double us_mk = 1000.0*ms/iters;
+            printf("ffn timing rep %d: reference graph %.1f us, megakernel %.1f us, speedup %.3fx\n", rep, us_ref, us_mk, us_ref/us_mk);
+        }
         ok = expect_error(stream, s, MK_ERR_NONE, "ffn timing") && ok;
     }
 
-    CUDA_CHECK(hipFree(mk_out));
     printf("ffn: %s\n", ok ? "OK" : "FAILED");
     return ok;
 }

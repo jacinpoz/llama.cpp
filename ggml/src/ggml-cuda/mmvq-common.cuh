@@ -55,7 +55,7 @@ enum mmvq_parameter_table_id {
 
 #include "mmvq-rdna.cuh"
 
-static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+static constexpr __host__ __device__ mmvq_parameter_table_id get_device_table_id() {
 #if defined(RDNA4)
     return MMVQ_PARAMETERS_RDNA4;
 #elif defined(RDNA3_0)

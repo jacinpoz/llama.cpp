@@ -1,5 +1,6 @@
 #include "norm.cuh"
 #include "mmb.cuh"
+#include "mk-ops-ffn.cuh"
 #include "mmvq.cuh"
 #include <cstdint>
 
@@ -940,12 +941,43 @@ static __global__ void rms_norm_q8_1_f32(
     }
 }
 
+// Record mode (megakernel.cuh): the launch's params as the MK_OP_RMSNORM_Q8_1 op takes them.
+static void rms_norm_q8_1_record(
+        const float * x, float * dst, block_q8_1 * y, const float * mul,
+        const int ncols, const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const int64_t mul_stride_row, const int ncols_padded, const float eps, const float * xa, const float * xb,
+        const dim3 & blocks_num, const int block_size) {
+    if (g_mk_recording == nullptr) {
+        return;
+    }
+    mk_rmsnorm_q8_1_params p;
+    p.x              = x;
+    p.dst            = dst;
+    p.y              = y;
+    p.mul            = mul;
+    p.xa             = xa;
+    p.xb             = xb;
+    p.stride_row     = stride_row;
+    p.stride_channel = stride_channel;
+    p.stride_sample  = stride_sample;
+    p.mul_stride_row = mul_stride_row;
+    p.ncols          = ncols;
+    p.ncols_padded   = ncols_padded;
+    p.nrows          = blocks_num.x;
+    p.nchannels      = blocks_num.y;
+    p.eps            = eps;
+    mk_record(MK_OP_RMSNORM_Q8_1, (xa != nullptr ? MK_RMSNORM_Q8_1_ADD : 0) | (block_size == 256 ? MK_RMSNORM_Q8_1_W256 : 0),
+              (int64_t) blocks_num.x*blocks_num.y*blocks_num.z, p);
+}
+
 static void rms_norm_q8_1_cuda(
         const float * x, float * dst, block_q8_1 * y, const float * mul,
         const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
         const int64_t mul_stride_row, const int ncols_padded, const float eps, cudaStream_t stream) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
+    rms_norm_q8_1_record(x, dst, y, mul, ncols, stride_row, stride_channel, stride_sample, mul_stride_row, ncols_padded, eps,
+                         nullptr, nullptr, blocks_num, ncols < 1024 ? 256 : 1024);
     if (ncols < 1024) {
         const dim3 block_dims(256, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
@@ -989,6 +1021,9 @@ bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor
     const dim3 blocks_num(dst->ne[1], 1, 1);
     const auto launch = [&](auto bs_c) {
         constexpr int BS = decltype(bs_c)::value;
+        rms_norm_q8_1_record((const float *) add_node->data, (float *) dst->data, found ? nullptr : (block_q8_1 *) q8_1,
+            (const float *) weight->data, ncols, s01, 0, 0, 0, (int) ne10_padded, eps, (const float *) a->data, (const float *) b->data,
+            blocks_num, BS);
         const dim3 block_dims(BS, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, BS > WARP_SIZE ? 32 * sizeof(float) : 0, ctx.stream()};
         ggml_cuda_kernel_launch(rms_norm_q8_1_f32<BS, true>, launch_params, (const float *) add_node->data, (float *) dst->data,

@@ -58,8 +58,11 @@ static __device__ __forceinline__ bool mk_dispatch(const mk_stream_desc & d, con
         MK_CASE(MK_OP_TEST_ADD,  mk_test_add);
         MK_CASE(MK_OP_TEST_SPIN, mk_test_spin);
 #ifdef MK_HAVE_OPS_FFN
-#define MK_CASE_DISPATCH(opc, dispatch) case opc: \
-            dispatch<MK_THREADS>(in.variant, [&](auto op) { mk_exec<decltype(op)>(in, d.params, lds); }); return true
+#define MK_CASE_DISPATCH(opc, dispatch) case opc: { \
+            bool ran = false; \
+            dispatch<MK_THREADS>(in.variant, [&](auto op) { mk_exec<decltype(op)>(in, d.params, lds); ran = true; }); \
+            if (ran) { return true; } \
+            break; }
         MK_CASE_DISPATCH(MK_OP_RMSNORM_Q8_1, mk_rmsnorm_q8_1_dispatch);
         MK_CASE_DISPATCH(MK_OP_RMSNORM_F32,  mk_rmsnorm_f32_dispatch);
         MK_CASE_DISPATCH(MK_OP_MMVQ,         mk_mmvq_dispatch);
@@ -82,14 +85,15 @@ static __device__ __forceinline__ bool mk_dispatch(const mk_stream_desc & d, con
         MK_CASE(MK_OP_ATTN_COMBINE,   mk_attn_combine);
 #endif
         default:
-            if (threadIdx.x == 0) {
-                int32_t expected = MK_ERR_NONE;
-                __hip_atomic_compare_exchange_strong(d.error, &expected, MK_ERR_BAD_OPCODE,
-                    __ATOMIC_RELAXED, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-            }
-            return false;
+            break;
     }
 #undef MK_CASE
+    if (threadIdx.x == 0) {
+        int32_t expected = MK_ERR_NONE;
+        __hip_atomic_compare_exchange_strong(d.error, &expected, MK_ERR_BAD_OPCODE,
+            __ATOMIC_RELAXED, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    return false;
 }
 
 static __device__ __forceinline__ bool mk_poll(const uint32_t * counter, uint32_t target) {
@@ -206,6 +210,10 @@ int32_t ggml_cuda_mk_take_error(int32_t * error, cudaStream_t stream) {
 
 void ggml_cuda_mk_reset_counters(const mk_stream_desc & desc, cudaStream_t stream) {
     CUDA_CHECK(cudaMemsetAsync(desc.counters, 0, desc.n_counters*sizeof(uint32_t), stream));
+}
+
+void ggml_cuda_mk_set_recording(std::vector<mk_recorded_op> * rec) {
+    g_mk_recording = rec;
 }
 
 #endif // defined(GGML_USE_HIP)

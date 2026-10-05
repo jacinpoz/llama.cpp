@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "mk-ops-ffn.cuh"
 #include <cstdint>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -589,6 +590,20 @@ void quantize_row_q8_1_cuda(
     const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    if (g_mk_recording != nullptr) {
+        mk_quantize_q8_1_params p;
+        p.x         = x;
+        p.vy        = vy;
+        p.ne00      = ne00;
+        p.s01       = s01;
+        p.s02       = s02;
+        p.s03       = s03;
+        p.ne0       = ne0;
+        p.ne1       = (uint32_t) ne1;
+        p.ne2       = ne2_fastdiv;
+        p.nblocks_x = num_blocks.x;
+        mk_record(MK_OP_QUANTIZE_Q8_1, 0, (int64_t) num_blocks.x*num_blocks.y*num_blocks.z, p);
+    }
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
     ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
     GGML_UNUSED(type_src0);
