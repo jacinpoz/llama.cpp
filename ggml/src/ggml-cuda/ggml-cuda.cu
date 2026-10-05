@@ -2382,8 +2382,8 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
-// RDNA3_5 (Strix Halo, gfx1151): the dense gate+up+GLU mmvq fusion is single-token-only
-// (mmvq.cu restricts fusion to ncols_dst == 1) and its fused kernel does not reproduce the
+// RDNA3_5 (Strix Halo, gfx1151): the dense gate+up+GLU mmvq fusion (single-token unless
+// GGML_CUDA_VERIFY_GLU is set) and its fused kernel does not reproduce the
 // standalone mul_mat_vec_q arithmetic, so a 1-token decode and an n-token speculative verify
 // batch of the same layer are not bit-identical - the decode==verify invariant greedy MTP
 // depends on.  Measured 2026-09-12: W=1 8abc6206... vs W=8 453eaa61...; skipping it (together
@@ -2436,7 +2436,7 @@ static bool ggml_cuda_fuse_q8_1_verify() {
 // and leave the matmul itself unchanged.  Their kernels are row-generic, so on RDNA4 the verify band
 // (2..8 tokens) takes them too; the quantized values are the ones quantize_q8_1 would write, so W = 1..8
 // stay bit-identical.  GGML_CUDA_FUSE_Q8_1_VERIFY=0 turns it off.
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band = false) {
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band = false, const int64_t max_ncols = 1) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -2453,8 +2453,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, cons
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1 (the RDNA4 verify band too for verify_band callers)
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 &&
+    //fusion is limited to max_ncols columns (the RDNA4 verify band too for verify_band callers)
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] > max_ncols &&
             !(verify_band && ggml_cuda_fuse_q8_1_verify() && GGML_CUDA_CC_IS_RDNA4(cc) && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE)) {
         return false;
     }
@@ -2520,6 +2520,16 @@ static bool ggml_cuda_norm_q8_1_consumer(ggml_backend_cuda_context & ctx, const 
     return ggml_cuda_verify_norm_q8() && ggml_cuda_fuse_q8_1_verify() &&
         ggml_cuda_info().devices[ctx.device].cc > GGML_CUDA_CC_PASCAL && mm->op == GGML_OP_MUL_MAT && mm->ne[1] > 1 && mm->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
         mm->ne[2] == 1 && mm->ne[3] == 1 && ggml_cuda_mul_mat_kernel(ctx, mm->src[0], mm->src[1], mm) == GGML_CUDA_MM_MMVQ;
+}
+
+// With GGML_CUDA_VERIFY_GLU set, 2..MMVQ_MAX_BATCH_SIZE tokens fuse only where the unfused gate and up would run as the ksplit mmvq, which keeps each column's reduction order.
+static bool ggml_cuda_should_fuse_mul_mat_vec_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * up) {
+    static const bool verify_glu = getenv("GGML_CUDA_VERIFY_GLU") != nullptr && atoi(getenv("GGML_CUDA_VERIFY_GLU")) != 0;
+    if (!ggml_cuda_should_fuse_mul_mat_vec_q(up, false, verify_glu ? MMVQ_MAX_BATCH_SIZE : 1)) {
+        return false;
+    }
+    return up->op != GGML_OP_MUL_MAT || up->ne[1] == 1 ||
+           ggml_cuda_mul_mat_kernel(ctx, up->src[0], up->src[1], up) == GGML_CUDA_MM_MMVQ;
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -6303,7 +6313,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q_glu(*cuda_ctx, up) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);

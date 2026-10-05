@@ -895,7 +895,8 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
                             fusion.conv_input != nullptr;
-    GGML_ASSERT((c_ncols_dst == 1 || !has_fusion) && "fusion only supported for ncols_dst=1");
+    GGML_ASSERT((!has_fusion || c_ncols_dst == 1 || (c_ncols_dst <= MMVQ_MAX_BATCH_SIZE && fusion.conv_input == nullptr)) &&
+                "fusion only supported up to MMVQ_MAX_BATCH_SIZE columns, conv input only at one");
     GGML_UNUSED(ids_stride);
 
     mk_mmvq_params p;
@@ -920,8 +921,10 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
     p.nblocks_x          = block_nums.x;
     p.nchannels_dst      = block_nums.y;
 
-    const bool fused = c_ncols_dst == 1 && has_fusion;
-    if (g_mmvq_capture != nullptr && !small_k && !halve_iters && rows_per_block == 0) {
+    const bool fused = c_ncols_dst <= MMVQ_MAX_BATCH_SIZE && has_fusion;
+    // The megakernel dispatch has no fused op wider than one column, so those launches stay host-only.
+    const bool mk_op = !small_k && !halve_iters && rows_per_block == 0 && !(fused && c_ncols_dst > 1);
+    if (g_mmvq_capture != nullptr && mk_op) {
         static_assert(sizeof(p) <= sizeof(g_mmvq_capture->params), "capture buffer too small");
         g_mmvq_capture->valid   = true;
         g_mmvq_capture->variant = mk_mmvq_variant(type, c_ncols_dst, fused, long_k);
@@ -934,11 +937,11 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
         return;
     }
     mk_record(MK_OP_MMVQ, mk_mmvq_variant(type, c_ncols_dst, fused, long_k),
-              !small_k && !halve_iters && rows_per_block == 0 ? (int64_t) block_nums.x*block_nums.y*block_nums.z : -1,
+              mk_op ? (int64_t) block_nums.x*block_nums.y*block_nums.z : -1,
               (int) (block_dims.x*block_dims.y), p);
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    if constexpr (c_ncols_dst == 1) {
+    if constexpr (c_ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
         if (fused) {
             ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, true, small_k, halve_iters, rows_per_block, long_k>, launch_params, p);
             return;
@@ -1519,7 +1522,7 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || (dst->ne[1] <= MMVQ_MAX_BATCH_SIZE && !fusion->conv_input));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b. The per-token MoE scale is a second exception.
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4 || fusion->x_scale_channel_dst);
@@ -1579,29 +1582,32 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
-    // Opt-in: a one-token SwiGLU matmul also writes its output's Q8_1 form into the cache slot the next matmul
-    // looks up (keyed on this dst), so that matmul skips its own quantize_q8_1 launch.
+    // Opt-in: a SwiGLU matmul also writes its output's Q8_1 form into the cache slot the next matmul looks up
+    // (keyed on this dst), so that matmul skips its own quantize_q8_1 launch.
     static const bool glu_q8_1 = getenv("GGML_CUDA_GLU_Q8_1") != nullptr;
+    constexpr int64_t glu_q8_1_max_groups = 1 << 16;
     if (glu_q8_1 && fusion && fusion->gate && fusion->glu_op == GGML_GLU_OP_SWIGLU && !fusion->dst_gate && !ids &&
-            !fusion->x_bias && !fusion->conv_input && dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
-            dst->ne[0] % QK8_1 == 0 && ggml_is_contiguous(dst) && dst->view_src == nullptr) {
+            !fusion->x_bias && !fusion->conv_input && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+            dst->ne[0] == GGML_PAD(dst->ne[0], MATRIX_ROW_PADDING) && dst->ne[0]/QK8_1 <= glu_q8_1_max_groups &&
+            ggml_is_contiguous(dst) && dst->view_src == nullptr) {
         static std::array<unsigned int *, GGML_CUDA_MAX_DEVICES> group_done = {};
-        constexpr int64_t max_groups = 1 << 16;
         const int id = ggml_cuda_get_device();
         if (group_done[id] == nullptr) {
-            CUDA_CHECK(cudaMalloc(&group_done[id], max_groups*sizeof(unsigned int)));
-            CUDA_CHECK(cudaMemset(group_done[id], 0, max_groups*sizeof(unsigned int)));
+            CUDA_CHECK(cudaMalloc(&group_done[id], glu_q8_1_max_groups*sizeof(unsigned int)));
+            CUDA_CHECK(cudaMemset(group_done[id], 0, glu_q8_1_max_groups*sizeof(unsigned int)));
         }
         const int64_t n = dst->ne[0];
         const int64_t s1 = dst->nb[1]/sizeof(float), s2 = dst->nb[2]/sizeof(float), s3 = dst->nb[3]/sizeof(float);
-        const size_t q8_1_size = GGML_PAD(n, MATRIX_ROW_PADDING)*sizeof(block_q8_1)/QK8_1;
+        const int64_t ncols = dst->ne[1];
+        const size_t q8_1_size = ncols*n*sizeof(block_q8_1)/QK8_1;
         bool found = false;
-        void * q8_1 = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, q8_1_size, n, 1, 1, 1, s1, s2, s3, found);
-        if (!found && n/QK8_1 <= max_groups && GGML_PAD(n, MATRIX_ROW_PADDING) == n) {
+        void * q8_1 = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, q8_1_size, n, ncols, 1, 1, s1, s2, s3, found);
+        if (!found) {
             fusion_local.q8_1_out        = q8_1;
             fusion_local.q8_1_group_done = group_done[id];
         }
     }
+    const ggml_tensor * glu_q8_1_key = fusion_local.q8_1_out ? dst : nullptr;
 
     // If src0 is a temporary compute buffer, clear any potential padding.
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
@@ -1631,6 +1637,13 @@ void ggml_cuda_mul_mat_vec_q(
                                           ne10, ne11, ne12, ne13, src1_s11, src1_s12, src1_s13, src1_q8_1_cached);
     if (!src1_q8_1_cached) {
         quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1, src0->type, ne10, src1_s11, src1_s12, src1_s13, ne10_padded, ne11, ne12, ne13, stream);
+    }
+    if (glu_q8_1_key != nullptr) {
+        // The src1 lookup may have reallocated the arena.
+        bool found = false;
+        fusion_local.q8_1_out = ctx.q8_1_cache_get(glu_q8_1_key, ctx.curr_stream_no, 0, dst->ne[0], dst->ne[1], 1, 1,
+                                                   dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), dst->nb[3]/sizeof(float), found);
+        GGML_ASSERT(found);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

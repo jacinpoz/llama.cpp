@@ -1928,8 +1928,8 @@ struct ggml_cuda_mm_fusion_args_host {
     // when set (with glu_op == GGML_GLU_OP_NONE), the gate result is written
     // to this separate destination instead of being combined into the main output
     const ggml_tensor * dst_gate = nullptr;
-    // When set, the GLU output is also quantized to Q8_1 here (the next matmul's input), group by group,
-    // by the last wave to finish each 32-row group; q8_1_group_done holds one zeroed counter per group.
+    // When set, the GLU output is also quantized to Q8_1 here (the next matmul's input, one row per token column),
+    // group by group, by the last wave to finish each 32-row group; q8_1_group_done holds one zeroed counter per group.
     void * q8_1_out = nullptr;
     unsigned int * q8_1_group_done = nullptr;
     // SSM conv-input fusion: the matmul output is the last row of an

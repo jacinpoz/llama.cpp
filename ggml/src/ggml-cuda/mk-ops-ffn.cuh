@@ -836,21 +836,28 @@ struct mk_mmvq {
             }
         }
 
-        if constexpr (has_fusion && ncols_dst == 1 && rows_per_cuda_block == 1) {
+        if constexpr (has_fusion) {
+            static_assert(QK8_1 % rows_per_cuda_block == 0, "a block's rows must sit in one Q8_1 group");
             if (fusion.q8_1_out != nullptr) {
-                // Publish this row, then count it in its 32-row group; the wave that completes the group
-                // quantizes it, reading the other waves' rows after an acquire.
+                // Publish this block's rows, then count them in their 32-row group.
+                // The wave that completes the group quantizes it for every column, reading the other waves' rows after an acquire.
+                // The host requires an unpadded row, so column j's Q8_1 row starts at block j*stride_col_dst/QK8_1.
                 __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
                 const uint32_t group = row0 / QK8_1;
                 uint32_t prev = 0;
                 if (lane == 0) {
-                    prev = __hip_atomic_fetch_add(fusion.q8_1_group_done + group, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+                    prev = __hip_atomic_fetch_add(fusion.q8_1_group_done + group, (uint32_t) rows_per_cuda_block,
+                                                  __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
                 }
                 prev = __builtin_amdgcn_readfirstlane(prev);
-                if (prev == QK8_1 - 1) {
+                if (prev == QK8_1 - rows_per_cuda_block) {
                     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-                    const float xi = __hip_atomic_load(dst - row0 % QK8_1 + lane, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-                    mk_quantize_q8_1_group(xi, (block_q8_1 *) fusion.q8_1_out + group, lane);
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        const float xi = __hip_atomic_load(dst + j*stride_col_dst - row0 % QK8_1 + lane,
+                                                           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                        mk_quantize_q8_1_group(xi, (block_q8_1 *) fusion.q8_1_out + j*(stride_col_dst/QK8_1) + group, lane);
+                    }
                     if (lane == 0) {
                         fusion.q8_1_group_done[group] = 0;
                     }
@@ -904,7 +911,7 @@ static __device__ __forceinline__ void mk_mmvq_dispatch_type(int ncols_dst, bool
     }
 }
 
-// fusion only at ncols_dst == 1, as in mul_mat_vec_q_switch_fusion_ksplit
+// Fused variants exist only at ncols_dst == 1; wider fused launches are recorded as host-only.
 template <int BLOCK, typename F>
 static __device__ __forceinline__ void mk_mmvq_dispatch(int variant, F && f) {
     const int  ncols_dst  = (variant >> 8) & 0xF;
