@@ -605,6 +605,29 @@ static const char * mk_opname(uint16_t opc) {
 
 struct mk_param_blob { alignas(16) uint8_t b[256]; };
 
+// DeepGEMM-style dynamic schedule: each sub-tile claims its next tile from a global counter (starting at 0),
+// so waves that finish early take more work instead of idling through the static split's tail.
+template <typename Op>
+__global__ void __launch_bounds__(MK_THREADS, 1) k_split_dyn(const mk_op_params<Op> p, int n_tiles, uint32_t * claim) {
+    __shared__ __align__(16) char lds[MK_THREADS/Op::threads*Op::lds_bytes + 16];
+    constexpr int nsub = MK_THREADS / Op::threads;
+    const int sub   = threadIdx.x / Op::threads;
+    const int local = threadIdx.x % Op::threads;
+    char * my_lds = lds + sub*Op::lds_bytes;
+
+    while (true) {
+        int tile = 0;
+        if (local == 0) {
+            tile = (int) __hip_atomic_fetch_add(claim, 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        }
+        tile = __shfl(tile, 0, 32);
+        if (tile >= n_tiles) {
+            break;
+        }
+        Op::block(p, tile, 0, 0, local % 32, local / 32, true, my_lds);
+    }
+}
+
 // One recorded op as a plain 1024-thread kernel: same tile split as the stream builder, params by value
 // in kernarg. Separates the persistent machinery from the 1024-block op structure.
 __global__ void __launch_bounds__(MK_THREADS, 1) k_split_op(const mk_param_blob blob, int opcode, int variant, int n_tiles) {
@@ -622,7 +645,7 @@ __global__ void __launch_bounds__(MK_THREADS, 1) k_split_op(const mk_param_blob 
             if (Op::lds_bytes > 0 && t0 != tb) {
                 __syncthreads();
             }
-            const int tile = t0 + sub;
+            const int tile = __builtin_amdgcn_readfirstlane(t0 + sub);
             Op::run(p, variant, tile < te ? tile : te - 1, tile < te, lds + sub*Op::lds_bytes);
         }
     };
@@ -632,6 +655,12 @@ __global__ void __launch_bounds__(MK_THREADS, 1) k_split_op(const mk_param_blob 
         case MK_OP_QUANTIZE_Q8_1: exec(mk_quantize_q8_1<MK_THREADS>{}); break;
         default: break;
     }
+}
+
+template <typename Op, int MINB>
+__global__ void __launch_bounds__(Op::threads, MINB > 0 ? MINB : 1) k_direct(const mk_op_params<Op> p) {
+    __shared__ __align__(16) char lds[Op::lds_bytes + 16];
+    Op::block(p, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x % 32, threadIdx.x / 32, true, lds);
 }
 
 static bool test_ffn(hipStream_t stream, int n_blocks, bool timing) {
@@ -731,6 +760,89 @@ static bool test_ffn(hipStream_t stream, int n_blocks, bool timing) {
             printf("trace op %d (%zu blocks): op start %.1f..%.1f us, op end %.1f..%.1f us, op time mean %.1f max %.1f us\n",
                    op, idx.size(), os_min, os_max, oe_min, oe_max, dur_sum/idx.size(), dur_max);
         }
+    }
+    if (getenv("MK_GLU_IL")) {
+        // DeepGEMM-style interleaved gate/up: one buffer with gate and up rows alternating. The existing kernel
+        // reads it through gate = base, vx = base + row, row stride doubled: same code, same data, one stream.
+        const mk_recorded_op & r = recs.at(1);
+        mk_mmvq_params p0;
+        memcpy(&p0, r.params.data(), sizeof(p0));
+        const size_t rb = (size_t) p0.stride_row_x*ggml_type_size(ggml_type(r.variant & 0xFF));
+        const size_t nrows = (size_t) r.n_tiles, mat = nrows*rb;
+        GGML_ASSERT(p0.fusion.gate != nullptr);
+        using OpG = mk_mmvq<32, GGML_TYPE_IQ4_XS, 1, true, false, 0, true>;
+        // Two copies of each layout so a timed loop streams 190 MB, past the 96 MiB infinity cache.
+        uint8_t * sep[2]; uint8_t * il[2];
+        for (int c = 0; c < 2; ++c) {
+            CUDA_CHECK(hipMalloc(&sep[c], 2*mat));
+            CUDA_CHECK(hipMemcpy(sep[c],       p0.vx,         mat, hipMemcpyDeviceToDevice));
+            CUDA_CHECK(hipMemcpy(sep[c] + mat, p0.fusion.gate, mat, hipMemcpyDeviceToDevice));
+            CUDA_CHECK(hipMalloc(&il[c], 2*mat));
+            CUDA_CHECK(hipMemcpy2D(il[c] + rb, 2*rb, p0.vx,         rb, rb, nrows, hipMemcpyDeviceToDevice));
+            CUDA_CHECK(hipMemcpy2D(il[c],      2*rb, p0.fusion.gate, rb, rb, nrows, hipMemcpyDeviceToDevice));
+        }
+        mk_mmvq_params ps[2], pi[2];
+        for (int c = 0; c < 2; ++c) {
+            ps[c] = p0; ps[c].vx = sep[c]; ps[c].fusion.gate = sep[c] + mat;
+            pi[c] = p0; pi[c].vx = il[c] + rb; pi[c].fusion.gate = il[c]; pi[c].stride_row_x = 2*p0.stride_row_x;
+        }
+        float * dst = (float *) p0.dst;
+        std::vector<float> a(nrows), b(nrows);
+        k_direct<OpG, 1><<<nrows, 32, 0, stream>>>(ps[0]);
+        sync_bounded(stream, 10000, "glu sep");
+        CUDA_CHECK(hipMemcpy(a.data(), dst, nrows*4, hipMemcpyDeviceToHost));
+        k_direct<OpG, 1><<<nrows, 32, 0, stream>>>(pi[0]);
+        sync_bounded(stream, 10000, "glu il");
+        CUDA_CHECK(hipMemcpy(b.data(), dst, nrows*4, hipMemcpyDeviceToHost));
+        printf("glu interleave: %s\n", memcmp(a.data(), b.data(), nrows*4) == 0 ? "bit-identical" : "DIFFERS");
+        for (int rep = 0; rep < 3; ++rep) {
+            const float ms_s = gpu_time_ms(stream, 60000, "glu sep", [&] { for (int i = 0; i < 1000; ++i) { k_direct<OpG, 1><<<nrows, 32, 0, stream>>>(ps[i & 1]); } });
+            const float ms_i = gpu_time_ms(stream, 60000, "glu il",  [&] { for (int i = 0; i < 1000; ++i) { k_direct<OpG, 1><<<nrows, 32, 0, stream>>>(pi[i & 1]); } });
+            printf("glu interleave rep %d: separate gate/up %.1f us, interleaved %.1f us (%.1f%%)\n", rep, ms_s, ms_i, 100.0*(ms_s - ms_i)/ms_s);
+        }
+        for (int c = 0; c < 2; ++c) { CUDA_CHECK(hipFree(sep[c])); CUDA_CHECK(hipFree(il[c])); }
+    }
+    if (getenv("MK_DYN")) {
+        // GLU op (recs[1], IQ4_XS, one wave per row): reference-shaped kernel vs 1024-thread static vs dynamic.
+        const mk_recorded_op & r = recs.at(1);
+        mk_mmvq_params p0;
+        memcpy(&p0, r.params.data(), sizeof(p0));
+        using Op32 = mk_mmvq<32,   GGML_TYPE_IQ4_XS, 1, true, false, 0, true>;
+        using OpK  = mk_mmvq<1024, GGML_TYPE_IQ4_XS, 1, true, false, 0, true>;
+        uint32_t * claim; CUDA_CHECK(hipMalloc(&claim, 4));
+        const int nt = r.n_tiles;
+        float * dst = (float *) p0.dst;
+        std::vector<float> a(nt), b(nt);
+        k_direct<Op32, 1><<<nt, 32, 0, stream>>>(p0);
+        sync_bounded(stream, 10000, "dyn ref");
+        CUDA_CHECK(hipMemcpy(a.data(), dst, nt*4, hipMemcpyDeviceToHost));
+        if (getenv("MK_DYN_SMALL")) {
+            CUDA_CHECK(hipMemsetAsync(claim, 0, 4, stream));
+            k_split_dyn<OpK><<<1, MK_THREADS, 0, stream>>>(p0, 64, claim);
+            sync_bounded(stream, 3000, "dyn small");
+            uint32_t c = 0; CUDA_CHECK(hipMemcpy(&c, claim, 4, hipMemcpyDeviceToHost));
+            printf("dyn small: finished, claim counter %u\n", c);
+        }
+        CUDA_CHECK(hipMemsetAsync(claim, 0, 4, stream));
+        k_split_dyn<OpK><<<n_blocks, MK_THREADS, 0, stream>>>(p0, nt, claim);
+        sync_bounded(stream, 10000, "dyn");
+        CUDA_CHECK(hipMemcpy(b.data(), dst, nt*4, hipMemcpyDeviceToHost));
+        printf("dyn: %s\n", memcmp(a.data(), b.data(), nt*4) == 0 ? "bit-identical" : "DIFFERS");
+        // Weights alone fit the infinity cache, so time the GLU op paired with the down op as in the FFN block.
+        mk_param_blob bd = {}; memcpy(bd.b, recs.at(3).params.data(), recs.at(3).params.size());
+        for (int rep = 0; rep < 3; ++rep) {
+            const float ms_r = gpu_time_ms(stream, 60000, "dyn ref", [&] { for (int i = 0; i < 500; ++i) {
+                k_direct<Op32, 1><<<nt, 32, 0, stream>>>(p0); k_split_op<<<n_blocks, MK_THREADS, 0, stream>>>(bd, recs[3].opcode, recs[3].variant, recs[3].n_tiles); } });
+            const float ms_s = gpu_time_ms(stream, 60000, "dyn static", [&] { for (int i = 0; i < 500; ++i) {
+                mk_param_blob bg = {}; memcpy(bg.b, r.params.data(), r.params.size());
+                k_split_op<<<n_blocks, MK_THREADS, 0, stream>>>(bg, r.opcode, r.variant, nt); k_split_op<<<n_blocks, MK_THREADS, 0, stream>>>(bd, recs[3].opcode, recs[3].variant, recs[3].n_tiles); } });
+            const float ms_d = gpu_time_ms(stream, 60000, "dyn", [&] { for (int i = 0; i < 500; ++i) {
+                hipMemsetAsync(claim, 0, 4, stream); k_split_dyn<OpK><<<n_blocks, MK_THREADS, 0, stream>>>(p0, nt, claim);
+                k_split_op<<<n_blocks, MK_THREADS, 0, stream>>>(bd, recs[3].opcode, recs[3].variant, recs[3].n_tiles); } });
+            printf("dyn rep %d (GLU op + down op, us per pair): one-wave blocks %.1f, 1024-thread static %.1f, 1024-thread dynamic %.1f\n",
+                   rep, 2*ms_r, 2*ms_s, 2*ms_d);
+        }
+        CUDA_CHECK(hipFree(claim));
     }
     if (getenv("MK_SPLIT")) {
         auto run_split = [&] {
@@ -864,11 +976,6 @@ __global__ void __launch_bounds__(BLOCK) k_multi_typed(const mk_op_params<OpA> p
     }
 }
 
-template <typename Op, int MINB>
-__global__ void __launch_bounds__(Op::threads, MINB > 0 ? MINB : 1) k_direct(const mk_op_params<Op> p) {
-    __shared__ __align__(16) char lds[Op::lds_bytes + 16];
-    Op::block(p, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x % 32, threadIdx.x / 32, true, lds);
-}
 
 template <typename Op>
 __global__ void __launch_bounds__(Op::threads, 1) k_run1(const mk_op_params<Op> p, int nt) {
@@ -927,6 +1034,14 @@ static bool test_multi(hipStream_t stream) {
     ggml_backend_tensor_set(pc.oa, poison.data(), 0, ggml_nbytes(pc.oa));
     ggml_backend_tensor_set(pc.ob, poison.data(), 0, ggml_nbytes(pc.ob));
     ggml_backend_synchronize(pc.backend);
+    if (getenv("MK_MULTI_DBG")) {
+        printf("dbg: k_multi2 op A only\n"); fflush(stdout);
+        k_multi2<BLOCK><<<op[0].n_blocks, BLOCK, 0, stream>>>(op[0], op[1]); sync_bounded(stream, 3000, "k_multi2 A");
+        printf("dbg: k_multi2 op B only\n"); fflush(stdout);
+        mf_op none = op[0]; none.n_blocks = 0;
+        k_multi2<BLOCK><<<op[1].n_blocks, BLOCK, 0, stream>>>(none, op[1]); sync_bounded(stream, 3000, "k_multi2 B");
+        printf("dbg: ok\n");
+    }
     k_multi2<BLOCK><<<op[0].n_blocks + op[1].n_blocks, BLOCK, 0, stream>>>(op[0], op[1]);
     sync_bounded(stream, 10000, "multi");
     std::vector<float> ga(pc.oa->ne[0]), gb(pc.ob->ne[0]);
