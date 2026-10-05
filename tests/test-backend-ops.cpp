@@ -4049,13 +4049,17 @@ struct test_add_rms_norm : public test_case {
     }
 };
 
-// [ADD +] RMS_NORM + MUL feeding a quantized MUL_MAT
+// [ADD +] RMS_NORM + MUL feeding a quantized MUL_MAT.
+// two_mm: two matmuls share the norm and the ADD reads a reshaped matmul output (the GDN layer's ffn gate/up).
+// get_rows: the final norm, whose output reaches the matmul through GET_ROWS(out_ids).
 struct test_rms_norm_mul_mat : public test_case {
     const ggml_type type_w;
     const int64_t n_embd;
     const int64_t n_out;
     const int64_t n_tokens;
     const bool with_add;
+    const bool two_mm;
+    const bool get_rows;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4065,7 +4069,7 @@ struct test_rms_norm_mul_mat : public test_case {
     bool run_whole_graph() override { return true; }
 
     std::string vars() override {
-        return VARS_TO_STR5(type_w, n_embd, n_out, n_tokens, with_add);
+        return VARS_TO_STR7(type_w, n_embd, n_out, n_tokens, with_add, two_mm, get_rows);
     }
 
     double max_nmse_err() override {
@@ -4073,12 +4077,19 @@ struct test_rms_norm_mul_mat : public test_case {
     }
 
     test_rms_norm_mul_mat(ggml_type type_w = GGML_TYPE_Q8_0, int64_t n_embd = 5120, int64_t n_out = 1024,
-            int64_t n_tokens = 1, bool with_add = false)
-        : type_w(type_w), n_embd(n_embd), n_out(n_out), n_tokens(n_tokens), with_add(with_add) {}
+            int64_t n_tokens = 1, bool with_add = false, bool two_mm = false, bool get_rows = false)
+        : type_w(type_w), n_embd(n_embd), n_out(n_out), n_tokens(n_tokens), with_add(with_add), two_mm(two_mm), get_rows(get_rows) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
-        ggml_set_name(x, "x");
+        ggml_tensor * x;
+        if (two_mm) {
+            x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd*n_tokens);
+            ggml_set_name(x, "x");
+            x = ggml_reshape_2d(ctx, x, n_embd, n_tokens);
+        } else {
+            x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(x, "x");
+        }
         if (with_add) {
             ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
             ggml_set_name(res, "res");
@@ -4093,9 +4104,36 @@ struct test_rms_norm_mul_mat : public test_case {
         ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), norm_w);
         ggml_set_name(cur, "norm");
 
+        if (get_rows) {
+            ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+            ggml_set_name(ids, "ids");
+            cur = ggml_get_rows(ctx, cur, ids);
+            ggml_set_name(cur, "rows");
+        }
+
         ggml_tensor * out = ggml_mul_mat(ctx, w, cur);
         ggml_set_name(out, "out");
+        if (two_mm) {
+            ggml_tensor * w2 = ggml_new_tensor_2d(ctx, type_w, n_embd, n_out);
+            ggml_set_name(w2, "w2");
+            out = ggml_add(ctx, out, ggml_mul_mat(ctx, w2, cur));
+            ggml_set_name(out, "out2");
+        }
         return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = i;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -10726,6 +10764,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q8_0,   5120, 1024,  t, false));
         test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_IQ4_XS, 5120, 10240, t, true));
         test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q6_K,   5120, 10240, t, true));
+        test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_IQ4_XS, 5120, 17408, t, true, true));
+        test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_Q8_0,   5120, 1024,  t, true, false, true));
     }
 
     test_cases.emplace_back(new test_rms_norm_mul_rope({128, 4, 7, 2}));
