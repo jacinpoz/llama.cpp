@@ -60,7 +60,8 @@ static __device__ __noinline__ void mk_exec(const mk_instr & in_ref, const uint8
         if (Op::lds_bytes > 0 && t0 != tile_begin) {
             __syncthreads();
         }
-        const int  tile  = t0 + sub;
+        // Sub-tiles are whole waves, so the tile is wave-uniform; saying so keeps the op's address math scalar.
+        const int  tile  = __builtin_amdgcn_readfirstlane(t0 + sub);
         const bool valid = tile < tile_end;
         Op::run(p, variant, valid ? tile : tile_end - 1, valid, lds_sub);
     }

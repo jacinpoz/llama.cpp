@@ -481,9 +481,20 @@ struct mk_mmvq {
 
     static __device__ __forceinline__ void run(const mk_mmvq_params & p, int variant, int tile, bool valid, char * lds) {
         GGML_UNUSED(variant);
+        // A sub-tile is whole waves, so tile is wave-uniform. Making that explicit keeps the branch below scalar:
+        // block() holds a barrier, which must not sit in control flow the compiler thinks diverges.
+        tile = __builtin_amdgcn_readfirstlane(tile);
         const int local = threadIdx.x % threads;
-        block(p, tile % p.nblocks_x, tile / p.nblocks_x % p.nchannels_dst, tile / p.nblocks_x / p.nchannels_dst,
-              local % warp_size, local / warp_size, valid, lds);
+        const int wid   = __builtin_amdgcn_readfirstlane(local / warp_size);
+        // Decode tiles are one channel and one sample: skip the three integer divisions, a real cost per one-row
+        // block. A single block() call keeps its barrier in one place.
+        uint32_t bx = tile, channel = 0, sample = 0;
+        if ((uint32_t) tile >= p.nblocks_x) {
+            bx      = tile % p.nblocks_x;
+            channel = tile / p.nblocks_x % p.nchannels_dst;
+            sample  = tile / p.nblocks_x / p.nchannels_dst;
+        }
+        block(p, bx, channel, sample, local % warp_size, wid, valid, lds);
     }
 
     static __device__ __forceinline__ void block(const mk_mmvq_params & p, const uint32_t bx, const uint32_t channel_dst,
@@ -685,7 +696,10 @@ struct mk_mmvq {
                 }
             }
         }
-        __syncthreads();
+        // A one-wave op has nothing to exchange; a barrier would make every wave of a wider block wait for the slowest row.
+        if constexpr (nwarps > 1) {
+            __syncthreads();
+        }
         if (wid > 0 || !valid) {
             return;
         }
