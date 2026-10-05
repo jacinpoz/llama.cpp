@@ -5493,13 +5493,18 @@ bool ggml_cuda_verify_norm_q8() {
     return enabled;
 }
 
-// A matmul that will read a norm's Q8_1 output from the quantize cache.  GGML_CUDA_VERIFY_NORM_Q8=1 extends
-// the verify band (2..MMVQ_MAX_BATCH_SIZE tokens) to every arch whose matmul takes the mmvq launch.
+static bool ggml_cuda_fuse_q8_1_verify() {
+    static const bool enabled = getenv("GGML_CUDA_FUSE_Q8_1_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_Q8_1_VERIFY")) != 0;
+    return enabled;
+}
+
+// GGML_CUDA_VERIFY_NORM_Q8=1 extends the verify band to every arch whose matmul takes the mmvq launch.
 bool ggml_cuda_norm_q8_1_consumer(ggml_backend_cuda_context & ctx, const ggml_tensor * mm) {
     if (ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)) {
         return true;
     }
-    return ggml_cuda_verify_norm_q8() && mm->op == GGML_OP_MUL_MAT && mm->ne[1] > 1 && mm->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
+    return ggml_cuda_verify_norm_q8() && ggml_cuda_fuse_q8_1_verify() &&
+        ggml_cuda_info().devices[ctx.device].cc > GGML_CUDA_CC_PASCAL && mm->op == GGML_OP_MUL_MAT && mm->ne[1] > 1 && mm->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
         mm->ne[2] == 1 && mm->ne[3] == 1 && ggml_cuda_mul_mat_kernel(ctx, mm->src[0], mm->src[1], mm) == GGML_CUDA_MM_MMVQ;
 }
 

@@ -991,7 +991,7 @@ static void rms_norm_q8_1_cuda(
 
 // Residual ADD + rms_norm + weight mul + Q8_1 quantize (the verify band, where the ADD is not
 // folded into the preceding mmvq epilogue as it is for one token).  Writes the ADD output, the MUL
-// output and, if quantize, the Q8_1 cache; the values are those of the unfused k_bin_bcast + rms_norm_q8_1 pair.
+// output and the Q8_1 cache; the values are those of the unfused k_bin_bcast + rms_norm_q8_1 pair.
 bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * norm_node, const ggml_tensor * mul_node,
         const bool quantize) {
     const ggml_tensor * a = add_node->src[0];
@@ -1412,7 +1412,7 @@ int ggml_cuda_add_rms_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_
         quantize = n->op == GGML_OP_MUL_MAT && ggml_cuda_norm_q8_1_consumer(ctx, n);
         break;
     }
-    // GGML_CUDA_VERIFY_NORM_Q8: without an mmvq consumer (the final norm feeds GET_ROWS) the ADD still folds into the norm.
+    // With GGML_CUDA_VERIFY_NORM_Q8=1 the ADD folds into the norm even without an mmvq consumer (final norm via GET_ROWS).
     if ((quantize || (ggml_cuda_verify_norm_q8() && node->ne[1] > 1)) && ggml_cuda_op_add_rms_norm_q8_1(ctx, node, norm, mul, quantize)) {
         return 2;
     }
