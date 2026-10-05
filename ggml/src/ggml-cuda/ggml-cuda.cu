@@ -2427,6 +2427,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
+static bool ggml_cuda_fuse_q8_1_verify() {
+    static const bool enabled = getenv("GGML_CUDA_FUSE_Q8_1_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_Q8_1_VERIFY")) != 0;
+    return enabled;
+}
+
 // verify_band: callers that only pre-fill the mmvq Q8_1 activation cache (norm -> Q8_1, gated unary -> Q8_1)
 // and leave the matmul itself unchanged.  Their kernels are row-generic, so on RDNA4 the verify band
 // (2..8 tokens) takes them too; the quantized values are the ones quantize_q8_1 would write, so W = 1..8
@@ -2449,9 +2454,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, cons
         return false;
     }
     //we only support fusion for ncols_dst = 1 (the RDNA4 verify band too for verify_band callers)
-    static const bool q8_1_verify = getenv("GGML_CUDA_FUSE_Q8_1_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_Q8_1_VERIFY")) != 0;
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 &&
-            !(verify_band && q8_1_verify && GGML_CUDA_CC_IS_RDNA4(cc) && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE)) {
+            !(verify_band && ggml_cuda_fuse_q8_1_verify() && GGML_CUDA_CC_IS_RDNA4(cc) && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE)) {
         return false;
     }
 
@@ -2469,8 +2473,7 @@ enum ggml_cuda_mm_kernel {
     GGML_CUDA_MM_MMQ,
 };
 
-// The kernel ggml_cuda_mul_mat() below runs this MUL_MAT through (OTHER may be conservative): the same
-// predicate chain in the same order.  Keep the two in sync.
+// Kernel ggml_cuda_mul_mat() runs for this MUL_MAT; OTHER may be conservative. Keep the predicate chain in sync with it.
 static ggml_cuda_mm_kernel ggml_cuda_mul_mat_kernel(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
         return GGML_CUDA_MM_OTHER;
@@ -2509,13 +2512,13 @@ static bool ggml_cuda_verify_norm_q8() {
     return enabled;
 }
 
-// A matmul that will read a norm's Q8_1 output from the quantize cache.  GGML_CUDA_VERIFY_NORM_Q8=1 extends
-// the verify band (2..MMVQ_MAX_BATCH_SIZE tokens) to every arch whose matmul takes the mmvq launch.
+// GGML_CUDA_VERIFY_NORM_Q8=1 extends the verify band to every arch whose matmul takes the mmvq launch.
 static bool ggml_cuda_norm_q8_1_consumer(ggml_backend_cuda_context & ctx, const ggml_tensor * mm) {
     if (ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)) {
         return true;
     }
-    return ggml_cuda_verify_norm_q8() && mm->op == GGML_OP_MUL_MAT && mm->ne[1] > 1 && mm->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
+    return ggml_cuda_verify_norm_q8() && ggml_cuda_fuse_q8_1_verify() &&
+        ggml_cuda_info().devices[ctx.device].cc > GGML_CUDA_CC_PASCAL && mm->op == GGML_OP_MUL_MAT && mm->ne[1] > 1 && mm->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
         mm->ne[2] == 1 && mm->ne[3] == 1 && ggml_cuda_mul_mat_kernel(ctx, mm->src[0], mm->src[1], mm) == GGML_CUDA_MM_MMVQ;
 }
 
@@ -5502,7 +5505,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             quantize = n->op == GGML_OP_MUL_MAT && ggml_cuda_norm_q8_1_consumer(*cuda_ctx, n);
             break;
         }
-        // Without an mmvq consumer (the final norm feeds GET_ROWS) the ADD still folds into the norm.
+        // With GGML_CUDA_VERIFY_NORM_Q8=1 the ADD folds into the norm even without an mmvq consumer (final norm via GET_ROWS).
         if ((quantize || ggml_cuda_verify_norm_q8()) && ggml_cuda_op_add_rms_norm_q8_1(*cuda_ctx, node, norm, mul, quantize)) {
             return 2;
         }

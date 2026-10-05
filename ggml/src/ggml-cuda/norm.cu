@@ -659,7 +659,7 @@ static void rms_norm_q8_1_cuda(
 
 // Residual ADD + rms_norm + weight mul + Q8_1 quantize (the verify band, where the ADD is not
 // folded into the preceding mmvq epilogue as it is for one token).  Writes the ADD output, the MUL
-// output and, if quantize, the Q8_1 cache; the values are those of the unfused k_bin_bcast + rms_norm_q8_1 pair.
+// output and the Q8_1 cache; the values are those of the unfused k_bin_bcast + rms_norm_q8_1 pair.
 bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * norm_node, const ggml_tensor * mul_node,
         const bool quantize) {
     const ggml_tensor * a = add_node->src[0];

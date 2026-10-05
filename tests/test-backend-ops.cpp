@@ -4049,9 +4049,7 @@ struct test_add_rms_norm : public test_case {
     }
 };
 
-// [ADD +] RMS_NORM + MUL feeding a quantized MUL_MAT.
-// two_mm: two matmuls share the norm and the ADD reads a reshaped matmul output (the GDN layer's ffn gate/up).
-// get_rows: the final norm, whose output reaches the matmul through GET_ROWS(out_ids).
+// [ADD +] RMS_NORM + MUL feeding a quantized MUL_MAT; two_mm: two matmuls share the norm, get_rows: GET_ROWS in between
 struct test_rms_norm_mul_mat : public test_case {
     const ggml_type type_w;
     const int64_t n_embd;
