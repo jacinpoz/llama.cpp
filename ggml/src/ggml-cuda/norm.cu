@@ -660,7 +660,8 @@ static void rms_norm_q8_1_cuda(
 // Residual ADD + rms_norm + weight mul + Q8_1 quantize (the verify band, where the ADD is not
 // folded into the preceding mmvq epilogue as it is for one token).  Writes the ADD output, the MUL
 // output and the Q8_1 cache; the values are those of the unfused k_bin_bcast + rms_norm_q8_1 pair.
-bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * norm_node, const ggml_tensor * mul_node) {
+bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * norm_node, const ggml_tensor * mul_node,
+        const bool quantize) {
     const ggml_tensor * a = add_node->src[0];
     const ggml_tensor * b = add_node->src[1];
     const ggml_tensor * dst = mul_node;
@@ -681,14 +682,18 @@ bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor
     const int ncols = dst->ne[0];
     const int64_t s01 = add_node->nb[1] / sizeof(float);
     const int64_t ne10_padded = GGML_PAD(ncols, MATRIX_ROW_PADDING);
-    const size_t q8_1_size = dst->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
-    bool found = false;
-    void * q8_1 = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, q8_1_size,
-                                      ncols, dst->ne[1], dst->ne[2], dst->ne[3],
-                                      dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), dst->nb[3]/sizeof(float), found);
+    block_q8_1 * y = nullptr;
+    if (quantize) {
+        const size_t q8_1_size = dst->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+        bool found = false;
+        void * q8_1 = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, q8_1_size,
+                                          ncols, dst->ne[1], dst->ne[2], dst->ne[3],
+                                          dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), dst->nb[3]/sizeof(float), found);
+        y = found ? nullptr : (block_q8_1 *) q8_1;
+    }
     const dim3 blocks_num(dst->ne[1], 1, 1);
     const mk_rmsnorm_q8_1_params p = rms_norm_q8_1_params((const float *) add_node->data, (float *) dst->data,
-        found ? nullptr : (block_q8_1 *) q8_1, (const float *) weight->data, ncols, s01, 0, 0, 0, (int) ne10_padded, eps,
+        y, (const float *) weight->data, ncols, s01, 0, 0, 0, (int) ne10_padded, eps,
         (const float *) a->data, (const float *) b->data, blocks_num);
     const auto launch = [&](auto bs_c) {
         rms_norm_q8_1_launch<decltype(bs_c)::value, true>(p, blocks_num, ctx.stream());

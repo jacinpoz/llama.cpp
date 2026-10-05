@@ -2427,6 +2427,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
+static bool ggml_cuda_fuse_q8_1_verify() {
+    static const bool enabled = getenv("GGML_CUDA_FUSE_Q8_1_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_Q8_1_VERIFY")) != 0;
+    return enabled;
+}
+
 // verify_band: callers that only pre-fill the mmvq Q8_1 activation cache (norm -> Q8_1, gated unary -> Q8_1)
 // and leave the matmul itself unchanged.  Their kernels are row-generic, so on RDNA4 the verify band
 // (2..8 tokens) takes them too; the quantized values are the ones quantize_q8_1 would write, so W = 1..8
@@ -2449,9 +2454,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, cons
         return false;
     }
     //we only support fusion for ncols_dst = 1 (the RDNA4 verify band too for verify_band callers)
-    static const bool q8_1_verify = getenv("GGML_CUDA_FUSE_Q8_1_VERIFY") == nullptr || atoi(getenv("GGML_CUDA_FUSE_Q8_1_VERIFY")) != 0;
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 &&
-            !(verify_band && q8_1_verify && GGML_CUDA_CC_IS_RDNA4(cc) && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE)) {
+            !(verify_band && ggml_cuda_fuse_q8_1_verify() && GGML_CUDA_CC_IS_RDNA4(cc) && dst->ne[1] <= MMVQ_MAX_BATCH_SIZE)) {
         return false;
     }
 
@@ -2463,36 +2467,59 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, cons
 }
 
 
-// True iff ggml_cuda_mul_mat() below would run this MUL_MAT through ggml_cuda_mul_mat_q: the same
-// predicate chain in the same order.  Keep the two in sync.
-static bool ggml_cuda_mul_mat_takes_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+enum ggml_cuda_mm_kernel {
+    GGML_CUDA_MM_OTHER,
+    GGML_CUDA_MM_MMVQ,
+    GGML_CUDA_MM_MMQ,
+};
+
+// Kernel ggml_cuda_mul_mat() runs for this MUL_MAT; OTHER may be conservative. Keep the predicate chain in sync with it.
+static ggml_cuda_mm_kernel ggml_cuda_mul_mat_kernel(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
-        return false;
+        return GGML_CUDA_MM_OTHER;
     }
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        return false;
+        return GGML_CUDA_MM_OTHER;
     }
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
     const int64_t ne11 = src1->ne[1];
     if (ggml_cuda_mmb_supported_mm(src0, src1, dst)) {
-        return false;
+        return GGML_CUDA_MM_OTHER;
     }
     const int64_t ne11_mmvf = ne11 <= MMVF_MAX_BATCH_SIZE_FLAT ? 1 : ne11;
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11_mmvf) || src0->ne[1] == 1) {
-        return false;
+        return GGML_CUDA_MM_OTHER;
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
-        return false;
+        return GGML_CUDA_MM_OTHER;
     }
     bool use_mmvq = ggml_cuda_should_use_mmvq(src0->type, cc, ne11);
     static const bool dense_band_off = getenv("GGML_CUDA_DISABLE_MMVQ_DENSE_BAND") != nullptr;
     if (!use_mmvq && !dense_band_off && (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3_5(cc)) && ggml_is_quantized(src0->type) && ne11 <= MMVQ_MOE_MAX_BATCH_SIZE && src0->ne[1] % 128 != 0) {
         use_mmvq = true;
     }
-    return !use_mmvq && ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0);
+    if (use_mmvq) {
+        return GGML_CUDA_MM_MMVQ;
+    }
+    return ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0) ? GGML_CUDA_MM_MMQ : GGML_CUDA_MM_OTHER;
+}
+
+static bool ggml_cuda_verify_norm_q8() {
+    static const bool enabled = getenv("GGML_CUDA_VERIFY_NORM_Q8") != nullptr && atoi(getenv("GGML_CUDA_VERIFY_NORM_Q8")) != 0;
+    return enabled;
+}
+
+// GGML_CUDA_VERIFY_NORM_Q8=1 extends the verify band to every arch whose matmul takes the mmvq launch.
+static bool ggml_cuda_norm_q8_1_consumer(ggml_backend_cuda_context & ctx, const ggml_tensor * mm) {
+    if (ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)) {
+        return true;
+    }
+    return ggml_cuda_verify_norm_q8() && ggml_cuda_fuse_q8_1_verify() &&
+        ggml_cuda_info().devices[ctx.device].cc > GGML_CUDA_CC_PASCAL && mm->op == GGML_OP_MUL_MAT && mm->ne[1] > 1 && mm->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
+        mm->ne[2] == 1 && mm->ne[3] == 1 && ggml_cuda_mul_mat_kernel(ctx, mm->src[0], mm->src[1], mm) == GGML_CUDA_MM_MMVQ;
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -5509,9 +5536,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (fuse_add_rms_q8 && node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes &&
             node->ne[1] > 1 && node->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
             cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM && cgraph->nodes[i + 1]->src[0] == node &&
-            cgraph->nodes[i + 2]->op == GGML_OP_MUL && cgraph->nodes[i + 2]->src[0] == cgraph->nodes[i + 1]) {
+            cgraph->nodes[i + 2]->op == GGML_OP_MUL && cgraph->nodes[i + 2]->src[0] == cgraph->nodes[i + 1] &&
+            ggml_node_has_n_uses(cgraph, i + 1, 1)) {
         ggml_tensor * norm = cgraph->nodes[i + 1];
         const ggml_tensor * mul = cgraph->nodes[i + 2];
+        bool quantize = false;
         const int scan_end = std::min(cgraph->n_nodes, i + 33);
         for (int j = i + 3; j < scan_end; ++j) {
             const ggml_tensor * n = cgraph->nodes[j];
@@ -5522,11 +5551,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (!(n->src[0] == mul || n_src1 == mul)) {
                 continue;
             }
-            if (n->op == GGML_OP_MUL_MAT && ggml_cuda_should_fuse_mul_mat_vec_q(n, true) &&
-                    ggml_cuda_op_add_rms_norm_q8_1(*cuda_ctx, node, norm, mul)) {
-                return 2;
-            }
+            quantize = n->op == GGML_OP_MUL_MAT && ggml_cuda_norm_q8_1_consumer(*cuda_ctx, n);
             break;
+        }
+        // With GGML_CUDA_VERIFY_NORM_Q8=1 the ADD folds into the norm even without an mmvq consumer (final norm via GET_ROWS).
+        if ((quantize || ggml_cuda_verify_norm_q8()) && ggml_cuda_op_add_rms_norm_q8_1(*cuda_ctx, node, norm, mul, quantize)) {
+            return 2;
         }
     }
 
@@ -5537,7 +5567,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // be adjacent (unrelated nodes may sit between in DFS order).
     if (node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes) {
         const ggml_tensor * mul = cgraph->nodes[i + 1];
-        if (mul->op == GGML_OP_MUL && mul->src[0] == node) {
+        if (mul->op == GGML_OP_MUL && mul->src[0] == node && mul->src[1]->ne[0] == node->ne[0] &&
+                ggml_node_has_n_uses(cgraph, i, 1)) {
             // The consumers of the norm output are mostly mmvq matmuls; skip
             // over unrelated nodes and non-mmvq consumers (they read the F32
             // output, which the fused kernel still writes) until an mmvq
@@ -5563,8 +5594,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const bool mmid_single = n->op != GGML_OP_MUL_MAT_ID || n->ne[2] == 1;
                 if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) &&
                         node->ne[0] % QK8_1 == 0 &&
-                        ggml_cuda_should_fuse_mul_mat_vec_q(n, true) &&
-                        mmid_single) {
+                        mmid_single &&
+                        ggml_cuda_norm_q8_1_consumer(*cuda_ctx, n)) {
                     ggml_cuda_op_rms_norm_q8_1(*cuda_ctx, node, mul);
                     return 1;
                 }
@@ -5646,7 +5677,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const bool shape_ok = node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) && node->ne[0] % 4 == 0 &&
             node->ne[2] == 1 && node->ne[3] == 1 && rows_ok(a) && (b == nullptr || (rows_ok(b) && ggml_are_same_shape(a, b))) &&
             a->ne[0] == (b ? node->ne[0] : 2*node->ne[0]) && a->ne[1] == node->ne[1];
-        if (shape_ok && ggml_is_quantized(next->src[0]->type) && ggml_cuda_mul_mat_takes_mmq(*cuda_ctx, next->src[0], node, next) &&
+        if (shape_ok && ggml_is_quantized(next->src[0]->type) && ggml_cuda_mul_mat_kernel(*cuda_ctx, next->src[0], node, next) == GGML_CUDA_MM_MMQ &&
                 ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 })) {
             ggml_cuda_mul_mat_q_swiglu_dense(*cuda_ctx, next->src[0], next, node);
             return 1;

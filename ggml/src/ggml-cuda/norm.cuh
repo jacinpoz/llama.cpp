@@ -26,7 +26,8 @@ void ggml_cuda_op_l2_norm_pair(ggml_backend_cuda_context & ctx,
 
 void ggml_cuda_op_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * norm_node, const ggml_tensor * mul_node);
 
-bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * norm_node, const ggml_tensor * mul_node);
+bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * norm_node, const ggml_tensor * mul_node,
+        bool quantize);
 
 bool ggml_cuda_op_rms_norm_scale_pair_fused(ggml_backend_cuda_context & ctx, ggml_tensor * norm0, ggml_tensor * scale0,
         ggml_tensor * norm1, ggml_tensor * scale1);
