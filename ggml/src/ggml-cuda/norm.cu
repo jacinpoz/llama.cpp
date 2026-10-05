@@ -612,7 +612,7 @@ static __global__ void rms_norm_q8_1_f32(const mk_rmsnorm_q8_1_params p) {
 template <int block_size, bool has_add>
 static void rms_norm_q8_1_launch(const mk_rmsnorm_q8_1_params & p, const dim3 & blocks_num, cudaStream_t stream) {
     mk_record(MK_OP_RMSNORM_Q8_1, (has_add ? MK_RMSNORM_Q8_1_ADD : 0) | (block_size == 256 ? MK_RMSNORM_Q8_1_W256 : 0),
-              (int64_t) blocks_num.x*blocks_num.y*blocks_num.z, p);
+              (int64_t) blocks_num.x*blocks_num.y*blocks_num.z, block_size, p);
     const dim3 block_dims(block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_size > WARP_SIZE ? 32 * sizeof(float) : 0, stream};
     ggml_cuda_kernel_launch(rms_norm_q8_1_f32<block_size, has_add>, launch_params, p);

@@ -914,7 +914,8 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
 
     const bool fused = c_ncols_dst == 1 && has_fusion;
     mk_record(MK_OP_MMVQ, mk_mmvq_variant(type, c_ncols_dst, fused, long_k),
-              !small_k && !halve_iters && rows_per_block == 0 ? (int64_t) block_nums.x*block_nums.y*block_nums.z : -1, p);
+              !small_k && !halve_iters && rows_per_block == 0 ? (int64_t) block_nums.x*block_nums.y*block_nums.z : -1,
+              (int) (block_dims.x*block_dims.y), p);
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     if constexpr (c_ncols_dst == 1) {

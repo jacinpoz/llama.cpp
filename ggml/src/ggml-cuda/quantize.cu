@@ -561,7 +561,7 @@ void quantize_row_q8_1_cuda(
     p.ne1       = ne1;
     p.ne2       = ne2_fastdiv;
     p.nblocks_x = num_blocks.x;
-    mk_record(MK_OP_QUANTIZE_Q8_1, 0, (int64_t) num_blocks.x*num_blocks.y*num_blocks.z, p);
+    mk_record(MK_OP_QUANTIZE_Q8_1, 0, (int64_t) num_blocks.x*num_blocks.y*num_blocks.z, CUDA_QUANTIZE_BLOCK_SIZE, p);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
     ggml_cuda_kernel_launch(quantize_q8_1, launch_params, p);
     GGML_UNUSED(type_src0);
