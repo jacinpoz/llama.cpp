@@ -358,6 +358,29 @@
         }
     }
 
+#if defined(GGML_USE_HIP)
+    if constexpr (has_fusion && ncols_dst == 1 && rows_per_cuda_block == 1) {
+        if (fusion.q8_1_out != nullptr) {
+            // GGML_CUDA_GLU_Q8_1: publish this row, then count it in its 32-row group; the wave that completes the
+            // group quantizes it (mk_quantize_q8_1_group, as quantize_q8_1), reading the other waves' rows after an acquire.
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+            const uint32_t group = row0 / QK8_1;
+            uint32_t prev = 0;
+            if (threadIdx.x == 0) {
+                prev = __hip_atomic_fetch_add(fusion.q8_1_group_done + group, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
+            }
+            prev = __builtin_amdgcn_readfirstlane(prev);
+            if (prev == QK8_1 - 1) {
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+                const float xi = __hip_atomic_load(dst - row0 % QK8_1 + threadIdx.x, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                mk_quantize_q8_1_group(xi, (block_q8_1 *) fusion.q8_1_out + group, threadIdx.x);
+                if (threadIdx.x == 0) {
+                    fusion.q8_1_group_done[group] = 0;
+                }
+            }
+        }
+    }
+#endif // defined(GGML_USE_HIP)
     if constexpr (!has_fusion) {
         GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, use_dst_gate, use_conv_input, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate, dst_gate, conv_input, conv_states, conv_kernel_size);
     }

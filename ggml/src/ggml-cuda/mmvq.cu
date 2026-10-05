@@ -1,6 +1,8 @@
 #include "mmvq.cuh"
 #include "gdn-conv.cuh"
 #include "moe-expert-cache.h"   // Phase 1b: moe_cache_enabled/moe_cache_get_cold (the UVA cold seam)
+
+#include <array>
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1610,6 +1612,32 @@ void ggml_cuda_mul_mat_vec_q(
         ctx.mwr_done_idx   = ctx.mwr_fold_idx;
     }
     ctx.mwr_fold_experts = nullptr;
+
+    // Opt-in: a one-token SwiGLU matmul also writes its output's Q8_1 form into the cache slot the next matmul
+    // looks up (keyed on this dst), so that matmul skips its own quantize_q8_1 launch.  Only where the dense
+    // one-token launch is the one-row ksplit kernel that runs the epilogue (RDNA3_0: no row loop, no row concat).
+    static const bool glu_q8_1 = getenv("GGML_CUDA_GLU_Q8_1") != nullptr;
+    if (glu_q8_1 && fusion && fusion->gate && fusion->glu_op == GGML_GLU_OP_SWIGLU && !fusion->dst_gate && !ids &&
+            !fusion->x_bias && !fusion->conv_input && fusion_local.cat_dst[0] == nullptr &&
+            get_device_table_id(ggml_cuda_info().devices[ctx.device].cc) == MMVQ_PARAMETERS_RDNA3_0 && dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+            dst->ne[0] % QK8_1 == 0 && ggml_is_contiguous(dst) && dst->view_src == nullptr) {
+        static std::array<unsigned int *, GGML_CUDA_MAX_DEVICES> group_done = {};
+        constexpr int64_t max_groups = 1 << 16;
+        const int id = ggml_cuda_get_device();
+        if (group_done[id] == nullptr) {
+            CUDA_CHECK(cudaMalloc(&group_done[id], max_groups*sizeof(unsigned int)));
+            CUDA_CHECK(cudaMemset(group_done[id], 0, max_groups*sizeof(unsigned int)));
+        }
+        const int64_t n = dst->ne[0];
+        const int64_t s1 = dst->nb[1]/sizeof(float), s2 = dst->nb[2]/sizeof(float), s3 = dst->nb[3]/sizeof(float);
+        const size_t q8_1_size = GGML_PAD(n, MATRIX_ROW_PADDING)*sizeof(block_q8_1)/QK8_1;
+        bool found = false;
+        void * q8_1 = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, q8_1_size, n, 1, 1, 1, s1, s2, s3, found);
+        if (!found && n/QK8_1 <= max_groups && GGML_PAD(n, MATRIX_ROW_PADDING) == n) {
+            fusion_local.q8_1_out        = q8_1;
+            fusion_local.q8_1_group_done = group_done[id];
+        }
+    }
 
     // If src0 is a temporary compute buffer, clear any potential padding.  A redirected expert
     // table (wip/moe-expert-cache) carries no buffer; its compact arena has no padding to clear,
