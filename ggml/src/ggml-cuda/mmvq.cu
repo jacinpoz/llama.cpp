@@ -3782,6 +3782,8 @@ int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
         }
     }
     if (n_kv != 2 || ggml_cuda_mul_mat_kernel(ctx, q->src[0], q->src[1], q) != GGML_CUDA_MM_MMVQ) {
+        static const bool dbg = getenv("GGML_CUDA_FUSE_DEBUG") != nullptr;
+        if (dbg) { fprintf(stderr, "fuse-debug: triple at %s rejected: n_kv %d kernel %d\n", q->name, n_kv, (int) ggml_cuda_mul_mat_kernel(ctx, q->src[0], q->src[1], q)); }
         return 0;
     }
     ggml_cuda_redirect_early_output(cgraph, kv[0]);

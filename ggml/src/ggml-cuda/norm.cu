@@ -1416,6 +1416,8 @@ int ggml_cuda_add_rms_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_
     if ((quantize || (ggml_cuda_verify_norm_q8() && node->ne[1] > 1)) && ggml_cuda_op_add_rms_norm_q8_1(ctx, node, norm, mul, quantize)) {
         return 2;
     }
+    static const bool dbg_v1 = getenv("GGML_CUDA_FUSE_DEBUG") != nullptr;
+    if (dbg_v1) { fprintf(stderr, "fuse-debug: add+norm %s not fused (quantize %d, verify_norm_q8 %d)\n", node->name, (int) quantize, (int) ggml_cuda_verify_norm_q8()); }
     return 0;
 }
 
