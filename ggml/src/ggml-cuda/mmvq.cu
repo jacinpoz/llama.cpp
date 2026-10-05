@@ -2838,9 +2838,64 @@ static const ggml_tensor * ggml_cuda_find_conv_state_cpy(const ggml_cgraph * cgr
     return nullptr;
 }
 
+// An output computed before its node goes to a private buffer: the graph allocator may still be using the
+// tensor's own bytes for other tensors until that node. The tensor and its views point at the private buffer
+// for the rest of this evaluation (kernels launched or captured from here on read it) and are restored after.
+static thread_local std::vector<std::pair<ggml_tensor *, void *>> g_redirected;
+static thread_local int g_redirect_slot = 0;
+
+static void ggml_cuda_redirect_early_output(ggml_cgraph * cgraph, ggml_tensor * t) {
+    static std::vector<std::pair<void *, size_t>> buffers; // per slot, kept: captured graphs keep using them
+    const size_t nbytes = ggml_nbytes(t);
+    if ((size_t) g_redirect_slot >= buffers.size()) {
+        buffers.emplace_back(nullptr, 0);
+    }
+    auto & buf = buffers[g_redirect_slot++];
+    if (buf.second < nbytes) {
+        GGML_ASSERT(buf.first == nullptr && "early-output buffer size changed for a slot");
+        CUDA_CHECK(cudaMalloc(&buf.first, nbytes));
+        buf.second = nbytes;
+    }
+    char * old_base = (char *) t->data;
+    auto patch = [&](ggml_tensor * v) {
+        if (v == nullptr) {
+            return;
+        }
+        const ggml_tensor * root = v;
+        while (root->view_src != nullptr) {
+            root = root->view_src;
+        }
+        if (root != t && v != t) {
+            return;
+        }
+        for (const auto & r : g_redirected) {
+            if (r.first == v) {
+                return;
+            }
+        }
+        g_redirected.emplace_back(v, v->data);
+        v->data = (char *) buf.first + ((char *) v->data - old_base);
+    };
+    patch(t);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        patch(cgraph->nodes[i]);
+        for (int sidx = 0; sidx < GGML_MAX_SRC; ++sidx) {
+            patch(cgraph->nodes[i]->src[sidx]);
+        }
+    }
+}
+
+void ggml_cuda_restore_early_outputs() {
+    for (auto it = g_redirected.rbegin(); it != g_redirected.rend(); ++it) {
+        it->first->data = it->second;
+    }
+    g_redirected.clear();
+    g_redirect_slot = 0;
+}
+
 // Path F: the GDN z projection reads the same normed input as the qkv projection, so both can run as one
-// launch at the qkv node. Returns z's node index, or -1. z is then written early, so no node in between may
-// touch z's output bytes or write z's input (the graph allocator reuses buffers).
+// launch at the qkv node. Returns z's node index, or -1. z is then written early into a private buffer
+// (ggml_cuda_redirect_early_output), since the graph allocator reuses z's own bytes until z's node.
 static int ggml_cuda_find_mmvq_pair(const ggml_cgraph * cgraph, const int i_qkv, const int i_last_fused) {
     static const bool enabled = getenv("GGML_CUDA_MULTI_OP") != nullptr;
     static const bool dbg = getenv("GGML_CUDA_MULTI_OP_DEBUG") != nullptr;
@@ -2850,13 +2905,6 @@ static int ggml_cuda_find_mmvq_pair(const ggml_cgraph * cgraph, const int i_qkv,
         if (dbg && enabled) { fprintf(stderr, "mmvq pair: qkv %s rejected (type %s, ne1 %lld)\n", qkv->name, ggml_type_name(qkv->src[0]->type), (long long) qkv->ne[1]); }
         return -1;
     }
-    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
-        if (a == nullptr || b == nullptr || a->data == nullptr || b->data == nullptr) {
-            return false;
-        }
-        const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
-        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
-    };
     const int end = std::min(cgraph->n_nodes, i_last_fused + 48);
     for (int k = i_qkv + 1; k < end; ++k) {
         const ggml_tensor * z = cgraph->nodes[k];
@@ -2867,19 +2915,6 @@ static int ggml_cuda_find_mmvq_pair(const ggml_cgraph * cgraph, const int i_qkv,
         if (z->src[0]->type != GGML_TYPE_IQ4_XS || z->ne[1] != 1 || z->src[2] != nullptr ||
                 (z->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
-        }
-        for (int m = i_qkv + 1; m < k; ++m) {
-            const ggml_tensor * n = cgraph->nodes[m];
-            if (overlaps(n, z) || overlaps(n, z->src[1])) {
-                if (dbg) { fprintf(stderr, "mmvq pair: %s blocked by node %d %s (%s)\n", z->name, m, n->name, ggml_op_name(n->op)); }
-                return -1;
-            }
-            for (int sidx = 0; sidx < GGML_MAX_SRC; ++sidx) {
-                if (overlaps(n->src[sidx], z)) {
-                    if (dbg) { fprintf(stderr, "mmvq pair: %s blocked by src of node %d %s\n", z->name, m, n->name); }
-                    return -1;
-                }
-            }
         }
         return k;
     }
@@ -2947,6 +2982,7 @@ int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_c
         ggml_cuda_mmvq_capture cap_qkv, cap_z;
         ggml_cuda_mmvq_set_capture(&cap_qkv);
         ggml_cuda_mul_mat_vec_q(ctx, node->src[0], node->src[1], node->src[2], qkv_dst, fusion);
+        ggml_cuda_redirect_early_output(const_cast<ggml_cgraph *>(cgraph), z);
         ggml_cuda_mmvq_set_capture(&cap_z);
         ggml_cuda_mul_mat_vec_q(ctx, z->src[0], z->src[1], z->src[2], z, nullptr);
         ggml_cuda_mmvq_set_capture(nullptr);

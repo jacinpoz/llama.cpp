@@ -2277,7 +2277,8 @@ static int ggml_cuda_try_fuse_gdn_out_gate(ggml_backend_cuda_context & ctx, ggml
     if (mm == nullptr) {
         return 0;
     }
-    if (!ggml_cuda_compute_forward(ctx, zmm)) {
+    // z may already have run, paired with the qkv projection
+    if (g_precomputed_nodes.erase(zmm) == 0 && !ggml_cuda_compute_forward(ctx, zmm)) {
         GGML_ABORT("gdn out gate: z MUL_MAT dispatch failed");
     }
     if (!ggml_cuda_op_norm_silu_gate_q8_1(ctx, norm, nmul, unary, mul, mm)) {

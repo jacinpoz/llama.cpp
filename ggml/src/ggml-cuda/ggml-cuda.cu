@@ -7482,6 +7482,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            ggml_cuda_restore_early_outputs();
         }
 
 #ifdef USE_CUDA_GRAPH
