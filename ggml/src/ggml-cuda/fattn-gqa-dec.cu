@@ -1,6 +1,5 @@
 // Decode/verify attention for head dim 256 with GQA 6 or 8 (n_q <= 8), aimed at RDNA3 where the tile kernel
-// re-reads every K/V tile once per pair of query heads and is issue-bound on quantized K/V. The kernels are the
-// megakernel ops in mk-ops-attn.cuh, one sub-tile per block.
+// re-reads every K/V tile once per pair of query heads and is issue-bound on quantized K/V.
 // Opt-in with GGML_HIP_FA_GQA_DEC=1.
 
 #include "fattn-gqa-dec.cuh"
