@@ -782,47 +782,6 @@ static bool test_ffn(hipStream_t stream, int n_blocks, bool timing) {
                    op, idx.size(), os_min, os_max, oe_min, oe_max, dur_sum/idx.size(), dur_max);
         }
     }
-    if (getenv("MK_GLU_IL")) {
-        // DeepGEMM-style interleaved gate/up: one buffer with gate and up rows alternating. The existing kernel
-        // reads it through gate = base, vx = base + row, row stride doubled: same code, same data, one stream.
-        const mk_recorded_op & r = recs.at(1);
-        mk_mmvq_params p0;
-        memcpy(&p0, r.params.data(), sizeof(p0));
-        const size_t rb = (size_t) p0.stride_row_x*ggml_type_size(ggml_type(r.variant & 0xFF));
-        const size_t nrows = (size_t) r.n_tiles, mat = nrows*rb;
-        GGML_ASSERT(p0.fusion.gate != nullptr);
-        using OpG = mk_mmvq<32, GGML_TYPE_IQ4_XS, 1, true, false, 0, true>;
-        // Two copies of each layout so a timed loop streams 190 MB, past the 96 MiB infinity cache.
-        uint8_t * sep[2]; uint8_t * il[2];
-        for (int c = 0; c < 2; ++c) {
-            CUDA_CHECK(hipMalloc(&sep[c], 2*mat));
-            CUDA_CHECK(hipMemcpy(sep[c],       p0.vx,         mat, hipMemcpyDeviceToDevice));
-            CUDA_CHECK(hipMemcpy(sep[c] + mat, p0.fusion.gate, mat, hipMemcpyDeviceToDevice));
-            CUDA_CHECK(hipMalloc(&il[c], 2*mat));
-            CUDA_CHECK(hipMemcpy2D(il[c] + rb, 2*rb, p0.vx,         rb, rb, nrows, hipMemcpyDeviceToDevice));
-            CUDA_CHECK(hipMemcpy2D(il[c],      2*rb, p0.fusion.gate, rb, rb, nrows, hipMemcpyDeviceToDevice));
-        }
-        mk_mmvq_params ps[2], pi[2];
-        for (int c = 0; c < 2; ++c) {
-            ps[c] = p0; ps[c].vx = sep[c]; ps[c].fusion.gate = sep[c] + mat;
-            pi[c] = p0; pi[c].vx = il[c] + rb; pi[c].fusion.gate = il[c]; pi[c].stride_row_x = 2*p0.stride_row_x;
-        }
-        float * dst = (float *) p0.dst;
-        std::vector<float> a(nrows), b(nrows);
-        k_direct<OpG, 1><<<nrows, 32, 0, stream>>>(ps[0]);
-        sync_bounded(stream, 10000, "glu sep");
-        CUDA_CHECK(hipMemcpy(a.data(), dst, nrows*4, hipMemcpyDeviceToHost));
-        k_direct<OpG, 1><<<nrows, 32, 0, stream>>>(pi[0]);
-        sync_bounded(stream, 10000, "glu il");
-        CUDA_CHECK(hipMemcpy(b.data(), dst, nrows*4, hipMemcpyDeviceToHost));
-        printf("glu interleave: %s\n", memcmp(a.data(), b.data(), nrows*4) == 0 ? "bit-identical" : "DIFFERS");
-        for (int rep = 0; rep < 3; ++rep) {
-            const float ms_s = gpu_time_ms(stream, 60000, "glu sep", [&] { for (int i = 0; i < 1000; ++i) { k_direct<OpG, 1><<<nrows, 32, 0, stream>>>(ps[i & 1]); } });
-            const float ms_i = gpu_time_ms(stream, 60000, "glu il",  [&] { for (int i = 0; i < 1000; ++i) { k_direct<OpG, 1><<<nrows, 32, 0, stream>>>(pi[i & 1]); } });
-            printf("glu interleave rep %d: separate gate/up %.1f us, interleaved %.1f us (%.1f%%)\n", rep, ms_s, ms_i, 100.0*(ms_s - ms_i)/ms_s);
-        }
-        for (int c = 0; c < 2; ++c) { CUDA_CHECK(hipFree(sep[c])); CUDA_CHECK(hipFree(il[c])); }
-    }
     if (getenv("MK_DYN")) {
         // GLU op (recs[1], IQ4_XS, one wave per row): reference-shaped kernel vs 1024-thread static vs dynamic.
         const mk_recorded_op & r = recs.at(1);
@@ -1004,13 +963,6 @@ __global__ void __launch_bounds__(BLOCK) k_multi_typed(const mk_op_params<OpA> p
     }
 }
 
-
-template <typename Op>
-__global__ void __launch_bounds__(Op::threads, 1) k_run1(const mk_op_params<Op> p, int nt) {
-    __shared__ __align__(16) char lds[Op::lds_bytes + 16];
-    Op::run(p, 0, blockIdx.x, true, lds);
-}
-
 // Tuned form: (BLOCK, 1) launch bounds, and decode-shaped tiles (one channel, one sample) passed straight
 // to block() without run()'s generic decode.
 template <int BLOCK, typename OpA, typename OpB>
@@ -1062,14 +1014,6 @@ static bool test_multi(hipStream_t stream) {
     ggml_backend_tensor_set(pc.oa, poison.data(), 0, ggml_nbytes(pc.oa));
     ggml_backend_tensor_set(pc.ob, poison.data(), 0, ggml_nbytes(pc.ob));
     ggml_backend_synchronize(pc.backend);
-    if (getenv("MK_MULTI_DBG")) {
-        printf("dbg: k_multi2 op A only\n"); fflush(stdout);
-        k_multi2<BLOCK><<<op[0].n_blocks, BLOCK, 0, stream>>>(op[0], op[1]); sync_bounded(stream, 3000, "k_multi2 A");
-        printf("dbg: k_multi2 op B only\n"); fflush(stdout);
-        mf_op none = op[0]; none.n_blocks = 0;
-        k_multi2<BLOCK><<<op[1].n_blocks, BLOCK, 0, stream>>>(none, op[1]); sync_bounded(stream, 3000, "k_multi2 B");
-        printf("dbg: ok\n");
-    }
     k_multi2<BLOCK><<<op[0].n_blocks + op[1].n_blocks, BLOCK, 0, stream>>>(op[0], op[1]);
     sync_bounded(stream, 10000, "multi");
     std::vector<float> ga(pc.oa->ne[0]), gb(pc.ob->ne[0]);
@@ -1114,28 +1058,7 @@ static bool test_multi(hipStream_t stream) {
         printf("multi: qkv differs %d (nan %d) of %zu, z differs %d (nan %d) of %zu; e.g. qkv[0] %.9g vs %.9g\n", da, na, ga.size(), db, nb, gb.size(), ga[0], ra[0]);
     }
 
-    // Timing: the normal path (graph: norm + 2 mmvq) vs the norm's recorded launch... approximated by the
-    // reference graph minus nothing: compare the full graph against norm-in-graph + one multi-op launch.
     constexpr int iters = 2000;
-    if (getenv("MK_MULTI_PARTS")) {
-        // Each op alone in the multi-op kernel shape, and the IQ4_XS op at its native 32-thread blocks.
-        using OpB32 = mk_mmvq<32, GGML_TYPE_IQ4_XS, 1, false, false, 0, true>;
-        auto t_a   = [&] { k_multi_typed<BLOCK, OpA, OpB><<<nba, BLOCK, 0, stream>>>(pa, recs[1].n_tiles, nba, pb, 0); };
-        auto t_b   = [&] { k_multi_typed<BLOCK, OpA, OpB><<<nbb, BLOCK, 0, stream>>>(pa, 0, 0, pb, recs[2].n_tiles); };
-        auto t_aa  = [&] { k_multi_typed<BLOCK, OpA, OpA><<<nba, BLOCK, 0, stream>>>(pa, recs[1].n_tiles, nba, pa, 0); };
-        using OpA8 = mk_mmvq<256, GGML_TYPE_Q6_K, 1, false, false, 0, true>;
-        auto t_dir1 = [&] { k_direct<OpA8, 1><<<nba, 256, 0, stream>>>(pa); };
-        auto t_dir0 = [&] { k_direct<OpA8, 0><<<nba, 256, 0, stream>>>(pa); };
-        auto t_run1 = [&] { k_run1<OpA8><<<nba, 256, 0, stream>>>(pa, nba); };
-        auto t_fast_a = [&] { k_multi_fast<BLOCK, OpA, OpB><<<nba, BLOCK, 0, stream>>>(pa, recs[1].n_tiles, nba, pb, 0); };
-        auto t_fast   = [&] { k_multi_fast<BLOCK, OpA, OpB><<<nba + nbb, BLOCK, 0, stream>>>(pa, recs[1].n_tiles, nba, pb, recs[2].n_tiles); };
-        auto t_sep    = [&] { k_direct<OpA8, 1><<<nba, 256, 0, stream>>>(pa); k_direct<mk_mmvq<32, GGML_TYPE_IQ4_XS, 1, false, false, 0, true>, 1><<<recs[2].n_tiles, 32, 0, stream>>>(pb); };
-        auto t_b32 = [&] { k_multi_typed<32, OpB32, OpB32><<<recs[2].n_tiles, 32, 0, stream>>>(pb, recs[2].n_tiles, recs[2].n_tiles, pb, 0); };
-        for (auto & [f, name] : std::vector<std::pair<std::function<void()>, const char *>>{ {t_a, "Q6_K op alone, BLOCK 256"}, {t_aa, "Q6_K op, kernel of Q6_K only"}, {t_dir1, "Q6_K block(), bounds(256,1)"}, {t_fast_a, "Q6_K in fast 2-op kernel"}, {t_fast, "both ops, fast 2-op kernel"}, {t_sep, "both ops, 2 direct kernels"}, {t_dir0, "Q6_K block(), bounds(256)"}, {t_run1, "Q6_K run(), bounds(256,1)"}, {t_b, "IQ4_XS op alone, BLOCK 256"}, {t_b32, "IQ4_XS op alone, BLOCK 32"} }) {
-            const float ms = gpu_time_ms(stream, 60000, name, [&] { for (int i = 0; i < 500; ++i) { f(); } });
-            printf("multi parts: %-28s %.1f us\n", name, 1000.0f*ms/500);
-        }
-    }
     for (int rep = 0; rep < 3; ++rep) {
         ggml_backend_synchronize(pc.backend);
         auto t0 = std::chrono::steady_clock::now();

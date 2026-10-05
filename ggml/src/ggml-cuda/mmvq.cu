@@ -2415,6 +2415,23 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
     }
 }
 
+// Block blk of a multi-op launch runs BLOCK/Op::threads one-row tiles of Op.
+template <int BLOCK, typename Op>
+static __device__ __forceinline__ void mmvq_multi_tile(const mk_mmvq_params & p, const uint32_t nt, const uint32_t blk, char * lds) {
+    constexpr int nsub = BLOCK / Op::threads;
+    const int sub   = threadIdx.x / Op::threads;
+    const int local = threadIdx.x % Op::threads;
+    const uint32_t tile = __builtin_amdgcn_readfirstlane(blk*nsub + sub);
+    Op::block(p, tile < nt ? tile : nt - 1, 0, 0, local % WARP_SIZE, __builtin_amdgcn_readfirstlane(local / WARP_SIZE),
+              tile < nt, lds + sub*Op::lds_bytes);
+}
+
+// block counts come from the launcher's own block sizes (host code cannot see the device mmvq table)
+static uint32_t mmvq_multi_blocks(const ggml_cuda_mmvq_capture & c, const int block) {
+    const int per_block = block / c.threads;
+    return (c.grid_x + per_block - 1) / per_block;
+}
+
 // Two independent decode matvecs in one launch: the first blocks run op A, the rest op B, each block taking
 // BLOCK/threads one-row tiles of its op. (BLOCK, 1) bounds and direct block coordinates keep the matvec codegen
 // as in the standalone kernels; each op's arithmetic is unchanged.
@@ -2423,19 +2440,10 @@ static __global__ void __launch_bounds__(BLOCK, 1) mmvq_pair(
         const mk_mmvq_params pa, const uint32_t nta, const uint32_t nba, const mk_mmvq_params pb, const uint32_t ntb) {
     constexpr int lds_a = BLOCK/OpA::threads*OpA::lds_bytes, lds_b = BLOCK/OpB::threads*OpB::lds_bytes;
     __shared__ __align__(16) char lds[(lds_a > lds_b ? lds_a : lds_b) + 16];
-    auto go = [&](auto op, const mk_mmvq_params & p, const uint32_t nt, const uint32_t blk) {
-        using Op = decltype(op);
-        constexpr int nsub = BLOCK / Op::threads;
-        const int sub   = threadIdx.x / Op::threads;
-        const int local = threadIdx.x % Op::threads;
-        const uint32_t tile = __builtin_amdgcn_readfirstlane(blk*nsub + sub);
-        Op::block(p, tile < nt ? tile : nt - 1, 0, 0, local % WARP_SIZE, __builtin_amdgcn_readfirstlane(local / WARP_SIZE),
-                  tile < nt, lds + sub*Op::lds_bytes);
-    };
     if (blockIdx.x < nba) {
-        go(OpA{}, pa, nta, blockIdx.x);
+        mmvq_multi_tile<BLOCK, OpA>(pa, nta, blockIdx.x, lds);
     } else {
-        go(OpB{}, pb, ntb, blockIdx.x - nba);
+        mmvq_multi_tile<BLOCK, OpB>(pb, ntb, blockIdx.x - nba, lds);
     }
 }
 
@@ -2468,8 +2476,8 @@ void ggml_cuda_mmvq_launch_pair(const ggml_cuda_mmvq_capture & a, const ggml_cud
     memcpy(&pb, b.params, sizeof(pb));
     auto launch = [&](auto block_c, auto op_a, auto op_b) {
         constexpr int BLOCK = decltype(block_c)::value;
-        const uint32_t nba = (a.grid_x + BLOCK/a.threads - 1) / (BLOCK/a.threads);
-        const uint32_t nbb = (b.grid_x + BLOCK/b.threads - 1) / (BLOCK/b.threads);
+        const uint32_t nba = mmvq_multi_blocks(a, BLOCK);
+        const uint32_t nbb = mmvq_multi_blocks(b, BLOCK);
         mmvq_pair<BLOCK, decltype(op_a), decltype(op_b)><<<nba + nbb, BLOCK, 0, stream>>>(pa, a.grid_x, nba, pb, b.grid_x);
     };
     using I32 = std::integral_constant<int, 32>;
@@ -2494,21 +2502,12 @@ static __global__ void __launch_bounds__(BLOCK, 1) mmvq_triple(
     constexpr int la = BLOCK/OpA::threads*OpA::lds_bytes, lb = BLOCK/OpB::threads*OpB::lds_bytes, lc = BLOCK/OpC::threads*OpC::lds_bytes;
     constexpr int lab = la > lb ? la : lb;
     __shared__ __align__(16) char lds[(lab > lc ? lab : lc) + 16];
-    auto go = [&](auto op, const mk_mmvq_params & p, const uint32_t nt, const uint32_t blk) {
-        using Op = decltype(op);
-        constexpr int nsub = BLOCK / Op::threads;
-        const int sub   = threadIdx.x / Op::threads;
-        const int local = threadIdx.x % Op::threads;
-        const uint32_t tile = __builtin_amdgcn_readfirstlane(blk*nsub + sub);
-        Op::block(p, tile < nt ? tile : nt - 1, 0, 0, local % WARP_SIZE, __builtin_amdgcn_readfirstlane(local / WARP_SIZE),
-                  tile < nt, lds + sub*Op::lds_bytes);
-    };
     if (blockIdx.x < nba) {
-        go(OpA{}, pa, nta, blockIdx.x);
+        mmvq_multi_tile<BLOCK, OpA>(pa, nta, blockIdx.x, lds);
     } else if (blockIdx.x < nba + nbb) {
-        go(OpB{}, pb, ntb, blockIdx.x - nba);
+        mmvq_multi_tile<BLOCK, OpB>(pb, ntb, blockIdx.x - nba, lds);
     } else {
-        go(OpC{}, pc, ntc, blockIdx.x - nba - nbb);
+        mmvq_multi_tile<BLOCK, OpC>(pc, ntc, blockIdx.x - nba - nbb, lds);
     }
 }
 
@@ -2539,10 +2538,9 @@ void ggml_cuda_mmvq_launch_triple(const ggml_cuda_mmvq_capture & a, const ggml_c
     memcpy(&pb, b.params, sizeof(pb));
     memcpy(&pc, c.params, sizeof(pc));
     constexpr int BLOCK = 256;
-    // block counts come from the launcher's own block sizes (host code cannot see the device mmvq table)
-    const uint32_t nba = (a.grid_x + BLOCK/a.threads - 1) / (BLOCK/a.threads);
-    const uint32_t nbb = (b.grid_x + BLOCK/b.threads - 1) / (BLOCK/b.threads);
-    const uint32_t nbc = (c.grid_x + BLOCK/c.threads - 1) / (BLOCK/c.threads);
+    const uint32_t nba = mmvq_multi_blocks(a, BLOCK);
+    const uint32_t nbb = mmvq_multi_blocks(b, BLOCK);
+    const uint32_t nbc = mmvq_multi_blocks(c, BLOCK);
     auto launch = [&](auto t_c) {
         constexpr int T = decltype(t_c)::value;
         using OpA = mk_mmvq<BLOCK, GGML_TYPE_IQ4_XS, T, false, false, 0, true>;

@@ -15,7 +15,7 @@ static bool gdn_gates_is_f32_vec(const ggml_tensor * t, const int64_t n) {
     return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == n;
 }
 
-bool ggml_cuda_gdn_gates_prepare(const ggml_cgraph * cgraph, const int i, mk_gdn_gates_params & p_out, int & n_blocks_out) {
+bool ggml_cuda_gdn_gates_prepare(const ggml_cgraph * cgraph, const int i, mk_gdn_gates_params & p_out) {
     static const bool disabled = getenv("GGML_CUDA_DISABLE_GDN_GATES_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_GDN_GATES_FUSION")) != 0;
     if (disabled || i + 8 >= cgraph->n_nodes) {
         return false;
@@ -76,14 +76,12 @@ bool ggml_cuda_gdn_gates_prepare(const ggml_cgraph * cgraph, const int i, mk_gdn
         (const float *) A->data, (float *) mul->data, (float *) sig->data, (int) K, (int) H,
         (int64_t) w_a->nb[1], (int64_t) w_b->nb[1], (int64_t) (x->nb[1]/sizeof(float)), H, H, (int) T, nullptr,
     };
-    n_blocks_out = (int) (2*H*T);
     return true;
 }
 
 int ggml_cuda_try_fuse_gdn_gates(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
     mk_gdn_gates_params p;
-    int n_blocks = 0;
-    if (!ggml_cuda_gdn_gates_prepare(cgraph, i, p, n_blocks)) {
+    if (!ggml_cuda_gdn_gates_prepare(cgraph, i, p)) {
         return 0;
     }
     k_gdn_gates<<<dim3((unsigned) (2*p.H), (unsigned) p.n_tokens), mk_gdn_gates<256>::threads, 0, ctx.stream()>>>(p);

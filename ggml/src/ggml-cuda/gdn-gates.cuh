@@ -8,5 +8,5 @@
 // Returns the number of extra graph nodes consumed (0 if the window does not match).
 int ggml_cuda_try_fuse_gdn_gates(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 
-// The same checks without launching: fills the params and the block count (one block per gates tile).
-bool ggml_cuda_gdn_gates_prepare(const ggml_cgraph * cgraph, int i, mk_gdn_gates_params & p, int & n_blocks);
+// The same checks without launching: fills the params.
+bool ggml_cuda_gdn_gates_prepare(const ggml_cgraph * cgraph, int i, mk_gdn_gates_params & p);

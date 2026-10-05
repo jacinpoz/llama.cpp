@@ -2507,6 +2507,16 @@ static ggml_cuda_mm_kernel ggml_cuda_mul_mat_kernel(ggml_backend_cuda_context & 
     return ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0) ? GGML_CUDA_MM_MMQ : GGML_CUDA_MM_OTHER;
 }
 
+static bool ggml_cuda_multi_op() {
+    static const bool enabled = getenv("GGML_CUDA_MULTI_OP") != nullptr;
+    return enabled;
+}
+
+static bool ggml_cuda_fuse_debug() {
+    static const bool enabled = getenv("GGML_CUDA_FUSE_DEBUG") != nullptr;
+    return enabled;
+}
+
 static bool ggml_cuda_verify_norm_q8() {
     static const bool enabled = getenv("GGML_CUDA_VERIFY_NORM_Q8") != nullptr && atoi(getenv("GGML_CUDA_VERIFY_NORM_Q8")) != 0;
     return enabled;
@@ -4771,7 +4781,7 @@ static bool ggml_cuda_try_elide_gdn_state_gather(const ggml_cgraph * cgraph, con
 // launch at the qkv node. Returns z's node index, or -1. z is then written early into a private buffer
 // (ggml_cuda_redirect_early_output), since the graph allocator reuses z's own bytes until z's node.
 static int ggml_cuda_find_mmvq_pair(const ggml_cgraph * cgraph, const int i_qkv, const int i_last_fused) {
-    static const bool enabled = getenv("GGML_CUDA_MULTI_OP") != nullptr;
+    const bool enabled = ggml_cuda_multi_op();
     static const bool dbg = getenv("GGML_CUDA_MULTI_OP_DEBUG") != nullptr;
     const ggml_tensor * qkv = cgraph->nodes[i_qkv];
     if (!enabled || (qkv->src[0]->type != GGML_TYPE_Q6_K && qkv->src[0]->type != GGML_TYPE_IQ4_XS) ||
@@ -5163,43 +5173,29 @@ static thread_local std::unordered_set<const ggml_tensor *> g_precomputed_nodes;
 static thread_local std::vector<std::pair<ggml_tensor *, void *>> g_redirected;
 static thread_local int g_redirect_slot = 0;
 
-static void ggml_cuda_redirect_early_output(ggml_cgraph * cgraph, ggml_tensor * t) {
-    static std::vector<std::pair<void *, size_t>> buffers; // per slot, kept: captured graphs keep using them
+// `from` is the current node: t and its views (view_src is always the root) all come after it.
+static void ggml_cuda_redirect_early_output(ggml_cgraph * cgraph, int from, ggml_tensor * t) {
+    static std::vector<std::pair<void *, size_t>> buffers[GGML_CUDA_MAX_DEVICES]; // kept: captured graphs keep using them
+    const int device = ggml_cuda_get_device();
     const size_t nbytes = ggml_nbytes(t);
-    if ((size_t) g_redirect_slot >= buffers.size()) {
-        buffers.emplace_back(nullptr, 0);
+    if ((size_t) g_redirect_slot >= buffers[device].size()) {
+        buffers[device].emplace_back(nullptr, 0);
     }
-    auto & buf = buffers[g_redirect_slot++];
+    auto & buf = buffers[device][g_redirect_slot++];
     if (buf.second < nbytes) {
         // a wider batch needs more; the old buffer stays allocated because captured graphs may still use it
-        CUDA_CHECK(cudaMalloc(&buf.first, nbytes));
+        CUDA_CHECK(ggml_cuda_device_malloc(&buf.first, nbytes, device));
         buf.second = nbytes;
     }
     char * old_base = (char *) t->data;
     auto patch = [&](ggml_tensor * v) {
-        if (v == nullptr) {
-            return;
-        }
-        const ggml_tensor * root = v;
-        while (root->view_src != nullptr) {
-            root = root->view_src;
-        }
-        if (root != t && v != t) {
-            return;
-        }
-        for (const auto & r : g_redirected) {
-            if (r.first == v) {
-                return;
-            }
-        }
         g_redirected.emplace_back(v, v->data);
         v->data = (char *) buf.first + ((char *) v->data - old_base);
     };
     patch(t);
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        patch(cgraph->nodes[i]);
-        for (int sidx = 0; sidx < GGML_MAX_SRC; ++sidx) {
-            patch(cgraph->nodes[i]->src[sidx]);
+    for (int k = from; k < cgraph->n_nodes; ++k) {
+        if (cgraph->nodes[k]->view_src == t) {
+            patch(cgraph->nodes[k]);
         }
     }
 }
@@ -5336,9 +5332,8 @@ static int ggml_cuda_try_fuse_gdn_out_gate(ggml_backend_cuda_context & ctx, ggml
 // Path F: the attention q (IQ4_XS) projection and the k and v (Q8_0) projections read the same normed input;
 // at q's node all three run as one launch, k and v into private buffers (they are written before their nodes).
 static int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
-    static const bool enabled = getenv("GGML_CUDA_MULTI_OP") != nullptr;
     ggml_tensor * q = cgraph->nodes[i];
-    if (!enabled || q->op != GGML_OP_MUL_MAT || q->src[0]->type != GGML_TYPE_IQ4_XS || q->ne[1] < 1 || q->ne[1] > MMVQ_MAX_BATCH_SIZE ||
+    if (!ggml_cuda_multi_op() || q->op != GGML_OP_MUL_MAT || q->src[0]->type != GGML_TYPE_IQ4_XS || q->ne[1] > MMVQ_MAX_BATCH_SIZE ||
             q->ne[2] != 1 || q->src[2] != nullptr) {
         return 0;
     }
@@ -5353,13 +5348,17 @@ static int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgrap
             kv[n_kv++] = n;
         }
     }
-    if (n_kv != 2 || ggml_cuda_mul_mat_kernel(ctx, q->src[0], q->src[1], q) != GGML_CUDA_MM_MMVQ) {
-        static const bool dbg = getenv("GGML_CUDA_FUSE_DEBUG") != nullptr;
-        if (dbg) { fprintf(stderr, "fuse-debug: triple at %s rejected: n_kv %d kernel %d\n", q->name, n_kv, (int) ggml_cuda_mul_mat_kernel(ctx, q->src[0], q->src[1], q)); }
+    const auto is_mmvq = [&](const ggml_tensor * m) {
+        return ggml_cuda_mul_mat_kernel(ctx, m->src[0], m->src[1], m) == GGML_CUDA_MM_MMVQ;
+    };
+    if (n_kv != 2 || !is_mmvq(q) || !is_mmvq(kv[0]) || !is_mmvq(kv[1])) {
+        if (ggml_cuda_fuse_debug()) {
+            fprintf(stderr, "fuse-debug: triple at %s rejected: n_kv %d q mmvq %d\n", q->name, n_kv, (int) is_mmvq(q));
+        }
         return 0;
     }
-    ggml_cuda_redirect_early_output(cgraph, kv[0]);
-    ggml_cuda_redirect_early_output(cgraph, kv[1]);
+    ggml_cuda_redirect_early_output(cgraph, i, kv[0]);
+    ggml_cuda_redirect_early_output(cgraph, i, kv[1]);
     ggml_cuda_mmvq_capture cap[3];
     ggml_tensor * mm[3] = { q, kv[0], kv[1] };
     for (int m = 0; m < 3; ++m) {
@@ -5663,8 +5662,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if ((quantize || ggml_cuda_verify_norm_q8()) && ggml_cuda_op_add_rms_norm_q8_1(*cuda_ctx, node, norm, mul, quantize)) {
             return 2;
         }
-        static const bool dbg_v1 = getenv("GGML_CUDA_FUSE_DEBUG") != nullptr;
-        if (dbg_v1) { fprintf(stderr, "fuse-debug: add+norm %s not fused (quantize %d, verify_norm_q8 %d)\n", node->name, (int) quantize, (int) ggml_cuda_verify_norm_q8()); }
+        if (ggml_cuda_fuse_debug()) { fprintf(stderr, "fuse-debug: add+norm %s not fused (quantize %d, verify_norm_q8 %d)\n", node->name, (int) quantize, (int) ggml_cuda_verify_norm_q8()); }
     }
 
     // rms_norm + norm-weight MUL whose output feeds an mmvq matmul: fold the
@@ -6023,7 +6021,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_mmvq_capture cap_qkv, cap_z;
                 ggml_cuda_mmvq_set_capture(&cap_qkv);
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], node->src[2], qkv_dst, fusion);
-                ggml_cuda_redirect_early_output(cgraph, z);
+                ggml_cuda_redirect_early_output(cgraph, i, z);
                 ggml_cuda_mmvq_set_capture(&cap_z);
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, z->src[0], z->src[1], z->src[2], z, nullptr);
                 ggml_cuda_mmvq_set_capture(nullptr);
@@ -6044,10 +6042,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], node->src[2], qkv_dst, fusion);
             }
             if (conv_fused) {
-                // Path F: the gate projections read the same normed input, so they can share the conv launch.
-                static const bool multi_op = getenv("GGML_CUDA_MULTI_OP") != nullptr;
                 int g = -1;
-                for (int k = j + 1; multi_op && k < std::min(cgraph->n_nodes - 8, j + 48); ++k) {
+                for (int k = j + 1; ggml_cuda_multi_op() && k < std::min(cgraph->n_nodes - 8, j + 48); ++k) {
                     const ggml_tensor * n = cgraph->nodes[k];
                     if (n->op == GGML_OP_MUL_MAT && n->src[1] == node->src[1] && (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
                         g = k;
@@ -6055,13 +6051,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     }
                 }
                 mk_gdn_gates_params gates_p;
-                int gates_blocks = 0;
-                if (g >= 0) {
-                    // outputs first: the gates are written before their nodes, into private buffers
-                    ggml_cuda_redirect_early_output(cgraph, cgraph->nodes[g + 4]);
-                    ggml_cuda_redirect_early_output(cgraph, cgraph->nodes[g + 8]);
-                }
-                if (g >= 0 && ggml_cuda_gdn_gates_prepare(cgraph, g, gates_p, gates_blocks)) {
+                if (g >= 0 && ggml_cuda_gdn_gates_prepare(cgraph, g, gates_p)) {
+                    ggml_cuda_redirect_early_output(cgraph, i, cgraph->nodes[g + 4]);
+                    ggml_cuda_redirect_early_output(cgraph, i, cgraph->nodes[g + 8]);
+                    gates_p.gate = (float *) cgraph->nodes[g + 4]->data;
+                    gates_p.beta = (float *) cgraph->nodes[g + 8]->data;
                     ggml_cuda_gdn_conv_gates(conv_plan.p, gates_p, cuda_ctx->stream());
                     for (int k = g; k <= g + 8; ++k) {
                         g_precomputed_nodes.insert(cgraph->nodes[k]);
