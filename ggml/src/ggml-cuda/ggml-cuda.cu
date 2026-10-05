@@ -5236,7 +5236,8 @@ static int ggml_cuda_try_fuse_gdn_out_gate(ggml_backend_cuda_context & ctx, ggml
 static int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
     static const bool enabled = getenv("GGML_CUDA_MULTI_OP") != nullptr;
     ggml_tensor * q = cgraph->nodes[i];
-    if (!enabled || q->op != GGML_OP_MUL_MAT || q->src[0]->type != GGML_TYPE_IQ4_XS || q->ne[1] != 1 || q->src[2] != nullptr) {
+    if (!enabled || q->op != GGML_OP_MUL_MAT || q->src[0]->type != GGML_TYPE_IQ4_XS || q->ne[1] < 1 || q->ne[1] > MMVQ_MAX_BATCH_SIZE ||
+            q->ne[2] != 1 || q->src[2] != nullptr) {
         return 0;
     }
     ggml_tensor * kv[2] = { nullptr, nullptr };
@@ -5244,13 +5245,13 @@ static int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgrap
     for (int k = i + 1; k < std::min(cgraph->n_nodes, i + 24) && n_kv < 2; ++k) {
         ggml_tensor * n = cgraph->nodes[k];
         if (n->op == GGML_OP_MUL_MAT && n->src[1] == q->src[1] && (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-            if (n->src[0]->type != GGML_TYPE_Q8_0 || n->ne[1] != 1 || n->src[2] != nullptr) {
+            if (n->src[0]->type != GGML_TYPE_Q8_0 || n->ne[1] != q->ne[1] || n->ne[2] != 1 || n->src[2] != nullptr) {
                 return 0;
             }
             kv[n_kv++] = n;
         }
     }
-    if (n_kv != 2 || !ggml_cuda_should_fuse_mul_mat_vec_q(q)) {
+    if (n_kv != 2 || ggml_cuda_mul_mat_kernel(ctx, q->src[0], q->src[1], q) != GGML_CUDA_MM_MMVQ) {
         return 0;
     }
     ggml_cuda_redirect_early_output(cgraph, kv[0]);
