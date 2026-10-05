@@ -10,6 +10,7 @@
 
 #include "mmvq-common.cuh"
 #include "mk-ops-ffn.cuh"
+#include "ggml-cuda-try-fuse.cuh"
 
 // Per-architecture maximum batch size for which MMVQ should be used for MUL_MAT_ID.
 // Returns a value <= MMVQ_MAX_BATCH_SIZE. Default is MMVQ_MAX_BATCH_SIZE.
@@ -772,6 +773,12 @@ static bool ggml_cuda_mmvq_cat2_ok(ggml_type type, ggml_type type_b, int cc) {
            (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS);
 }
 
+static thread_local ggml_cuda_mmvq_capture * g_mmvq_capture = nullptr;
+
+void ggml_cuda_mmvq_set_capture(ggml_cuda_mmvq_capture * cap) {
+    g_mmvq_capture = cap;
+}
+
 template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false, bool small_m = false>
 static void mul_mat_vec_q_switch_fusion_ksplit(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -785,7 +792,10 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
                             fusion.conv_input != nullptr;
-    if (g_mk_recording != nullptr) {
+    // the megakernel op has no small_m, row loop or row concat form: those launches are neither captured nor replayable
+    const bool mk_form = !small_k && !halve_iters && rows_per_block == 0 && !small_m && nrows_loop == 0 &&
+                         fusion.cat_dst[0] == nullptr;
+    if (g_mk_recording != nullptr || (g_mmvq_capture != nullptr && mk_form)) {
         mk_mmvq_params p;
         p.vx                 = vx;
         p.vy                 = vy;
@@ -807,11 +817,21 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
         p.stride_sample_dst  = stride_sample_dst;
         p.nblocks_x          = block_nums.x;
         p.nchannels_dst      = block_nums.y;
-        // the megakernel op has no small_m, row loop or row concat form: those launches are recorded as not replayable
-        const bool replayable = !small_k && !halve_iters && rows_per_block == 0 && !small_m && nrows_loop == 0 &&
-                                fusion.cat_dst[0] == nullptr;
-        mk_record(MK_OP_MMVQ, mk_mmvq_variant(type, c_ncols_dst, c_ncols_dst == 1 && has_fusion, long_k),
-                  replayable ? (int64_t) block_nums.x*block_nums.y*block_nums.z : -1, (int) (block_dims.x*block_dims.y), p);
+        const int variant = mk_mmvq_variant(type, c_ncols_dst, c_ncols_dst == 1 && has_fusion, long_k);
+        if (g_mmvq_capture != nullptr && mk_form) {
+            static_assert(sizeof(p) <= sizeof(g_mmvq_capture->params), "capture buffer too small");
+            g_mmvq_capture->valid   = true;
+            g_mmvq_capture->variant = variant;
+            g_mmvq_capture->grid_x  = block_nums.x;
+            g_mmvq_capture->grid_y  = block_nums.y;
+            g_mmvq_capture->grid_z  = block_nums.z;
+            g_mmvq_capture->threads = block_dims.x*block_dims.y;
+            memcpy(g_mmvq_capture->params, &p, sizeof(p));
+            GGML_UNUSED(ids_stride);
+            return;
+        }
+        mk_record(MK_OP_MMVQ, variant, mk_form ? (int64_t) block_nums.x*block_nums.y*block_nums.z : -1,
+                  (int) (block_dims.x*block_dims.y), p);
     }
     if constexpr (c_ncols_dst == 1) {
         if (fusion.cat_dst[0] != nullptr) {
@@ -2611,6 +2631,56 @@ static const ggml_tensor * ggml_cuda_find_conv_state_cpy(const ggml_cgraph * cgr
     return nullptr;
 }
 
+// Path F: the GDN z projection reads the same normed input as the qkv projection, so both can run as one
+// launch at the qkv node. Returns z's node index, or -1. z is then written early, so no node in between may
+// touch z's output bytes or write z's input (the graph allocator reuses buffers).
+static int ggml_cuda_find_mmvq_pair(const ggml_cgraph * cgraph, const int i_qkv, const int i_last_fused) {
+    static const bool enabled = getenv("GGML_CUDA_MULTI_OP") != nullptr;
+    static const bool dbg = getenv("GGML_CUDA_MULTI_OP_DEBUG") != nullptr;
+    const ggml_tensor * qkv = cgraph->nodes[i_qkv];
+    if (!enabled || (qkv->src[0]->type != GGML_TYPE_Q6_K && qkv->src[0]->type != GGML_TYPE_IQ4_XS) ||
+            qkv->ne[1] != 1 || qkv->src[2] != nullptr) {
+        if (dbg && enabled) { fprintf(stderr, "mmvq pair: qkv %s rejected (type %s, ne1 %lld)\n", qkv->name, ggml_type_name(qkv->src[0]->type), (long long) qkv->ne[1]); }
+        return -1;
+    }
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        if (a == nullptr || b == nullptr || a->data == nullptr || b->data == nullptr) {
+            return false;
+        }
+        const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    const int end = std::min(cgraph->n_nodes, i_last_fused + 48);
+    for (int k = i_qkv + 1; k < end; ++k) {
+        const ggml_tensor * z = cgraph->nodes[k];
+        if (z->op != GGML_OP_MUL_MAT || z->src[1] != qkv->src[1]) {
+            continue;
+        }
+        // the small alpha/beta gate projections read the same input; keep looking for z
+        if (z->src[0]->type != GGML_TYPE_IQ4_XS || z->ne[1] != 1 || z->src[2] != nullptr ||
+                (z->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        for (int m = i_qkv + 1; m < k; ++m) {
+            const ggml_tensor * n = cgraph->nodes[m];
+            if (overlaps(n, z) || overlaps(n, z->src[1])) {
+                if (dbg) { fprintf(stderr, "mmvq pair: %s blocked by node %d %s (%s)\n", z->name, m, n->name, ggml_op_name(n->op)); }
+                return -1;
+            }
+            for (int sidx = 0; sidx < GGML_MAX_SRC; ++sidx) {
+                if (overlaps(n->src[sidx], z)) {
+                    if (dbg) { fprintf(stderr, "mmvq pair: %s blocked by src of node %d %s\n", z->name, m, n->name); }
+                    return -1;
+                }
+            }
+        }
+        return k;
+    }
+    if (dbg) { fprintf(stderr, "mmvq pair: no z found after %s (searched to %d)\n", qkv->name, end); }
+    return -1;
+}
+
+
 // SSM conv-input fusion: the qkv_mixed MUL_MAT output feeds the last row of an interleaved
 // [conv_kernel_size, channels] conv input (via view nodes and a dim-0 CONCAT); fold the concat into
 // the mmvq epilogue.  Returns the number of nodes to skip (j - i), 0 otherwise.
@@ -2640,6 +2710,37 @@ int ggml_cuda_ssm_conv_in_try_fuse(ggml_backend_cuda_context & ctx, const ggml_c
             g_conv_elided_cpys.insert(cpy);
         }
         g_conv_state_srcs.erase(it);
+    }
+    const int k_z = ggml_cuda_find_mmvq_pair(cgraph, i, j);
+    if (k_z >= 0) {
+        ggml_tensor * z = cgraph->nodes[k_z];
+        ggml_cuda_mmvq_capture cap_qkv, cap_z;
+        ggml_cuda_mmvq_set_capture(&cap_qkv);
+        ggml_cuda_mul_mat_vec_q(ctx, node->src[0], node->src[1], node->src[2], node, &fusion_data);
+        ggml_cuda_mmvq_set_capture(&cap_z);
+        ggml_cuda_mul_mat_vec_q(ctx, z->src[0], z->src[1], z->src[2], z, nullptr);
+        ggml_cuda_mmvq_set_capture(nullptr);
+        if (ggml_cuda_mmvq_pair_supported(cap_qkv, cap_z)) {
+            ggml_cuda_mmvq_launch_pair(cap_qkv, cap_z, ctx.stream());
+            g_precomputed_nodes.insert(z);
+            return j - i;
+        }
+        if (!cap_qkv.valid && !cap_z.valid) {
+            // neither went through the capturable launcher, so both already ran normally
+            g_precomputed_nodes.insert(z);
+            return j - i;
+        }
+        if (cap_z.valid && !cap_qkv.valid) {
+            // qkv already ran through another launcher; z was only captured, so run it now
+            ggml_cuda_mul_mat_vec_q(ctx, z->src[0], z->src[1], z->src[2], z, nullptr);
+            g_precomputed_nodes.insert(z);
+            return j - i;
+        }
+        if (cap_qkv.valid && !cap_z.valid) {
+            // z already ran; qkv was only captured and runs below
+            g_precomputed_nodes.insert(z);
+        }
+        // captured but not pairable: whatever was captured has not run yet; qkv runs below, z stays in place
     }
     ggml_cuda_mul_mat_vec_q(ctx, node->src[0], node->src[1], node->src[2], node, &fusion_data);
     return j - i;
@@ -3199,4 +3300,74 @@ void ggml_cuda_glu_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_cgraph 
         ctx.glu_q8_1_node = node;
         ctx.glu_q8_1_mm   = mm;
     }
+}
+
+
+// Two independent decode matvecs in one launch: the first blocks run op A, the rest op B, each block taking
+// BLOCK/threads one-row tiles of its op. (BLOCK, 1) bounds and direct block coordinates keep the matvec codegen
+// as in the standalone kernels; each op's arithmetic is unchanged.
+template <int BLOCK, typename OpA, typename OpB>
+static __global__ void __launch_bounds__(BLOCK, 1) mmvq_pair(
+        const mk_mmvq_params pa, const uint32_t nta, const uint32_t nba, const mk_mmvq_params pb, const uint32_t ntb) {
+    constexpr int lds_a = BLOCK/OpA::threads*OpA::lds_bytes, lds_b = BLOCK/OpB::threads*OpB::lds_bytes;
+    __shared__ __align__(16) char lds[(lds_a > lds_b ? lds_a : lds_b) + 16];
+    auto go = [&](auto op, const mk_mmvq_params & p, const uint32_t nt, const uint32_t blk) {
+        using Op = decltype(op);
+        constexpr int nsub = BLOCK / Op::threads;
+        const int sub   = threadIdx.x / Op::threads;
+        const int local = threadIdx.x % Op::threads;
+        const uint32_t tile = __builtin_amdgcn_readfirstlane(blk*nsub + sub);
+        Op::block(p, tile < nt ? tile : nt - 1, 0, 0, local % WARP_SIZE, __builtin_amdgcn_readfirstlane(local / WARP_SIZE),
+                  tile < nt, lds + sub*Op::lds_bytes);
+    };
+    if (blockIdx.x < nba) {
+        go(OpA{}, pa, nta, blockIdx.x);
+    } else {
+        go(OpB{}, pb, ntb, blockIdx.x - nba);
+    }
+}
+
+// Supported pairs: the Qwen3.5/3.8 GDN qkv projection (IQ4_XS, or Q6_K in one layer; with or without the conv
+// epilogue) with the z projection (IQ4_XS), all one token.
+static int mmvq_pair_kind(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b) {
+    if (!a.valid || !b.valid || a.grid_y != 1 || a.grid_z != 1 || b.grid_y != 1 || b.grid_z != 1 ||
+            b.variant != mk_mmvq_variant(GGML_TYPE_IQ4_XS, 1, false, true) || b.threads != 32) {
+        return -1;
+    }
+    for (const bool fused : { false, true }) {
+        if (a.variant == mk_mmvq_variant(GGML_TYPE_IQ4_XS, 1, fused, true) && a.threads == 32) {
+            return fused ? 1 : 0;
+        }
+        if (a.variant == mk_mmvq_variant(GGML_TYPE_Q6_K, 1, fused, true) && a.threads == 256) {
+            return fused ? 3 : 2;
+        }
+    }
+    return -1;
+}
+
+bool ggml_cuda_mmvq_pair_supported(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return mmvq_pair_kind(a, b) >= 0 && get_device_table_id(cc) == MMVQ_PARAMETERS_RDNA3_0;
+}
+
+void ggml_cuda_mmvq_launch_pair(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, cudaStream_t stream) {
+    mk_mmvq_params pa, pb;
+    memcpy(&pa, a.params, sizeof(pa));
+    memcpy(&pb, b.params, sizeof(pb));
+    auto launch = [&](auto block_c, auto op_a, auto op_b) {
+        constexpr int BLOCK = decltype(block_c)::value;
+        const uint32_t nba = (a.grid_x + BLOCK/a.threads - 1) / (BLOCK/a.threads);
+        const uint32_t nbb = (b.grid_x + BLOCK/b.threads - 1) / (BLOCK/b.threads);
+        mmvq_pair<BLOCK, decltype(op_a), decltype(op_b)><<<nba + nbb, BLOCK, 0, stream>>>(pa, a.grid_x, nba, pb, b.grid_x);
+    };
+    using I32 = std::integral_constant<int, 32>;
+    using I256 = std::integral_constant<int, 256>;
+    switch (mmvq_pair_kind(a, b)) {
+        case 0: launch(I32{},  mk_mmvq<32,  GGML_TYPE_IQ4_XS, 1, false, false, 0, true>{}, mk_mmvq<32,  GGML_TYPE_IQ4_XS, 1, false, false, 0, true>{}); break;
+        case 1: launch(I32{},  mk_mmvq<32,  GGML_TYPE_IQ4_XS, 1, true,  false, 0, true>{}, mk_mmvq<32,  GGML_TYPE_IQ4_XS, 1, false, false, 0, true>{}); break;
+        case 2: launch(I256{}, mk_mmvq<256, GGML_TYPE_Q6_K,   1, false, false, 0, true>{}, mk_mmvq<256, GGML_TYPE_IQ4_XS, 1, false, false, 0, true>{}); break;
+        case 3: launch(I256{}, mk_mmvq<256, GGML_TYPE_Q6_K,   1, true,  false, 0, true>{}, mk_mmvq<256, GGML_TYPE_IQ4_XS, 1, false, false, 0, true>{}); break;
+        default: GGML_ABORT("mmvq pair: unsupported pair");
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
