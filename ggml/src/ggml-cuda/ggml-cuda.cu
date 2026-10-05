@@ -7129,7 +7129,7 @@ static const ggml_tensor * ggml_cuda_view_root(const ggml_tensor * t) {
 
 
 // The verify-GDN rewrites move reads and writes across nodes, so they stay off while the graph runs on several streams.
-static thread_local bool g_verify_gdn_single_stream = false;
+thread_local bool g_verify_gdn_single_stream = false;
 
 // GGML_CUDA_VERIFY_GDN_STATE: 1 = both verify-band GDN rewrites, 2 = only the recurrent state, 3 = only the conv.
 static int ggml_cuda_verify_gdn_state_env() {

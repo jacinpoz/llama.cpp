@@ -1413,7 +1413,8 @@ int ggml_cuda_add_rms_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_
         break;
     }
     // With GGML_CUDA_VERIFY_NORM_Q8=1 the ADD folds into the norm even without an mmvq consumer (final norm via GET_ROWS).
-    if ((quantize || (ggml_cuda_verify_norm_q8() && node->ne[1] > 1)) && ggml_cuda_op_add_rms_norm_q8_1(ctx, node, norm, mul, quantize)) {
+    static const bool q8_1_verify = [] { const char * e = getenv("GGML_CUDA_FUSE_Q8_1_VERIFY"); return e == nullptr || atoi(e) != 0; }();
+    if ((quantize || (ggml_cuda_verify_norm_q8() && q8_1_verify && node->ne[1] > 1)) && ggml_cuda_op_add_rms_norm_q8_1(ctx, node, norm, mul, quantize)) {
         return 2;
     }
     static const bool dbg_v1 = getenv("GGML_CUDA_FUSE_DEBUG") != nullptr;
