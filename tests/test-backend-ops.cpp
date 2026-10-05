@@ -5546,6 +5546,27 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// orthonormal Sylvester Hadamard matrix, as the KV cache rotation uses
+static void init_tensor_hadamard(ggml_tensor * t) {
+    const int64_t n_cols = t->ne[0];
+    const int64_t n_rows = ggml_nrows(t);
+    std::vector<float> data(n_cols * n_rows);
+    float scale = 1.0f / sqrtf((float)n_cols);
+    for (int64_t r = 0; r < n_rows; r++) {
+        float * row_data = data.data() + r * n_cols;
+        for (int64_t i = 0; i < n_cols; i++) {
+            int pop = 0;
+            int64_t val = r & i;
+            while (val) {
+                pop += (val & 1);
+                val >>= 1;
+            }
+            row_data[i] = (pop % 2 == 0) ? scale : -scale;
+        }
+    }
+    ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+}
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -5570,23 +5591,7 @@ struct test_mul_mat_hadamard : public test_mul_mat {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "a") == 0) {
-                const int64_t n_cols = t->ne[0];
-                const int64_t n_rows = ggml_nrows(t);
-                std::vector<float> data(n_cols * n_rows);
-                float scale = 1.0f / sqrtf((float)n_cols);
-                for (int64_t r = 0; r < n_rows; r++) {
-                    float * row_data = data.data() + r * n_cols;
-                    for (int64_t i = 0; i < n_cols; i++) {
-                        int pop = 0;
-                        int64_t val = r & i;
-                        while (val) {
-                            pop += (val & 1);
-                            val >>= 1;
-                        }
-                        row_data[i] = (pop % 2 == 0) ? scale : -scale;
-                    }
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+                init_tensor_hadamard(t);
             } else if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
                 init_tensor_uniform(t);
             }
@@ -8454,6 +8459,209 @@ struct test_flash_attn_ext : public test_case {
 
     bool grad_precise() override {
         return true;
+    }
+};
+
+// Qwen3.5/3.8 attention head prep with KV rotation: RMS_NORM MUL ROPE(imrope) MUL_MAT(Hadamard 256), and for K also
+// RESHAPE VIEW SET_ROWS(q5_0). CUDA/HIP fuse each chain into one kernel.
+struct test_attn_head_prep : public test_case {
+    const int64_t n_head;
+    const int64_t n_tok;
+    const bool    set_rows;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ATTN_HEAD_PREP";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_head, n_tok, set_rows);
+    }
+
+    double max_nmse_err() override {
+        return set_rows ? 1e-4 : test_case::max_nmse_err();
+    }
+
+    test_attn_head_prep(int64_t n_head = 24, int64_t n_tok = 1, bool set_rows = false)
+        : n_head(n_head), n_tok(n_tok), set_rows(set_rows) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D = 256;
+
+        // the rows are a strided view of a wider projection, as Q is of the joint Q + gate projection
+        ggml_tensor * src = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*D, n_head, n_tok);
+        ggml_tensor * x   = ggml_view_3d(ctx, src, D, n_head, n_tok, src->nb[1], src->nb[2], 0);
+        ggml_tensor * w   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok*4);
+        ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, D);
+        ggml_set_name(rot, "hadamard");
+
+        int sections[4] = { 11, 11, 10, 0 };
+        ggml_tensor * cur = ggml_rms_norm(ctx, x, 1e-6f);
+        cur = ggml_mul(ctx, cur, w);
+        cur = ggml_rope_multi(ctx, cur, pos, nullptr, 64, sections, GGML_ROPE_TYPE_IMROPE, 262144, 1e7f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        cur = ggml_reshape_2d(ctx, cur, D, n_head*n_tok);
+        cur = ggml_mul_mat(ctx, rot, cur);
+        ggml_mul_mat_set_hint(cur, GGML_HINT_SRC0_IS_HADAMARD);
+        cur = ggml_reshape_3d(ctx, cur, D, n_head, n_tok);
+
+        if (set_rows) {
+            ggml_tensor * view  = ggml_view_2d(ctx, cur, D*n_head, n_tok, cur->nb[2], 0);
+            ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_Q5_0, D*n_head, 2*n_tok);
+            ggml_tensor * idx   = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tok);
+            cur = ggml_set_rows(ctx, cache, view, idx);
+        }
+
+        ggml_set_name(cur, "out");
+        return cur;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "hadamard") == 0) {
+                init_tensor_hadamard(t);
+            } else if (t->type == GGML_TYPE_I64) {
+                init_set_rows_row_ids(t, 2*n_tok);
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int32_t & value : data) {
+                    value = rand() % 4096;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// Qwen3.5/3.8 V path with KV rotation: MUL_MAT(Hadamard 64) RESHAPE VIEW SET_ROWS(q5_0).
+struct test_v_hadamard_set_rows : public test_case {
+    const int64_t n_head;
+    const int64_t n_tok;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "V_HADAMARD_SET_ROWS";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_head, n_tok);
+    }
+
+    double max_nmse_err() override {
+        return 1e-4;
+    }
+
+    test_v_hadamard_set_rows(int64_t n_head = 4, int64_t n_tok = 1)
+        : n_head(n_head), n_tok(n_tok) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D = 256;
+
+        ggml_tensor * v   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_head, n_tok);
+        ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_set_name(rot, "hadamard");
+
+        ggml_tensor * cur = ggml_reshape_2d(ctx, v, 64, ggml_nelements(v)/64);
+        cur = ggml_mul_mat(ctx, rot, cur);
+        ggml_mul_mat_set_hint(cur, GGML_HINT_SRC0_IS_HADAMARD);
+        cur = ggml_reshape_3d(ctx, cur, D, n_head, n_tok);
+
+        ggml_tensor * view  = ggml_view_2d(ctx, cur, D*n_head, n_tok, cur->nb[2], 0);
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_Q5_0, D*n_head, 2*n_tok);
+        ggml_tensor * idx   = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tok);
+        cur = ggml_set_rows(ctx, cache, view, idx);
+
+        ggml_set_name(cur, "out");
+        return cur;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "hadamard") == 0) {
+                init_tensor_hadamard(t);
+            } else if (t->type == GGML_TYPE_I64) {
+                init_set_rows_row_ids(t, 2*n_tok);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// Qwen3.5/3.8 gated attention: FLASH_ATTN_EXT, inverse V rotation (MUL_MAT Hadamard 64), x sigmoid(gate). With
+// GGML_HIP_FA_GQA_DEC=1 the tail is folded into the GQA decode combine kernel.
+struct test_attn_gated_tail : public test_case {
+    const int64_t   nh;     // KV heads
+    const int64_t   gqa;
+    const int64_t   kv;
+    const int64_t   nb;
+    const ggml_type type_KV;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ATTN_GATED_TAIL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(nh, gqa, kv, nb, type_KV);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_attn_gated_tail(int64_t nh = 4, int64_t gqa = 6, int64_t kv = 512, int64_t nb = 1, ggml_type type_KV = GGML_TYPE_Q5_0)
+        : nh(nh), gqa(gqa), kv(kv), nb(nb), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D      = 256;
+        const int64_t n_head = nh*gqa;
+
+        ggml_tensor * q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, nb, n_head, 1);
+        ggml_tensor * k0 = ggml_new_tensor_3d(ctx, type_KV, D, 2*kv, nh);
+        ggml_tensor * v0 = ggml_new_tensor_3d(ctx, type_KV, D, 2*kv, nh);
+        ggml_tensor * k  = ggml_view_3d(ctx, k0, D, kv, nh, k0->nb[1], k0->nb[2], 0);
+        ggml_tensor * v  = ggml_view_3d(ctx, v0, D, kv, nh, v0->nb[1], v0->nb[2], 0);
+        ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(m, "m");
+        ggml_tensor * rot = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+        ggml_set_name(rot, "hadamard");
+        ggml_tensor * qg = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*D, n_head, nb);
+
+        ggml_tensor * cur = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) D), 0.0f, 0.0f);
+        ggml_prec_set_acc(cur, GGML_PREC_F32);
+        cur = ggml_reshape_2d(ctx, cur, D*n_head, nb);
+        cur = ggml_reshape_2d(ctx, cur, 64, ggml_nelements(cur)/64);
+        cur = ggml_mul_mat(ctx, rot, cur);
+        ggml_mul_mat_set_hint(cur, GGML_HINT_SRC0_IS_HADAMARD);
+        cur = ggml_reshape_2d(ctx, cur, D*n_head, nb);
+
+        ggml_tensor * gate = ggml_view_3d(ctx, qg, D, n_head, nb, qg->nb[1], qg->nb[2], D*ggml_element_size(qg));
+        gate = ggml_cont_2d(ctx, gate, D*n_head, nb);
+        cur = ggml_mul(ctx, cur, ggml_sigmoid(ctx, gate));
+
+        ggml_set_name(cur, "out");
+        return cur;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "hadamard") == 0) {
+                init_tensor_hadamard(t);
+            } else if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -11535,6 +11743,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+    }
+
+    // HIP GQA decode path (GGML_HIP_FA_GQA_DEC=1) at Qwen3.8-27B decode/verify widths: partial last KV chunks, and
+    // kv 33000 for chunks longer than the 64-cell minimum.
+    for (int64_t gqa : { 6, 8 }) {
+        for (ggml_type type_KV : { GGML_TYPE_Q5_0, GGML_TYPE_Q8_0 }) {
+            for (int64_t kv : { 113, 2000, 33000 }) {
+                for (int64_t nb = 1; nb <= 8; ++nb) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {gqa, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                }
+                for (int64_t nb : { 1, 3, 8 }) {
+                    test_cases.emplace_back(new test_attn_gated_tail(4, gqa, kv, nb, type_KV));
+                }
+            }
+        }
+    }
+    for (int64_t n_tok = 1; n_tok <= 8; ++n_tok) {
+        test_cases.emplace_back(new test_attn_head_prep(24, n_tok, false));
+        test_cases.emplace_back(new test_attn_head_prep(4, n_tok, true));
+        test_cases.emplace_back(new test_v_hadamard_set_rows(4, n_tok));
     }
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned

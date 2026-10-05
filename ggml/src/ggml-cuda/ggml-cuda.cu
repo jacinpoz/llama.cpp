@@ -4822,7 +4822,7 @@ static int ggml_cuda_try_fuse_attn_tail(ggml_backend_cuda_context & ctx, const g
 
 // Attention head prep (Qwen3.5/3.8 with KV rotation): the Q chain RMS_NORM MUL ROPE RESHAPE MUL_MAT(hadamard) and
 // the K chain (the same + RESHAPE VIEW SET_ROWS) each become one launch, and the V chain MUL_MAT(hadamard 64) ...
-// SET_ROWS is written when the MUL_MAT runs and the SET_ROWS is skipped. Bit-identical (see rope.cu).
+// SET_ROWS is written when the MUL_MAT runs and the SET_ROWS is skipped. Bit-identical (see mk-ops-attn.cuh).
 // GGML_CUDA_DISABLE_ATTN_PREP_FUSION=1 turns it off.
 static thread_local std::unordered_set<const ggml_tensor *> g_precomputed_nodes;
 
