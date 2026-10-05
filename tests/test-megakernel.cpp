@@ -1,0 +1,644 @@
+// Persistent decode megakernel: ordering, epoch reuse, watchdog, soak and timing. HIP only, compiled as HIP.
+// Usage: test-megakernel [-n soak_launches] [--timing] [--ffn]
+
+#include "megakernel.cuh"
+#include "mk-ops-test.cuh"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#define TEST_THREADS (mk_test_add<MK_THREADS>::threads)
+
+struct mk_host_stream {
+    int                                n_blocks;
+    std::vector<std::vector<mk_instr>> queues;
+    std::vector<uint8_t>               params;
+    std::vector<uint32_t>              signals_per_pass;
+
+    explicit mk_host_stream(int n_blocks) : n_blocks(n_blocks), queues(n_blocks) {}
+
+    template <typename P>
+    uint32_t add_params(const P & p) {
+        const size_t off = GGML_PAD(params.size(), MK_PARAM_ALIGN);
+        params.resize(off + sizeof(P));
+        memcpy(params.data() + off, &p, sizeof(P));
+        return (uint32_t) off;
+    }
+
+    int add_counter() {
+        signals_per_pass.push_back(0);
+        return (int) signals_per_pass.size() - 1;
+    }
+
+    void push(int block, uint16_t opcode, int tile_begin, int tile_end, int wait_counter, uint32_t wait_target,
+              int signal_counter, uint32_t params_off = 0) {
+        mk_instr in = {};
+        in.opcode         = opcode;
+        in.tile_begin     = tile_begin;
+        in.tile_end       = tile_end;
+        in.wait_counter   = wait_counter;
+        in.wait_target    = wait_target;
+        in.signal_counter = signal_counter;
+        in.params_off     = params_off;
+        in.prefetch_off   = UINT32_MAX;
+        queues[block].push_back(in);
+        if (signal_counter >= 0) {
+            signals_per_pass[signal_counter]++;
+        }
+    }
+
+    void push_add(int block, int tile_begin, int tile_end, int wait_counter, uint32_t wait_target, int signal_counter,
+                  float * y, const float * x, int n, int delay) {
+        const mk_test_add_params p = { y, x, n, delay };
+        push(block, MK_OP_TEST_ADD, tile_begin, tile_end, wait_counter, wait_target, signal_counter, add_params(p));
+    }
+};
+
+// Device copy of a host stream. launch[e].epoch == e, so a launch selects its epoch through desc.launch alone.
+struct mk_dev_stream {
+    int n_epochs;
+
+    mk_stream_desc     desc = {};
+    mk_instr         * instrs = nullptr;
+    int32_t          * queue_begin = nullptr;
+    uint8_t          * params = nullptr;
+    uint32_t         * spp = nullptr;
+    uint32_t         * counters = nullptr;
+    int32_t          * error = nullptr;
+    mk_launch_params * launch = nullptr;
+
+    mk_dev_stream(const mk_host_stream & h, uint64_t watchdog_ticks, int n_epochs) : n_epochs(std::max(n_epochs, 1)) {
+        std::vector<mk_instr> flat;
+        std::vector<int32_t>  qb = { 0 };
+        for (const auto & q : h.queues) {
+            flat.insert(flat.end(), q.begin(), q.end());
+            qb.push_back((int32_t) flat.size());
+        }
+        std::vector<mk_launch_params> lp(this->n_epochs);
+        for (int e = 0; e < this->n_epochs; ++e) {
+            lp[e] = { (uint32_t) e, 0, 1, 0 };
+        }
+        const size_t n_counters = h.signals_per_pass.size();
+
+        CUDA_CHECK(hipMalloc(&instrs,      std::max<size_t>(flat.size(), 1)*sizeof(mk_instr)));
+        CUDA_CHECK(hipMalloc(&queue_begin, qb.size()*sizeof(int32_t)));
+        CUDA_CHECK(hipMalloc(&params,      std::max<size_t>(h.params.size(), 1)));
+        CUDA_CHECK(hipMalloc(&spp,         std::max<size_t>(n_counters, 1)*sizeof(uint32_t)));
+        CUDA_CHECK(hipMalloc(&counters,    std::max<size_t>(n_counters, 1)*sizeof(uint32_t)));
+        CUDA_CHECK(hipMalloc(&error,       sizeof(int32_t)));
+        CUDA_CHECK(hipMalloc(&launch,      lp.size()*sizeof(mk_launch_params)));
+        CUDA_CHECK(hipMemcpy(instrs, flat.data(), flat.size()*sizeof(mk_instr), hipMemcpyHostToDevice));
+        CUDA_CHECK(hipMemcpy(queue_begin, qb.data(), qb.size()*sizeof(int32_t), hipMemcpyHostToDevice));
+        CUDA_CHECK(hipMemcpy(params, h.params.data(), h.params.size(), hipMemcpyHostToDevice));
+        CUDA_CHECK(hipMemcpy(spp, h.signals_per_pass.data(), n_counters*sizeof(uint32_t), hipMemcpyHostToDevice));
+        CUDA_CHECK(hipMemset(counters, 0, std::max<size_t>(n_counters, 1)*sizeof(uint32_t)));
+        CUDA_CHECK(hipMemset(error, 0, sizeof(int32_t)));
+        CUDA_CHECK(hipMemcpy(launch, lp.data(), lp.size()*sizeof(mk_launch_params), hipMemcpyHostToDevice));
+
+        desc.instrs           = instrs;
+        desc.queue_begin      = queue_begin;
+        desc.params           = params;
+        desc.signals_per_pass = spp;
+        desc.counters         = counters;
+        desc.error            = error;
+        desc.launch           = launch;
+        desc.n_blocks         = h.n_blocks;
+        desc.n_counters       = (int32_t) n_counters;
+        desc.watchdog_cycles  = watchdog_ticks;
+    }
+
+    mk_dev_stream(const mk_dev_stream &) = delete;
+    mk_dev_stream & operator=(const mk_dev_stream &) = delete;
+
+    ~mk_dev_stream() {
+        CUDA_CHECK(hipFree(instrs));
+        CUDA_CHECK(hipFree(queue_begin));
+        CUDA_CHECK(hipFree(params));
+        CUDA_CHECK(hipFree(spp));
+        CUDA_CHECK(hipFree(counters));
+        CUDA_CHECK(hipFree(error));
+        CUDA_CHECK(hipFree(launch));
+    }
+};
+
+// Single launch point for every megakernel launch in this test; stream validation goes here.
+static void mk_run(const mk_dev_stream & s, uint32_t epoch, hipStream_t stream) {
+    GGML_ASSERT(epoch < (uint32_t) s.n_epochs);
+    mk_stream_desc d = s.desc;
+    d.launch = s.launch + epoch;
+    ggml_cuda_mk_launch(d, stream);
+}
+
+// A hung megakernel cannot be recovered from the host, so report it and stop the process.
+static void sync_bounded(hipStream_t stream, double timeout_ms, const char * what) {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (true) {
+        const hipError_t err = hipStreamQuery(stream);
+        if (err == hipSuccess) {
+            return;
+        }
+        if (err != hipErrorNotReady) {
+            CUDA_CHECK(err);
+        }
+        if (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() > timeout_ms) {
+            fprintf(stderr, "HANG: %s did not finish within %.0f ms\n", what, timeout_ms);
+            fflush(stderr);
+            std::_Exit(2);
+        }
+    }
+}
+
+template <typename F>
+static float gpu_time_ms(hipStream_t stream, double timeout_ms, const char * name, F && f) {
+    hipEvent_t e0, e1;
+    CUDA_CHECK(hipEventCreate(&e0));
+    CUDA_CHECK(hipEventCreate(&e1));
+    CUDA_CHECK(hipEventRecord(e0, stream));
+    f();
+    CUDA_CHECK(hipEventRecord(e1, stream));
+    sync_bounded(stream, timeout_ms, name);
+    float ms = 0.0f;
+    CUDA_CHECK(hipEventElapsedTime(&ms, e0, e1));
+    CUDA_CHECK(hipEventDestroy(e0));
+    CUDA_CHECK(hipEventDestroy(e1));
+    return ms;
+}
+
+static uint64_t ticks_per_ms() {
+    int khz = 0;
+    CUDA_CHECK(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, ggml_cuda_get_device()));
+    return (uint64_t) khz;
+}
+
+static int n_wgp() {
+    return ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+}
+
+static float init_value(int buf, int i) {
+    return (float) ((buf*31 + i) % 17);
+}
+
+struct buffers {
+    int                n;
+    int                count;
+    float            * d = nullptr;
+    std::vector<float> init;
+
+    buffers(int n, int count) : n(n), count(count), init((size_t) n*count) {
+        for (int b = 0; b < count; ++b) {
+            for (int i = 0; i < n; ++i) {
+                init[(size_t) b*n + i] = init_value(b, i);
+            }
+        }
+        CUDA_CHECK(hipMalloc(&d, init.size()*sizeof(float)));
+    }
+    ~buffers() { CUDA_CHECK(hipFree(d)); }
+
+    float * operator[](int b) const { return d + (size_t) b*n; }
+
+    void reset(hipStream_t stream) {
+        CUDA_CHECK(hipMemcpyAsync(d, init.data(), init.size()*sizeof(float), hipMemcpyHostToDevice, stream));
+    }
+
+    std::vector<float> read(hipStream_t stream) const {
+        std::vector<float> out(init.size());
+        CUDA_CHECK(hipMemcpyAsync(out.data(), d, out.size()*sizeof(float), hipMemcpyDeviceToHost, stream));
+        sync_bounded(stream, 10000, "readback");
+        return out;
+    }
+};
+
+static bool check_adds(const buffers & bufs, const std::vector<float> & got, const std::vector<std::pair<int, int>> & adds,
+                       const char * name) {
+    std::vector<float> ref = bufs.init;
+    for (const auto & [y, x] : adds) {
+        for (int i = 0; i < bufs.n; ++i) {
+            ref[(size_t) y*bufs.n + i] += ref[(size_t) x*bufs.n + i];
+        }
+    }
+    for (size_t i = 0; i < ref.size(); ++i) {
+        if (memcmp(&ref[i], &got[i], sizeof(float)) != 0) {
+            fprintf(stderr, "%s: mismatch at buf %zu elem %zu: got %f want %f\n", name, i / bufs.n, i % bufs.n, got[i], ref[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool expect_error(hipStream_t stream, const mk_dev_stream & s, int32_t want, const char * name) {
+    const int32_t err = ggml_cuda_mk_take_error(s.error, stream);
+    if (err != want) {
+        fprintf(stderr, "%s: error flag %d, want %d\n", name, err, want);
+        return false;
+    }
+    if (err != MK_ERR_NONE) {
+        ggml_cuda_mk_reset_counters(s.desc, stream);
+    }
+    return true;
+}
+
+// Chain: instruction k adds buffer k into buffer k+1 after k-1 signals, spread across blocks.
+// 4 tiles per instruction on 8 sub-tiles per step, the last tile partial.
+struct stream_case {
+    buffers                          bufs;
+    mk_host_stream                   h;
+    std::vector<std::pair<int, int>> adds;
+
+    stream_case(int n, int count, int n_blocks) : bufs(n, count), h(n_blocks) {}
+};
+
+struct chain_test : stream_case {
+    static constexpr int K = 101;
+
+    explicit chain_test(int n_blocks) : stream_case(3*TEST_THREADS + 17, K + 1, n_blocks) {
+        const int n_tiles = (bufs.n + TEST_THREADS - 1) / TEST_THREADS;
+        int prev = -1;
+        for (int k = 0; k < K; ++k) {
+            const int c = h.add_counter();
+            h.push_add((k*7) % n_blocks, 0, n_tiles, prev, 1, c, bufs[k + 1], bufs[k], bufs.n, 64);
+            adds.push_back({ k + 1, k });
+            prev = c;
+        }
+    }
+};
+
+// Fan-out over every block, then fan-in on one block, R rounds. Every queue ends with EXIT and then an
+// unsatisfiable wait, which only runs if EXIT is ignored.
+struct dag_test : stream_case {
+    static constexpr int R   = 8;
+    static constexpr int TPB = 3;
+
+    explicit dag_test(int n_blocks) : stream_case(n_blocks*TPB*TEST_THREADS - 5, 2*R + 1, n_blocks) {
+        const int n_tiles = (bufs.n + TEST_THREADS - 1) / TEST_THREADS;
+        int fin = -1;
+        int src = 0;
+        for (int r = 0; r < R; ++r) {
+            const int a   = 1 + 2*r;
+            const int b   = 2 + 2*r;
+            const int out = h.add_counter();
+            for (int blk = 0; blk < n_blocks; ++blk) {
+                const int t0 = std::min(blk*TPB, n_tiles);
+                const int t1 = std::min(t0 + TPB, n_tiles);
+                h.push_add(blk, t0, t1, fin, 1, out, bufs[a], bufs[src], bufs.n, 32);
+            }
+            adds.push_back({ a, src });
+            fin = h.add_counter();
+            h.push_add((r*13 + 5) % n_blocks, 0, n_tiles, out, n_blocks, fin, bufs[b], bufs[a], bufs.n, 0);
+            adds.push_back({ b, a });
+            src = b;
+        }
+        const int never = h.add_counter();
+        for (int blk = 0; blk < n_blocks; ++blk) {
+            h.push(blk, MK_OP_EXIT, 0, 0, -1, 0, -1);
+            h.push(blk, MK_OP_NOP, 0, 0, never, 1, -1);
+        }
+    }
+};
+
+static bool run_passes(stream_case & t, hipStream_t stream, int passes, uint64_t watchdog, const char * name) {
+    mk_dev_stream s(t.h, watchdog, passes);
+    for (int e = 0; e < passes; ++e) {
+        t.bufs.reset(stream);
+        mk_run(s, (uint32_t) e, stream);
+        sync_bounded(stream, 10000, name);
+        if (!expect_error(stream, s, MK_ERR_NONE, name) || !check_adds(t.bufs, t.bufs.read(stream), t.adds, name)) {
+            fprintf(stderr, "%s: failed at pass %d\n", name, e);
+            return false;
+        }
+    }
+    printf("%s: %d passes OK\n", name, passes);
+    return true;
+}
+
+static bool test_watchdog(hipStream_t stream, int n_blocks) {
+    const uint64_t tpm = ticks_per_ms();
+    bool ok = true;
+
+    {
+        mk_host_stream h(n_blocks);
+        const int never = h.add_counter();
+        h.push(0, MK_OP_NOP, 0, 0, never, 1, -1);
+        mk_dev_stream s(h, 50*tpm, 1);
+        mk_run(s, 0, stream);
+        sync_bounded(stream, 5000, "watchdog");
+        ok = expect_error(stream, s, MK_ERR_WATCHDOG, "watchdog") && ok;
+    }
+
+    // Block 1 starts waiting at 120 ms, so it ends at 200 ms only if it sees block 0's error.
+    {
+        mk_host_stream h(n_blocks);
+        const int never = h.add_counter();
+        const mk_test_spin_params spin = { 120*tpm };
+        h.push(0, MK_OP_NOP, 0, 0, never, 1, -1);
+        h.push(1, MK_OP_TEST_SPIN, 0, 1, -1, 0, -1, h.add_params(spin));
+        h.push(1, MK_OP_NOP, 0, 0, never, 1, -1);
+        mk_dev_stream s(h, 200*tpm, 1);
+        const float ms = gpu_time_ms(stream, 5000, "watchdog-propagate", [&] { mk_run(s, 0, stream); });
+        ok = expect_error(stream, s, MK_ERR_WATCHDOG, "watchdog-propagate") && ok;
+        if (ms > 290.0f) {
+            fprintf(stderr, "watchdog-propagate: kernel took %.1f ms, other blocks did not see the error\n", ms);
+            ok = false;
+        }
+    }
+
+    {
+        mk_host_stream h(n_blocks);
+        h.push(0, 0x7777, 0, 1, -1, 0, -1);
+        mk_dev_stream s(h, 50*tpm, 1);
+        mk_run(s, 0, stream);
+        sync_bounded(stream, 5000, "bad-opcode");
+        ok = expect_error(stream, s, MK_ERR_BAD_OPCODE, "bad-opcode") && ok;
+    }
+
+    printf("watchdog: %s\n", ok ? "OK" : "FAILED");
+    return ok;
+}
+
+template <typename T>
+static __global__ void __launch_bounds__(T::threads) k_mk_wrap(const mk_op_params<T> p, int variant) {
+    __shared__ __align__(16) char lds[T::lds_bytes > 0 ? T::lds_bytes : 1];
+    T::run(p, variant, blockIdx.x, true, lds);
+}
+
+// Chain of K full-width instructions with a full dependency between them, as K back to back kernel launches would have.
+static void test_timing(hipStream_t stream, int n_blocks) {
+    constexpr int K     = 256;
+    constexpr int iters = 50;
+    using op = mk_test_add<TEST_THREADS>;
+
+    buffers bufs(n_blocks*TEST_THREADS, K + 1);
+    const uint64_t watchdog = 1000*ticks_per_ms();
+
+    auto build = [&](mk_host_stream & h, int k0, int k1) {
+        int prev = -1;
+        for (int k = k0; k < k1; ++k) {
+            const int c = h.add_counter();
+            for (int blk = 0; blk < n_blocks; ++blk) {
+                h.push_add(blk, blk, blk + 1, prev, n_blocks, c, bufs[k + 1], bufs[k], bufs.n, 0);
+            }
+            prev = c;
+        }
+    };
+    mk_host_stream h1(n_blocks), h2a(n_blocks), h2b(n_blocks);
+    build(h1, 0, K);
+    build(h2a, 0, K/2);
+    build(h2b, K/2 + 1, K);
+    mk_dev_stream s1(h1, watchdog, iters + 1), s2a(h2a, watchdog, iters + 1), s2b(h2b, watchdog, iters + 1);
+
+    auto normal = [&](int k) {
+        const mk_test_add_params p = { bufs[k + 1], bufs[k], bufs.n, 0 };
+        k_mk_wrap<op><<<n_blocks, op::threads, 0, stream>>>(p, 0);
+    };
+
+    uint32_t epoch1 = 0, epoch2 = 0;
+    auto mk_one = [&] { mk_run(s1, epoch1++, stream); };
+    auto mk_two = [&] {
+        mk_run(s2a, epoch2, stream);
+        normal(K/2);
+        mk_run(s2b, epoch2, stream);
+        epoch2++;
+    };
+    auto eager = [&] { for (int k = 0; k < K; ++k) { normal(k); } };
+
+    auto time_us = [&](auto && f, const char * name) {
+        f();
+        sync_bounded(stream, 10000, name);
+        const float ms = gpu_time_ms(stream, 60000, name, [&] { for (int i = 0; i < iters; ++i) { f(); } });
+        printf("timing: %-36s %9.1f us per pass, %6.2f us per instruction\n", name, 1000.0f*ms/iters, 1000.0f*ms/iters/K);
+    };
+
+    auto time_graph = [&](auto && f, const char * name) {
+        hipGraph_t     graph = nullptr;
+        hipGraphExec_t exec  = nullptr;
+        CUDA_CHECK(hipStreamBeginCapture(stream, hipStreamCaptureModeRelaxed));
+        f();
+        const hipError_t err_end = hipStreamEndCapture(stream, &graph);
+        const hipError_t err_ins = err_end == hipSuccess ? hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0) : err_end;
+        if (err_ins != hipSuccess) {
+            printf("timing: %-36s capture failed: %s\n", name, hipGetErrorString(err_ins));
+            (void) hipGetLastError();
+        } else {
+            time_us([&] { CUDA_CHECK(hipGraphLaunch(exec, stream)); }, name);
+        }
+        if (exec) {
+            CUDA_CHECK(hipGraphExecDestroy(exec));
+        }
+        if (graph) {
+            CUDA_CHECK(hipGraphDestroy(graph));
+        }
+    };
+
+    time_us(eager, "normal launches, eager");
+    time_graph(eager, "normal launches, HIP graph");
+    time_us(mk_one, "megakernel, 1 segment");
+    time_us(mk_two, "megakernel, 2 segments + 1 kernel");
+
+    // A captured graph replays one epoch, so its counters are reset before each replay.
+    time_graph([&] { ggml_cuda_mk_reset_counters(s2a.desc, stream); ggml_cuda_mk_reset_counters(s2b.desc, stream);
+                     mk_run(s2a, 0, stream); normal(K/2); mk_run(s2b, 0, stream); },
+               "megakernel, 2 segments, HIP graph");
+
+    const int32_t err = std::max({ ggml_cuda_mk_take_error(s1.error, stream), ggml_cuda_mk_take_error(s2a.error, stream),
+                                   ggml_cuda_mk_take_error(s2b.error, stream) });
+    printf("timing: error flags %s\n", err == MK_ERR_NONE ? "clear" : "SET");
+}
+
+#if __has_include("mk-ops-ffn.cuh")
+#include "mk-ops-ffn.cuh"
+
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-cuda.h"
+
+// Qwen3.8-27B FFN block at T = 1: rms_norm_q8_1 -> mmvq gate/up + GLU -> mmvq down + residual add.
+// The reference is today's ggml-cuda path (3 launches); the megakernel stream must match it bit for bit.
+struct ffn_case {
+    static constexpr int n_embd = 5120;
+    static constexpr int n_ff   = 17408;
+
+    ggml_backend_t        backend = nullptr;
+    ggml_context        * ctx     = nullptr;
+    ggml_backend_buffer_t buf     = nullptr;
+    ggml_cgraph         * gf      = nullptr;
+    ggml_tensor * x = nullptr, * norm_w = nullptr, * gate = nullptr, * up = nullptr, * down = nullptr, * out = nullptr;
+
+    ffn_case() {
+        backend = ggml_backend_cuda_init(ggml_cuda_get_device());
+        ggml_init_params ip = { 64*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+        ctx    = ggml_init(ip);
+        x      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        gate   = ggml_new_tensor_2d(ctx, GGML_TYPE_IQ4_XS, n_embd, n_ff);
+        up     = ggml_new_tensor_2d(ctx, GGML_TYPE_IQ4_XS, n_embd, n_ff);
+        down   = ggml_new_tensor_2d(ctx, GGML_TYPE_IQ4_XS, n_ff, n_embd);
+        ggml_tensor * cur = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), norm_w);
+        ggml_tensor * h   = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, gate, cur), ggml_mul_mat(ctx, up, cur));
+        out = ggml_add(ctx, ggml_mul_mat(ctx, down, h), x);
+        gf  = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, out);
+        buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+
+        std::vector<float> v(n_embd);
+        for (int i = 0; i < n_embd; ++i) {
+            v[i] = 0.01f*(float) ((i*37) % 101 - 50);
+        }
+        ggml_backend_tensor_set(x, v.data(), 0, ggml_nbytes(x));
+        for (int i = 0; i < n_embd; ++i) {
+            v[i] = 1.0f + 0.001f*(float) (i % 13);
+        }
+        ggml_backend_tensor_set(norm_w, v.data(), 0, ggml_nbytes(norm_w));
+        fill_quant(gate);
+        fill_quant(up);
+        fill_quant(down);
+    }
+
+    ~ffn_case() {
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+    }
+
+    // Quantizes 64 pseudo-random rows and tiles them over the whole matrix.
+    static void fill_quant(ggml_tensor * t) {
+        const int64_t ncols = t->ne[0];
+        const int64_t rows  = 64;
+        std::vector<float> f((size_t) (ncols*rows));
+        uint32_t s = 12345u + (uint32_t) ncols;
+        for (float & e : f) {
+            s = s*1664525u + 1013904223u;
+            e = (float) ((int) (s >> 9) % 2001 - 1000) * 1e-3f;
+        }
+        const size_t row_size = ggml_row_size(t->type, ncols);
+        std::vector<uint8_t> q(row_size*rows);
+        ggml_quantize_chunk(t->type, f.data(), q.data(), 0, rows, ncols, nullptr);
+        for (int64_t r = 0; r < t->ne[1]; r += rows) {
+            const int64_t n = std::min(rows, t->ne[1] - r);
+            ggml_backend_tensor_set(t, q.data(), r*row_size, n*row_size);
+        }
+    }
+};
+
+// TODO: RMSNORM_Q8_1 on one block, MMVQ gate/up + GLU and MMVQ down + add over all blocks, writing mk_out.
+static bool build_ffn_stream(const ffn_case & /*fc*/, int /*n_blocks*/, mk_host_stream & /*h*/, float * /*mk_out*/) {
+    return false;
+}
+
+static bool test_ffn(hipStream_t stream, int n_blocks, bool timing) {
+    ffn_case fc;
+    GGML_ASSERT(ggml_backend_graph_compute(fc.backend, fc.gf) == GGML_STATUS_SUCCESS);
+    std::vector<float> ref(ffn_case::n_embd);
+    ggml_backend_tensor_get(fc.out, ref.data(), 0, ggml_nbytes(fc.out));
+
+    if (timing) {
+        constexpr int iters = 100;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            ggml_backend_graph_compute(fc.backend, fc.gf);
+        }
+        ggml_backend_synchronize(fc.backend);
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / iters;
+        printf("ffn: reference graph %.1f us per pass (host timed)\n", us);
+    }
+
+    float * mk_out = nullptr;
+    CUDA_CHECK(hipMalloc(&mk_out, ggml_nbytes(fc.out)));
+    mk_host_stream h(n_blocks);
+    if (!build_ffn_stream(fc, n_blocks, h, mk_out)) {
+        printf("ffn: stream builder not implemented, comparison skipped\n");
+        CUDA_CHECK(hipFree(mk_out));
+        return true;
+    }
+
+    mk_dev_stream s(h, 1000*ticks_per_ms(), 101);
+    mk_run(s, 0, stream);
+    sync_bounded(stream, 10000, "ffn");
+    bool ok = expect_error(stream, s, MK_ERR_NONE, "ffn");
+    std::vector<float> got(ffn_case::n_embd);
+    CUDA_CHECK(hipMemcpy(got.data(), mk_out, ggml_nbytes(fc.out), hipMemcpyDeviceToHost));
+    if (memcmp(got.data(), ref.data(), ggml_nbytes(fc.out)) != 0) {
+        fprintf(stderr, "ffn: megakernel output differs from the reference\n");
+        ok = false;
+    }
+
+    if (timing && ok) {
+        constexpr int iters = 100;
+        const float ms = gpu_time_ms(stream, 60000, "ffn timing", [&] {
+            for (int i = 1; i <= iters; ++i) {
+                mk_run(s, (uint32_t) i, stream);
+            }
+        });
+        printf("ffn: megakernel %.1f us per pass\n", 1000.0f*ms/iters);
+        ok = expect_error(stream, s, MK_ERR_NONE, "ffn timing") && ok;
+    }
+
+    CUDA_CHECK(hipFree(mk_out));
+    printf("ffn: %s\n", ok ? "OK" : "FAILED");
+    return ok;
+}
+#endif // __has_include("mk-ops-ffn.cuh")
+
+int main(int argc, char ** argv) {
+    int  soak   = 20;
+    bool timing = false;
+    bool ffn    = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "-n" && i + 1 < argc) {
+            soak = atoi(argv[++i]);
+        } else if (a == "--timing") {
+            timing = true;
+        } else if (a == "--ffn") {
+            ffn = true;
+        } else {
+            fprintf(stderr, "usage: %s [-n soak_launches] [--timing] [--ffn]\n", argv[0]);
+            return 1;
+        }
+    }
+
+    ggml_cuda_set_device(0);
+    hipStream_t stream;
+    CUDA_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+    const int      n_blocks = n_wgp();
+    const uint64_t watchdog = 2000*ticks_per_ms();
+    printf("megakernel: %d blocks x %d threads\n", n_blocks, MK_THREADS);
+
+    bool ok = true;
+    {
+        chain_test t(n_blocks);
+        ok = run_passes(t, stream, 4, watchdog, "chain") && ok;
+    }
+    {
+        dag_test t(n_blocks);
+        ok = run_passes(t, stream, 64, watchdog, "dag-epochs") && ok;
+    }
+    ok = test_watchdog(stream, n_blocks) && ok;
+    {
+        chain_test t(n_blocks);
+        ok = run_passes(t, stream, 2, watchdog, "chain-after-errors") && ok;
+    }
+    {
+        dag_test t(n_blocks);
+        ok = run_passes(t, stream, soak, watchdog, "soak") && ok;
+    }
+    if (timing) {
+        test_timing(stream, n_blocks);
+    }
+#if __has_include("mk-ops-ffn.cuh")
+    if (ffn || timing) {
+        ok = test_ffn(stream, n_blocks, timing) && ok;
+    }
+#else
+    if (ffn) {
+        printf("ffn: mk-ops-ffn.cuh not present, skipped\n");
+    }
+#endif
+
+    CUDA_CHECK(hipStreamDestroy(stream));
+    printf("%s\n", ok ? "OK" : "FAILED");
+    return ok ? 0 : 1;
+}

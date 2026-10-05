@@ -365,6 +365,21 @@ endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
 
+# persistent decode megakernel; calls ggml-hip internals, so it is built as HIP and linked to ggml-hip directly
+if (GGML_HIP AND NOT GGML_BACKEND_DL)
+    enable_language(HIP)
+    set_source_files_properties(test-megakernel.cpp PROPERTIES LANGUAGE HIP)
+    llama_build(test-megakernel.cpp LINK ggml)
+    target_link_libraries(test-megakernel PRIVATE ggml-hip)
+    target_include_directories(test-megakernel PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    target_compile_definitions(test-megakernel PRIVATE GGML_USE_HIP)
+    set(TEST_MK_ARCHS ${GPU_TARGETS} ${AMDGPU_TARGETS})
+    if (TEST_MK_ARCHS)
+        list(REMOVE_DUPLICATES TEST_MK_ARCHS)
+        set_target_properties(test-megakernel PROPERTIES HIP_ARCHITECTURES "${TEST_MK_ARCHS}")
+    endif()
+endif()
+
 llama_build_and_test(test-tiled-mulmat.cpp  LABEL "main behavior backend"  LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model behavior")
 llama_build_and_test(test-autorelease.cpp       LABEL "model behavior")
