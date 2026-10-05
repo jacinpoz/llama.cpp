@@ -5857,7 +5857,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], node->src[2], qkv_dst, fusion);
             }
             if (conv_fused) {
-                ggml_cuda_gdn_conv(conv_plan.p, cuda_ctx->stream());
+                // Path F: the gate projections read the same normed input, so they can share the conv launch.
+                static const bool multi_op = getenv("GGML_CUDA_MULTI_OP") != nullptr;
+                int g = -1;
+                for (int k = j + 1; multi_op && k < std::min(cgraph->n_nodes - 8, j + 48); ++k) {
+                    const ggml_tensor * n = cgraph->nodes[k];
+                    if (n->op == GGML_OP_MUL_MAT && n->src[1] == node->src[1] && (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                        g = k;
+                        break;
+                    }
+                }
+                mk_gdn_gates_params gates_p;
+                int gates_blocks = 0;
+                if (g >= 0) {
+                    // outputs first: the gates are written before their nodes, into private buffers
+                    ggml_cuda_redirect_early_output(cgraph, cgraph->nodes[g + 4]);
+                    ggml_cuda_redirect_early_output(cgraph, cgraph->nodes[g + 8]);
+                }
+                if (g >= 0 && ggml_cuda_gdn_gates_prepare(cgraph, g, gates_p, gates_blocks)) {
+                    ggml_cuda_gdn_conv_gates(conv_plan.p, gates_p, cuda_ctx->stream());
+                    for (int k = g; k <= g + 8; ++k) {
+                        g_precomputed_nodes.insert(cgraph->nodes[k]);
+                    }
+                } else {
+                    ggml_cuda_gdn_conv(conv_plan.p, cuda_ctx->stream());
+                }
             }
             return j - i;
         }
