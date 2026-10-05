@@ -1,6 +1,7 @@
 #include "norm.cuh"
 #include "mmb.cuh"
 #include "mk-ops-ffn.cuh"
+#include "mk-ops-gdn.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -183,24 +184,19 @@ static __global__ void rms_norm_scale_f32(const float * x, float * dst, const in
 }
 
 // Two independent rms_norm + scale jobs of the same shape and parameters (the GDN q and k l2 norms) in one
-// launch: blockIdx.z in [0, nsamples) is the first, [nsamples, 2*nsamples) the second. Same per-row code as
-// rms_norm_scale_f32, so the results are bit-identical to two separate launches.
+// launch: blockIdx.z in [0, nsamples) is the first, [nsamples, 2*nsamples) the second. Bit-identical to two
+// rms_norm_scale_f32 launches.
 template <int block_size>
 static __global__ void rms_norm_scale_pair_f32(const float * x0, float * dst0, const float * x1, float * dst1,
         const int ncols, const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
         const int nsamples, const float eps, const float s, const float b) {
-    const int nrows     = gridDim.x;
-    const int nchannels = gridDim.y;
-
-    const int  row     = blockIdx.x;
-    const int  channel = blockIdx.y;
-    const bool second  = blockIdx.z >= nsamples;
-    const int  sample  = second ? blockIdx.z - nsamples : blockIdx.z;
-
-    const float * x   = (second ? x1 : x0) + sample*stride_sample + channel*stride_channel + row*stride_row;
-    float       * dst = (second ? dst1 : dst0) + ((sample*nchannels + channel)*nrows + row)*ncols;
-
-    rms_norm_scale_row<block_size>(x, dst, ncols, eps, s, b);
+    static_assert(block_size == mk_gdn_qk_norm<block_size>::threads, "block_size");
+    const mk_gdn_qk_norm_params p = {
+        x0, dst0, x1, dst1, ncols, stride_row, stride_channel, stride_sample,
+        (int) gridDim.x, (int) gridDim.y, nsamples, eps, s, b,
+    };
+    extern __shared__ float s_sum[];
+    mk_gdn_qk_norm<block_size>::run_at(p, blockIdx.x, blockIdx.y, blockIdx.z, true, (char *) s_sum);
 }
 
 template <int block_size>

@@ -5224,6 +5224,135 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+// Qwen3.5/3.8 GDN gate chain:
+// gate = softplus(W_alpha x + dt) * A, beta = sigmoid(W_beta x)
+struct test_gdn_gates : public test_case {
+    const int64_t n_embd;
+    const int64_t n_v_heads;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_GATES";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_v_heads, n_tokens);
+    }
+
+    test_gdn_gates(int64_t n_embd = 5120, int64_t n_v_heads = 48, int64_t n_tokens = 1)
+        : n_embd(n_embd), n_v_heads(n_v_heads), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * w_alpha = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_v_heads);
+        ggml_tensor * w_beta  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_v_heads);
+        ggml_tensor * dt      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_v_heads);
+        ggml_tensor * a       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_v_heads);
+
+        ggml_tensor * alpha = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_alpha, x), n_v_heads, n_tokens, 1);
+        ggml_tensor * gate  = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), a);
+        gate = ggml_reshape_4d(ctx, gate, 1, n_v_heads, n_tokens, 1);
+
+        ggml_tensor * beta = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, w_beta, x), 1, n_v_heads, n_tokens, 1);
+        beta = ggml_sigmoid(ctx, beta);
+
+        ggml_tensor * out = ggml_add(ctx, gate, beta);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GDN q/k l2 norms on the conv output (build_gdn_l2_norm: RMS_NORM + SCALE)
+struct test_gdn_qk_norm_pair : public test_case {
+    const int64_t head_k_dim;
+    const int64_t n_k_heads;
+    const int64_t n_v_heads;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_QK_NORM_PAIR";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR4(head_k_dim, n_k_heads, n_v_heads, n_tokens);
+    }
+
+    test_gdn_qk_norm_pair(int64_t head_k_dim = 128, int64_t n_k_heads = 16, int64_t n_v_heads = 48, int64_t n_tokens = 1)
+        : head_k_dim(head_k_dim), n_k_heads(n_k_heads), n_v_heads(n_v_heads), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t C = head_k_dim*(2*n_k_heads + n_v_heads);
+        ggml_tensor * conv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, n_tokens);
+        const size_t nb1 = ggml_row_size(conv->type, head_k_dim);
+        const size_t nb2 = ggml_row_size(conv->type, C);
+
+        ggml_tensor * q = ggml_view_4d(ctx, conv, head_k_dim, n_k_heads, n_tokens, 1, nb1, nb2, nb2*n_tokens, 0);
+        ggml_tensor * k = ggml_view_4d(ctx, conv, head_k_dim, n_k_heads, n_tokens, 1, nb1, nb2, nb2*n_tokens,
+                ggml_row_size(conv->type, head_k_dim*n_k_heads));
+
+        const float n = head_k_dim;
+        const float eps = 1e-6f;
+        q = ggml_scale(ctx, ggml_rms_norm(ctx, q, eps/n), 1.0f/sqrtf(n));
+        k = ggml_scale(ctx, ggml_rms_norm(ctx, k, eps/n), 1.0f/sqrtf(n));
+
+        ggml_tensor * out = ggml_add(ctx, q, k);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GDN output gate: rms_norm(o) * w * silu(z) feeding the out projection
+struct test_gdn_out_gate : public test_case {
+    const ggml_type type_w;
+    const int64_t n_embd;
+    const int64_t head_v_dim;
+    const int64_t n_v_heads;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_OUT_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type_w, n_embd, head_v_dim, n_v_heads, n_tokens);
+    }
+
+    test_gdn_out_gate(ggml_type type_w = GGML_TYPE_Q8_0, int64_t n_embd = 512, int64_t head_v_dim = 128,
+            int64_t n_v_heads = 48, int64_t n_tokens = 1)
+        : type_w(type_w), n_embd(n_embd), head_v_dim(head_v_dim), n_v_heads(n_v_heads), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t value_dim = head_v_dim*n_v_heads;
+        ggml_tensor * inp    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * o      = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_v_dim, n_v_heads, n_tokens, 1);
+        ggml_tensor * w_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_v_dim);
+        ggml_tensor * w_z    = ggml_new_tensor_2d(ctx, type_w, n_embd, value_dim);
+        ggml_tensor * w_out  = ggml_new_tensor_2d(ctx, type_w, value_dim, n_embd);
+
+        ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, o, 1e-6f), w_norm);
+        ggml_tensor * z      = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, w_z, inp), head_v_dim, n_v_heads, n_tokens, 1);
+        ggml_tensor * gated  = ggml_mul(ctx, normed, ggml_silu(ctx, z));
+        gated = ggml_reshape_3d(ctx, gated, value_dim, n_tokens, 1);
+
+        ggml_tensor * out = ggml_mul_mat(ctx, w_out, gated);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -11789,6 +11918,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+
+    // Qwen3.8-27B GDN decode / verify shapes (n_embd 5120, H_k 16, H_v 48, S 128, conv kernel 4), T = 1..8
+    for (int64_t T = 1; T <= 8; ++T) {
+        test_cases.emplace_back(new test_gdn_gates(5120, 48, T));
+        test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {3 + T, 10240, 1, 1}, {4, 10240, 1, 1}, false));
+        test_cases.emplace_back(new test_gdn_qk_norm_pair(128, 16, 48, T));
+        for (int64_t K : {1, 4}) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, T, 1, 3, false, false, K));
+        }
+        test_cases.emplace_back(new test_gdn_out_gate(GGML_TYPE_Q8_0, 512, 128, 48, T));
+    }
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
