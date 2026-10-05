@@ -915,7 +915,6 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
     }
 }
 
-// Attention head prep and the V Hadamard + SET_ROWS: the megakernel ops in mk-ops-attn.cuh, one sub-tile per block.
 template <bool has_ff>
 static __global__ void __launch_bounds__(256, 1) k_attn_head_prep(const mk_attn_prep_params p) {
     using op = mk_attn_prep<256>;
@@ -981,6 +980,7 @@ bool ggml_cuda_op_attn_head_prep(ggml_backend_cuda_context & ctx, const ggml_ten
     p.freq_factors = rope->src[2] ? (const float *) rope->src[2]->data : nullptr;
     p.pos          = (const int32_t *) rope->src[1]->data;
     p.n_tok        = (int) n_tok;
+    p.pos_stride   = (int) n_tok;
     p.n_head       = (int) n_head;
 
     if (set_rows != nullptr) {

@@ -1,9 +1,8 @@
 #pragma once
 
 // Gated full-attention decode/verify ops (Qwen3.5/3.8, head dim 256) in the megakernel op form (megakernel.cuh).
-// The standalone kernels in rope.cu and fattn-gqa-dec.cu are thin wrappers around these.
-// Include before any file-wide fp contract pragma: quantize_f32_q5_0_block (cpy-utils.cuh) takes the includer's
-// setting, and the q5_0 cache bits match the reference kernels only with the default (contraction on).
+// Include before any file-wide fp contract pragma; quantize_f32_q5_0_block (cpy-utils.cuh) rounds the q5_0 cache like
+// the reference kernels only with contraction on.
 
 #include "common.cuh"
 #include "cpy-utils.cuh"
@@ -36,10 +35,9 @@ static __device__ __forceinline__ void mk_attn_set_row_q5_0(const float * y, cha
 
 // ---------------------------------------------------------------------------------------------------------------------
 // MK_OP_ATTN_PREP_Q / MK_OP_ATTN_PREP_K: one (head, token) row of 256: RMS_NORM * weight -> ROPE (mrope) -> 256-point
-// Hadamard, then written to out (Q) or quantized to q5_0 into cache row idx[token] (K, the SET_ROWS). Q and K are the
-// same op; out or cache selects the path. Each stage is the code of the kernel it replaces (rms_norm_f32<256>'s
-// reduction, rope_multi_cos_sin, fwht_cuda<256>'s layout and stage order, quantize_f32_q5_0_block), so the result is
-// bit-identical. Tile = tok*n_head + head. Variant: bit 0 = freq_factors present.
+// Hadamard, then written to out (Q) or quantized to q5_0 into cache row idx[token] (K). The stages keep
+// rms_norm_f32<256>'s reduction and fwht_cuda<256>'s layout and stage order.
+// Tile = tok*n_head + head. Variant: bit 0 = freq_factors present.
 
 struct mk_attn_prep_params {
     const float *   x;            // [256] rows, head stride sx1, token stride sx2 (floats)
@@ -48,7 +46,8 @@ struct mk_attn_prep_params {
     float           eps;
     int             n_dims, n_offs;
     const int32_t * pos;
-    int             n_tok;        // rope ne02 (pos is [n_tok * 4] for mrope); launch->n_tokens when launch is set
+    int             n_tok;        // live tokens; launch->n_tokens when launch is set
+    int             pos_stride;   // rope ne02: pos is [pos_stride * 4] for mrope
     int             n_head;
     mrope_sections  sections;
     bool            is_imrope;
@@ -99,7 +98,7 @@ struct mk_attn_prep {
                 const int iw = i0 - p.n_offs;
                 float cos_theta;
                 float sin_theta;
-                rope_multi_cos_sin<true, has_ff>(iw, p.pos, tok, n_tok, p.sections, p.is_imrope, p.theta_scale, p.freq_factors,
+                rope_multi_cos_sin<true, has_ff>(iw, p.pos, tok, p.pos_stride, p.sections, p.is_imrope, p.theta_scale, p.freq_factors,
                                                  p.freq_scale, p.corr_dims, p.ext_factor, p.attn_factor, cos_theta, sin_theta);
                 const float x0 = y[i0/2 + p.n_offs/2 + 0];
                 const float x1 = y[i0/2 + p.n_offs/2 + p.n_dims/2];
@@ -170,8 +169,7 @@ struct mk_attn_prep {
 
 // ---------------------------------------------------------------------------------------------------------------------
 // MK_OP_V_HAD_SET_ROWS: fwht_cuda<64> over the four 64-chunks of one (head, token) V row of 256, then quantized to
-// q5_0 into cache row idx[token] (the SET_ROWS). Bit-identical to the two kernels it replaces. Tile = tok*n_head + head.
-// No variants.
+// q5_0 into cache row idx[token]. Tile = tok*n_head + head. No variants.
 
 struct mk_v_had_set_rows_params {
     const float *  x;             // [256] rows, head stride sx1, token stride sx2 (floats)
@@ -254,9 +252,9 @@ struct mk_v_had_set_rows {
 // length depends only on n_kv, and each token is processed independently, so a token gets the same result whether it
 // is decoded alone or verified in a speculative batch.
 //
-// The chunk count follows n_kv, so a megakernel instruction covers tile_chunks >= the live count (mk_attn_tile_chunks)
-// and the tiles past it run with valid == false. The partial buffers are indexed with the live count; the combine
-// derives it from n_kv the same way, so the two need not share a launch.
+// The chunk count follows n_kv, so a megakernel instruction covers tile_chunks >= the live count (mk_attn_tile_chunks);
+// tiles at or past the live count do nothing. The partial buffers are indexed with the live count, which the combine
+// derives from n_kv the same way.
 
 static constexpr int mk_attn_d             = 256;
 static constexpr int mk_attn_max_chunks    = 512;
@@ -436,7 +434,6 @@ struct mk_attn_partial {
         for (int k0 = k_beg; k0 < k_end; k0 += WARP_SIZE) {
             const int nk = min(WARP_SIZE, k_end - k0);
 
-            // scores: lane j computes all G scores of key k0 + j
             float my_s[G];
 #pragma unroll
             for (int g = 0; g < G; ++g) {
@@ -484,7 +481,6 @@ struct mk_attn_partial {
             }
             __syncwarp();
 
-            // V: lane owns dims 8*lane..8*lane+7 of every key
             for (int j = 0; j < nk; ++j) {
                 float vv[8];
                 gqa_dec_load_slice<T>(Vh + (int64_t) (k0 + j)*p.nbv1, lane, vv);
@@ -528,9 +524,8 @@ struct mk_attn_partial {
     }
 };
 
-// Combine: one sub-tile per (query head, token). Wave w merges chunks w, w + mk_attn_combine_waves, ... over all 256
-// dims (8 per lane); the waves are then merged in LDS in a fixed order. With ep.gate set, the gated-attention tail is
-// applied: out = fwht64(o) * sigmoid(gate). Tile = t*n_head + hq. Variant: bit 0 = GQA 8 (else 6).
+// Combine: wave w merges chunks w, w + mk_attn_combine_waves, ...; the waves are then merged in LDS in a fixed order.
+// With ep.gate set, out = fwht64(o) * sigmoid(gate). Tile = t*n_head + hq. Variant: bit 0 = GQA 8 (else 6).
 static constexpr int mk_attn_combine_variant(const int G) {
     return G == 8 ? 1 : 0;
 }
@@ -563,7 +558,7 @@ struct mk_attn_combine {
         const int  t    = tile / p.n_head;
         const int  h    = hq / G;
         const int  g    = hq % G;
-        const int  lane = threadIdx.x % WARP_SIZE;
+        const int  lane = threadIdx.x % threads % WARP_SIZE;
         const int  w    = threadIdx.x % threads / WARP_SIZE;
         const bool live = valid && t < nq;
         const int  n_chunks = live ? mk_attn_chunking(n_kv).n : 0;
@@ -629,8 +624,7 @@ struct mk_attn_combine {
                 o[i] = AA[i]/SS;
             }
             if (p.ep.gate != nullptr) {
-                // inverse V rotation: fwht over each 64-dim chunk (8 lanes x 8 dims), stages in the order of the chunk
-                // index bits 0..5 as fwht_cuda<64> runs them, so the result is bit-identical; then x sigmoid(gate)
+                // fwht over each 64-dim chunk (8 lanes x 8 dims), stages in fwht_cuda<64>'s order of chunk index bits 0..5
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
                     o[i] *= 0.125f;
