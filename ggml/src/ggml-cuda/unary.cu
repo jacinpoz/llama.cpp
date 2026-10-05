@@ -1,6 +1,7 @@
 #include "unary.cuh"
 #include "convert.cuh"
 #include "mmb.cuh"
+#include "mk-ops-gdn.cuh"
 
 // RNE f32 -> bf16, bit-identical to mmb.cu's mmb_f2bf.
 static __device__ __forceinline__ uint16_t unary_f2bf(float f) {
@@ -972,45 +973,13 @@ void ggml_cuda_op_scale_unary(ggml_backend_cuda_context & ctx, ggml_tensor * sca
     }
 }
 
-// GDN output gate: RMS_NORM * w (rms_norm_f32<256>'s reduction) of each head row, then silu(z) * normed, quantized to
-// Q8_1 into the matmul's quantize cache as unary_gated_q8_1_op_kernel does. Bit-identical to those two kernels.
+// GDN output gate (mk_gdn_out_gate): RMS_NORM * w of each head row, then silu(z) * normed, quantized to Q8_1 into the
+// matmul's quantize cache. Bit-identical to rms_norm_f32<256> followed by unary_gated_q8_1_op_kernel.
 template <int ncols>
-static __global__ void __launch_bounds__(256, 1) norm_silu_gate_q8_1_kernel(
-        const float * x, const int64_t sx, const float * w, const float eps, const float * z, const int64_t sz,
-        block_q8_1 * y, const int64_t row_len) {
-    static_assert(ncols % QK8_1 == 0 && ncols <= 256, "ncols");
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-
-    __shared__ float s_sum[32];
-    const float xi = tid < ncols ? x[row*sx + tid] : 0.0f;
-    float tmp = tid < ncols ? xi * xi : 0.0f;
-    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
-    const float mean  = tmp / ncols;
-    const float scale = rsqrtf(mean + eps);
-    if (tid >= ncols) {
-        return;
-    }
-    const float n = scale * xi * w[tid];
-    const float v = op_silu(z[row*sz + tid]) * n;
-
-    const int64_t i    = (int64_t) row*ncols + tid;
-    const int     lane = tid % 32;
-    const int64_t blocks_per_row = (GGML_PAD(row_len, MATRIX_ROW_PADDING)) / QK8_1;
-    const int64_t ib = (i / row_len) * blocks_per_row + (i % row_len) / QK8_1;
-
-    float amax = fabsf(v);
-    float sum = v;
-    amax = warp_reduce_max<32>(amax);
-    sum  = warp_reduce_sum<32>(sum);
-
-    const float  d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
-
-    y[ib].qs[lane] = q;
-    if (lane == 0) {
-        y[ib].ds = make_half2(d, sum);
-    }
+static __global__ void __launch_bounds__(256, 1) norm_silu_gate_q8_1_kernel(const mk_gdn_out_gate_params p) {
+    using op = mk_gdn_out_gate<256, ncols>;
+    __shared__ float s_sum[op::threads/WARP_SIZE];
+    op::run(p, 0, blockIdx.x, true, (char *) s_sum);
 }
 
 bool ggml_cuda_op_norm_silu_gate_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * norm_mul,
@@ -1043,9 +1012,12 @@ bool ggml_cuda_op_norm_silu_gate_q8_1(ggml_backend_cuda_context & ctx, const ggm
     float eps;
     memcpy(&eps, rms_norm->op_params, sizeof(float));
     const int64_t nrows = ggml_nrows(x);
-    norm_silu_gate_q8_1_kernel<128><<<(unsigned) nrows, 256, 0, ctx.stream()>>>(
-        (const float *) x->data, x->nb[1]/sizeof(float), (const float *) w->data, eps,
-        (const float *) z->data, z->nb[1]/sizeof(float), (block_q8_1 *) y, mm->src[1]->ne[0]);
+    const mk_gdn_out_gate_params p = {
+        (const float *) x->data, (int64_t) (x->nb[1]/sizeof(float)), (const float *) w->data, eps,
+        (const float *) z->data, (int64_t) (z->nb[1]/sizeof(float)), (block_q8_1 *) y, mm->src[1]->ne[0],
+        (int) x->ne[1], (int) (x->ne[2]*x->ne[3]), nullptr,
+    };
+    norm_silu_gate_q8_1_kernel<128><<<(unsigned) nrows, 256, 0, ctx.stream()>>>(p);
     CUDA_CHECK(cudaGetLastError());
     GGML_UNUSED(mul_node);
     return true;
