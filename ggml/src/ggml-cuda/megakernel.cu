@@ -140,10 +140,11 @@ static __device__ bool mk_wait(const mk_stream_desc & d, int counter, uint32_t t
     return true;
 }
 
-static __device__ __forceinline__ void mk_prefetch(const mk_prefetch_desc & pf, int t, int nt) {
+// Stops as soon as thread 0 reports the wait is over, so the prefetch only fills idle time.
+static __device__ __forceinline__ void mk_prefetch(const mk_prefetch_desc & pf, int t, int nt, const volatile int * wait_done) {
     const uint8_t * p = (const uint8_t *) pf.ptr;
     uint32_t sink = 0;
-    for (uint64_t off = (uint64_t) t*128; off < pf.bytes; off += (uint64_t) nt*128) {
+    for (uint64_t off = (uint64_t) t*128; off < pf.bytes && !*wait_done; off += (uint64_t) nt*128) {
         sink ^= *(const volatile uint32_t *) (p + off);
     }
     asm volatile("" :: "v"(sink));
@@ -152,12 +153,17 @@ static __device__ __forceinline__ void mk_prefetch(const mk_prefetch_desc & pf, 
 __global__ void __launch_bounds__(MK_THREADS, 1) mk_persistent(const mk_stream_desc d) {
     __shared__ __align__(16) char lds[MK_OP_LDS_BYTES];
     __shared__ int abort_block;
-    static_assert(sizeof(lds) + sizeof(abort_block) <= MK_LDS_BYTES, "megakernel LDS over budget");
+    __shared__ int wait_done;
+    static_assert(sizeof(lds) + sizeof(abort_block) + sizeof(wait_done) <= MK_LDS_BYTES, "megakernel LDS over budget");
 
     const int      q_begin = d.queue_begin[blockIdx.x];
     const int      q_end   = d.queue_begin[blockIdx.x + 1];
     const uint32_t epoch   = d.launch->epoch;
 
+    if (threadIdx.x == 0) {
+        wait_done = 0;
+    }
+    __syncthreads();
     mk_instr next = q_begin < q_end ? d.instrs[q_begin] : mk_instr{};
     for (int q = q_begin; q < q_end; ++q) {
         const mk_instr in = next;
@@ -166,14 +172,19 @@ __global__ void __launch_bounds__(MK_THREADS, 1) mk_persistent(const mk_stream_d
             next = d.instrs[q + 1];
         }
 
+        uint64_t * tr = d.trace ? d.trace + 3*(size_t) q : nullptr;
+        if (tr && threadIdx.x == 0) {
+            tr[0] = wall_clock64();
+        }
         if (in.wait_counter >= 0) {
             if (threadIdx.x == 0) {
                 const uint32_t target = mk_counter_target(epoch, d.signals_per_pass[in.wait_counter], in.wait_target);
                 abort_block = !mk_wait(d, in.wait_counter, target);
+                __hip_atomic_store(&wait_done, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
             }
 #if GGML_CUDA_MK_PREFETCH
             else if (in.prefetch_off != UINT32_MAX && threadIdx.x >= WARP_SIZE) {
-                mk_prefetch(*(const mk_prefetch_desc *) (d.params + in.prefetch_off), threadIdx.x - WARP_SIZE, MK_THREADS - WARP_SIZE);
+                mk_prefetch(*(const mk_prefetch_desc *) (d.params + in.prefetch_off), threadIdx.x - WARP_SIZE, MK_THREADS - WARP_SIZE, &wait_done);
             }
 #endif
             __syncthreads();
@@ -182,6 +193,9 @@ __global__ void __launch_bounds__(MK_THREADS, 1) mk_persistent(const mk_stream_d
             }
         }
 
+        if (tr && threadIdx.x == 0) {
+            tr[1] = wall_clock64();
+        }
         if (!mk_dispatch(d, in, lds)) {
             return;
         }
@@ -190,9 +204,15 @@ __global__ void __launch_bounds__(MK_THREADS, 1) mk_persistent(const mk_stream_d
         if (in.signal_counter >= 0) {
             __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
         }
+        if (threadIdx.x == 0) {
+            wait_done = 0;
+        }
         __syncthreads();
         if (in.signal_counter >= 0 && threadIdx.x == 0) {
             __hip_atomic_fetch_add(d.counters + in.signal_counter, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        }
+        if (tr && threadIdx.x == 0) {
+            tr[2] = wall_clock64();
         }
     }
 }
@@ -209,6 +229,14 @@ void ggml_cuda_mk_launch(const mk_stream_desc & desc, cudaStream_t stream) {
     GGML_ASSERT(desc.n_blocks > 0 && desc.n_blocks <= max_blocks[id]);
 
     mk_stream_desc d = desc;
+    // A cooperative launch costs ~47 us on ROCm 10.x. With one block per WGP and the occupancy check above
+    // every block is resident anyway; GGML_CUDA_MK_COOPERATIVE=1 restores the guaranteed form.
+    static const bool cooperative = getenv("GGML_CUDA_MK_COOPERATIVE") != nullptr;
+    if (!cooperative) {
+        mk_persistent<<<desc.n_blocks, MK_THREADS, 0, stream>>>(d);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     void * args[] = { &d };
     CUDA_CHECK(cudaLaunchCooperativeKernel((const void *) mk_persistent, dim3(desc.n_blocks), dim3(MK_THREADS), args, 0, stream));
 }

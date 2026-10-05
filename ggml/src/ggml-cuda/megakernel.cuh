@@ -95,6 +95,7 @@ struct mk_stream_desc {
     int32_t                n_blocks;
     int32_t                n_counters;
     uint64_t               watchdog_cycles; // wall_clock64() ticks a wait may spin before aborting
+    uint64_t             * trace;           // optional: per block and instruction, 3 wall-clock stamps
 };
 
 enum mk_error : int32_t {
