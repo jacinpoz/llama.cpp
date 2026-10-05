@@ -4081,14 +4081,11 @@ struct test_rms_norm_mul_mat : public test_case {
         : type_w(type_w), n_embd(n_embd), n_out(n_out), n_tokens(n_tokens), with_add(with_add), two_mm(two_mm), get_rows(get_rows) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x;
+        ggml_tensor * x = two_mm ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd*n_tokens)
+                                 : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
         if (two_mm) {
-            x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd*n_tokens);
-            ggml_set_name(x, "x");
             x = ggml_reshape_2d(ctx, x, n_embd, n_tokens);
-        } else {
-            x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
-            ggml_set_name(x, "x");
         }
         if (with_add) {
             ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -4125,11 +4122,7 @@ struct test_rms_norm_mul_mat : public test_case {
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
-                std::vector<int32_t> data(ggml_nelements(t));
-                for (size_t i = 0; i < data.size(); i++) {
-                    data[i] = i;
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+                init_set_rows_row_ids(t, n_tokens);
             } else {
                 init_tensor_uniform(t);
             }

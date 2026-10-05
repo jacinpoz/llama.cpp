@@ -2504,10 +2504,6 @@ static ggml_cuda_mm_kernel ggml_cuda_mul_mat_kernel(ggml_backend_cuda_context & 
     return ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0) ? GGML_CUDA_MM_MMQ : GGML_CUDA_MM_OTHER;
 }
 
-static bool ggml_cuda_mul_mat_takes_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-    return ggml_cuda_mul_mat_kernel(ctx, src0, src1, dst) == GGML_CUDA_MM_MMQ;
-}
-
 static bool ggml_cuda_verify_norm_q8() {
     static const bool enabled = getenv("GGML_CUDA_VERIFY_NORM_Q8") != nullptr && atoi(getenv("GGML_CUDA_VERIFY_NORM_Q8")) != 0;
     return enabled;
@@ -5489,7 +5485,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             node->ne[1] > 1 && node->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
             cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM && cgraph->nodes[i + 1]->src[0] == node &&
             cgraph->nodes[i + 2]->op == GGML_OP_MUL && cgraph->nodes[i + 2]->src[0] == cgraph->nodes[i + 1] &&
-            ggml_node_get_use_count(cgraph, i + 1) == 1 && !(cgraph->nodes[i + 1]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            ggml_node_has_n_uses(cgraph, i + 1, 1)) {
         ggml_tensor * norm = cgraph->nodes[i + 1];
         const ggml_tensor * mul = cgraph->nodes[i + 2];
         bool quantize = false;
@@ -5517,10 +5513,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // cache. Consumes only the norm+MUL pair; the matmul dispatch that follows
     // finds the cached blocks and skips its own quantize. The matmul need not
     // be adjacent (unrelated nodes may sit between in DFS order).
-    if (node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes &&
-            ggml_node_get_use_count(cgraph, i) == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+    if (node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes) {
         const ggml_tensor * mul = cgraph->nodes[i + 1];
-        if (mul->op == GGML_OP_MUL && mul->src[0] == node && mul->src[1]->ne[0] == node->ne[0]) {
+        if (mul->op == GGML_OP_MUL && mul->src[0] == node && mul->src[1]->ne[0] == node->ne[0] &&
+                ggml_node_has_n_uses(cgraph, i, 1)) {
             // The consumers of the norm output are mostly mmvq matmuls; skip
             // over unrelated nodes and non-mmvq consumers (they read the F32
             // output, which the fused kernel still writes) until an mmvq
@@ -5546,8 +5542,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const bool mmid_single = n->op != GGML_OP_MUL_MAT_ID || n->ne[2] == 1;
                 if ((n->op == GGML_OP_MUL_MAT || n->op == GGML_OP_MUL_MAT_ID) &&
                         node->ne[0] % QK8_1 == 0 &&
-                        ggml_cuda_norm_q8_1_consumer(*cuda_ctx, n) &&
-                        mmid_single) {
+                        mmid_single &&
+                        ggml_cuda_norm_q8_1_consumer(*cuda_ctx, n)) {
                     ggml_cuda_op_rms_norm_q8_1(*cuda_ctx, node, mul);
                     return 1;
                 }
@@ -5629,7 +5625,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const bool shape_ok = node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) && node->ne[0] % 4 == 0 &&
             node->ne[2] == 1 && node->ne[3] == 1 && rows_ok(a) && (b == nullptr || (rows_ok(b) && ggml_are_same_shape(a, b))) &&
             a->ne[0] == (b ? node->ne[0] : 2*node->ne[0]) && a->ne[1] == node->ne[1];
-        if (shape_ok && ggml_is_quantized(next->src[0]->type) && ggml_cuda_mul_mat_takes_mmq(*cuda_ctx, next->src[0], node, next) &&
+        if (shape_ok && ggml_is_quantized(next->src[0]->type) && ggml_cuda_mul_mat_kernel(*cuda_ctx, next->src[0], node, next) == GGML_CUDA_MM_MMQ &&
                 ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 })) {
             ggml_cuda_mul_mat_q_swiglu_dense(*cuda_ctx, next->src[0], next, node);
             return 1;
