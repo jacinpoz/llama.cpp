@@ -2,7 +2,9 @@
 
 // One block of MK_THREADS per WGP. 1024 threads give 8 waves per SIMD, so VGPRs must stay <= MK_MAX_VGPRS.
 
+#ifndef GGML_MK_HOST_ONLY
 #include "common.cuh"
+#endif
 
 #include <cstdint>
 #include <cstring>
@@ -114,12 +116,14 @@ template <typename P> struct mk_run_signature<void (*)(const P &, int, int, bool
 };
 template <typename Op> using mk_op_params = typename mk_run_signature<decltype(&Op::run)>::params;
 
+#ifndef GGML_MK_HOST_ONLY
 // Host API (megakernel.cu). Launches are async and never sync, so segments can be queued back to back.
 // A set *error makes later waits abort until take_error clears it; then reset the counters and restart at epoch 0.
 // A captured launch replays one epoch.
 void    ggml_cuda_mk_launch(const mk_stream_desc & desc, cudaStream_t stream);
 int32_t ggml_cuda_mk_take_error(int32_t * error, cudaStream_t stream); // syncs the stream, returns and clears *error
 void    ggml_cuda_mk_reset_counters(const mk_stream_desc & desc, cudaStream_t stream);
+#endif
 
 // Record mode: while g_mk_recording is set, op launchers append the params they launch with, so a stream
 // built from the records runs exactly what the normal path ran. n_tiles < 0 marks a launch with no megakernel op.
@@ -132,7 +136,9 @@ struct mk_recorded_op {
 
 inline std::vector<mk_recorded_op> * g_mk_recording = nullptr;
 
+#ifndef GGML_MK_HOST_ONLY
 void ggml_cuda_mk_set_recording(std::vector<mk_recorded_op> * rec); // nullptr stops recording
+#endif
 
 template <typename P>
 static void mk_record(uint16_t opcode, int variant, int64_t n_tiles, const P & p) {
