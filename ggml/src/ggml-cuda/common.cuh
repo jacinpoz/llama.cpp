@@ -2756,6 +2756,15 @@ bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 
 // Whether a dense MUL_MAT over a quantized src0 will run as MMQ (defined in ggml-cuda.cu).
 bool ggml_cuda_mul_mat_takes_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+
+enum ggml_cuda_mm_kernel {
+    GGML_CUDA_MM_OTHER,
+    GGML_CUDA_MM_MMVQ,
+    GGML_CUDA_MM_MMQ,
+};
+
+// The kernel ggml_cuda_mul_mat() runs for this MUL_MAT (defined in ggml-cuda.cu).
+ggml_cuda_mm_kernel ggml_cuda_mul_mat_kernel(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 // GGML_CUDA_VERIFY_NORM_Q8 and the matmuls that read a norm's Q8_1 output from the quantize cache (defined in ggml-cuda.cu).
 bool ggml_cuda_verify_norm_q8();
 bool ggml_cuda_norm_q8_1_consumer(ggml_backend_cuda_context & ctx, const ggml_tensor * mm);
@@ -2778,8 +2787,8 @@ struct ggml_cuda_mm_fusion_args_host {
     // when set (with glu_op == GGML_GLU_OP_NONE), the gate result is written
     // to this separate destination instead of being combined into the main output
     const ggml_tensor * dst_gate = nullptr;
-    // When set, the GLU output is also quantized to Q8_1 here (the next matmul's input), group by group,
-    // by the last wave to finish each 32-row group; q8_1_group_done holds one zeroed counter per group.
+    // When set, the GLU output is also quantized to Q8_1 here (the next matmul's input, one row per token column),
+    // group by group, by the last wave to finish each 32-row group; q8_1_group_done holds one zeroed counter per group.
     void * q8_1_out = nullptr;
     unsigned int * q8_1_group_done = nullptr;
     // SSM conv-input fusion: the matmul output is the last row of an

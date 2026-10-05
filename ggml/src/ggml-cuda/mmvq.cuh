@@ -58,7 +58,7 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
 
-bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band = false);
+bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, const bool verify_band = false, const int64_t max_ncols = 1);
 
 int ggml_cuda_mul_mat_id_weighted_down_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 

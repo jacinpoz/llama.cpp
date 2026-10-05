@@ -2291,6 +2291,16 @@ static int ggml_cuda_try_fuse_gdn_out_gate(ggml_backend_cuda_context & ctx, ggml
 }
 
 
+// With GGML_CUDA_VERIFY_GLU set, 2..MMVQ_MAX_BATCH_SIZE tokens fuse only where the unfused gate and up would run as the ksplit mmvq, which keeps each column's reduction order.
+static bool ggml_cuda_should_fuse_mul_mat_vec_q_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * up) {
+    static const bool verify_glu = getenv("GGML_CUDA_VERIFY_GLU") != nullptr && atoi(getenv("GGML_CUDA_VERIFY_GLU")) != 0;
+    if (!ggml_cuda_should_fuse_mul_mat_vec_q(up, false, verify_glu ? MMVQ_MAX_BATCH_SIZE : 1)) {
+        return false;
+    }
+    return up->op != GGML_OP_MUL_MAT || up->ne[1] == 1 ||
+           (up->ne[2] == 1 && up->ne[3] == 1 && ggml_cuda_mul_mat_kernel(ctx, up->src[0], up->src[1], up) == GGML_CUDA_MM_MMVQ);
+}
+
 int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -2950,7 +2960,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q_glu(*cuda_ctx, up) && (ids != nullptr || !ggml_cuda_rdna3_5_dense_glu_disabled())) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);

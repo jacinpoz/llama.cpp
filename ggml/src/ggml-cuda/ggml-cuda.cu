@@ -5443,15 +5443,10 @@ bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_tensor *
     return ggml_cuda_mmq_fusion_is_efficient(x_up->type, x_up->ne[1], y->ne[1], y->ne[2]*y->ne[3], device);
 }
 
-enum ggml_cuda_mm_kernel {
-    GGML_CUDA_MM_OTHER,
-    GGML_CUDA_MM_MMVQ,
-    GGML_CUDA_MM_MMQ,
-};
 
 // The kernel ggml_cuda_mul_mat() below runs this MUL_MAT through (OTHER may be conservative): the same
 // predicate chain in the same order.  Keep the two in sync.
-static ggml_cuda_mm_kernel ggml_cuda_mul_mat_kernel(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+ggml_cuda_mm_kernel ggml_cuda_mul_mat_kernel(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
         return GGML_CUDA_MM_OTHER;
     }
