@@ -85,6 +85,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
+#include "ggml-cuda/megakernel-host.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -1409,6 +1410,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     // wip/slab-transient-absorption: steady-state accounting for the headroom campaign (gated on
     // GGML_CUDA_SLAB_STATS).  Printed before the transients are released, so it reports the live layout.
     ggml_cuda_slab_log_stats(device, "context-exit");
+
+    ggml_cuda_mk_release(this);
 
     if (q8_1_arena != nullptr) {
         CUDA_CHECK(cudaFree(q8_1_arena));
@@ -7619,6 +7622,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_set_device(cuda_ctx->device);
     ggml_cuda_async_input_wait(cuda_ctx->device, cuda_ctx->stream());
     const ggml_cuda_async_input_done_guard async_input_done { cuda_ctx->device, cuda_ctx->stream() };
+
+    if (ggml_cuda_mk_enabled() && ggml_cuda_mk_try_compute(*cuda_ctx, cgraph, ggml_cuda_compute_forward)) {
+        return GGML_STATUS_SUCCESS;
+    }
 
     if (g_stream_dbg_on) {
         static int n = 0;

@@ -1782,6 +1782,8 @@ bool ggml_cuda_fusion_disabled();
 #define GGML_CUDA_MOE_GLU_Q8_CNT 4096
 #define GGML_CUDA_MOE_RED_CNT 4096
 
+struct ggml_cuda_mk_state;
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1810,6 +1812,7 @@ struct ggml_backend_cuda_context {
 
     // GET_ROWS state gathers skipped in the current graph evaluation; the GDN reading them loads the cache rows itself
     std::vector<const ggml_tensor *> gdn_deferred_gathers;
+    ggml_cuda_mk_state * mk_state = nullptr;
 
 #ifdef USE_CUDA_GRAPH
     // Map from (first_node_ptr, token count) to cuda_graph - allows multiple graphs per context
