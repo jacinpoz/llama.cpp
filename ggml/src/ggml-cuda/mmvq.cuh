@@ -76,6 +76,9 @@ struct ggml_cuda_conv_state_src {
 };
 extern thread_local std::unordered_map<const ggml_tensor *, ggml_cuda_conv_state_src> g_conv_state_srcs;
 extern thread_local std::unordered_set<const ggml_tensor *>                            g_conv_elided_cpys;
+
+// GGML_CUDA_GDN_CONV_FUSED=1: match the GDN conv layers of this graph (once per graph uid) before its nodes run.
+void ggml_cuda_gdn_conv_prepare(ggml_cgraph * cgraph, bool single_stream);
 bool ggml_cuda_ssm_prescan_match_at(const struct ggml_cgraph * cgraph, int i);
 int ggml_cuda_ssm_prescan_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 

@@ -7314,6 +7314,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             ggml_cuda_gdn_gather_index gdn_gather_index;
             cuda_ctx->gdn_deferred_gathers.clear();
             ggml_cuda_gdn_clear_state_srcs();
+            ggml_cuda_gdn_conv_prepare(cgraph, stream_ctx.concurrent_events.empty());
             g_conv_state_srcs.clear();
             g_conv_elided_cpys.clear();
             g_precomputed_nodes.clear();
