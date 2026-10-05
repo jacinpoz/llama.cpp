@@ -653,40 +653,11 @@ static __global__ void mul_mat_vec_q(
 // ncols_dst == 1 path).
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, int rows_per_block = 0, bool long_k = false>
 __launch_bounds__(calc_nwarps_weight(type, ncols_dst, get_device_table_id(), long_k)*ggml_cuda_get_physical_warp_size(), 1)
-static __global__ void mul_mat_vec_q_ksplit(
-        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
-        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
-        const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
-        const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
-        const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
-        const uint32_t ids_stride) {
+static __global__ void mul_mat_vec_q_ksplit(const mk_mmvq_params p) {
     using op = mk_mmvq<calc_nwarps_weight(type, ncols_dst, get_device_table_id(), long_k)*ggml_cuda_get_physical_warp_size(),
                        type, ncols_dst, has_fusion, small_k, rows_per_block, long_k>;
     static_assert(!halve_iters, "the ksplit body has no halve_iters form");
     __shared__ __align__(16) char lds[op::lds_bytes];
-
-    mk_mmvq_params p;
-    p.vx                 = vx_ptr;
-    p.vy                 = vy_ptr;
-    p.ids                = ids_ptr;
-    p.dst                = dst_ptr;
-    p.fusion             = fusion;
-    p.nchannels_y        = nchannels_y;
-    p.channel_ratio      = channel_ratio;
-    p.sample_ratio       = sample_ratio;
-    p.ncols_x            = ncols_x;
-    p.stride_row_x       = stride_row_x;
-    p.stride_col_y       = stride_col_y;
-    p.stride_col_dst     = stride_col_dst;
-    p.stride_channel_x   = stride_channel_x;
-    p.stride_channel_y   = stride_channel_y;
-    p.stride_channel_dst = stride_channel_dst;
-    p.stride_sample_x    = stride_sample_x;
-    p.stride_sample_y    = stride_sample_y;
-    p.stride_sample_dst  = stride_sample_dst;
-    GGML_UNUSED(ids_stride);
-    p.nblocks_x          = gridDim.x;
-    p.nchannels_dst      = gridDim.y;
 
     ggml_cuda_pdl_sync();
     op::block(p, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y, true, lds);
@@ -916,24 +887,43 @@ static void mul_mat_vec_q_switch_fusion_ksplit(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_scale_channel_dst ||
                             fusion.conv_input != nullptr;
+    GGML_ASSERT((c_ncols_dst == 1 || !has_fusion) && "fusion only supported for ncols_dst=1");
+    GGML_UNUSED(ids_stride);
+
+    mk_mmvq_params p;
+    p.vx                 = vx;
+    p.vy                 = vy;
+    p.ids                = ids;
+    p.dst                = dst;
+    p.fusion             = fusion;
+    p.nchannels_y        = nchannels_y;
+    p.channel_ratio      = channel_ratio;
+    p.sample_ratio       = sample_ratio;
+    p.ncols_x            = ncols_x;
+    p.stride_row_x       = stride_row_x;
+    p.stride_col_y       = stride_col_y;
+    p.stride_col_dst     = stride_col_dst;
+    p.stride_channel_x   = stride_channel_x;
+    p.stride_channel_y   = stride_channel_y;
+    p.stride_channel_dst = stride_channel_dst;
+    p.stride_sample_x    = stride_sample_x;
+    p.stride_sample_y    = stride_sample_y;
+    p.stride_sample_dst  = stride_sample_dst;
+    p.nblocks_x          = block_nums.x;
+    p.nchannels_dst      = block_nums.y;
+
+    const bool fused = c_ncols_dst == 1 && has_fusion;
+    mk_record(MK_OP_MMVQ, mk_mmvq_variant(type, c_ncols_dst, fused, long_k),
+              !small_k && !halve_iters && rows_per_block == 0 ? (int64_t) block_nums.x*block_nums.y*block_nums.z : -1, p);
+
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
     if constexpr (c_ncols_dst == 1) {
-        if (has_fusion) {
-            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, true, small_k, halve_iters, rows_per_block, long_k>, launch_params,
-                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+        if (fused) {
+            ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, true, small_k, halve_iters, rows_per_block, long_k>, launch_params, p);
             return;
         }
     }
-
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
-
-    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, false, small_k, halve_iters, rows_per_block, long_k>, launch_params,
-        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+    ggml_cuda_kernel_launch(mul_mat_vec_q_ksplit<type, c_ncols_dst, false, small_k, halve_iters, rows_per_block, long_k>, launch_params, p);
 }
 
 template <ggml_type type>

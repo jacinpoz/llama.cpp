@@ -5,6 +5,8 @@
 #include "common.cuh"
 
 #include <cstdint>
+#include <cstring>
+#include <vector>
 
 #define MK_THREADS     1024
 #define MK_MAX_VGPRS   192
@@ -118,3 +120,26 @@ template <typename Op> using mk_op_params = typename mk_run_signature<decltype(&
 void    ggml_cuda_mk_launch(const mk_stream_desc & desc, cudaStream_t stream);
 int32_t ggml_cuda_mk_take_error(int32_t * error, cudaStream_t stream); // syncs the stream, returns and clears *error
 void    ggml_cuda_mk_reset_counters(const mk_stream_desc & desc, cudaStream_t stream);
+
+// Record mode: while g_mk_recording is set, op launchers append the params they launch with, so a stream
+// built from the records runs exactly what the normal path ran. n_tiles < 0 marks a launch with no megakernel op.
+struct mk_recorded_op {
+    uint16_t opcode;
+    uint16_t variant;
+    int32_t  n_tiles;
+    std::vector<uint8_t> params;
+};
+
+inline std::vector<mk_recorded_op> * g_mk_recording = nullptr;
+
+void ggml_cuda_mk_set_recording(std::vector<mk_recorded_op> * rec); // nullptr stops recording
+
+template <typename P>
+static void mk_record(uint16_t opcode, int variant, int64_t n_tiles, const P & p) {
+    if (g_mk_recording == nullptr) {
+        return;
+    }
+    mk_recorded_op r = { opcode, (uint16_t) variant, (int32_t) n_tiles, std::vector<uint8_t>(sizeof(P)) };
+    memcpy(r.params.data(), &p, sizeof(P));
+    g_mk_recording->push_back(std::move(r));
+}

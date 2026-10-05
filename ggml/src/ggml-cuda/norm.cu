@@ -604,11 +604,25 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 // the norm, one IEEE add as in k_bin_bcast) and written out, then normalized; y may then be null
 // (quantize cache already filled).
 template <int block_size, bool has_add = false>
-static __global__ void rms_norm_q8_1_f32(
+static __global__ void rms_norm_q8_1_f32(const mk_rmsnorm_q8_1_params p) {
+    extern __shared__ float s_sum[];
+    mk_rmsnorm_q8_1<block_size, block_size>::template row<has_add>(p, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, true, (char *) s_sum);
+}
+
+template <int block_size, bool has_add>
+static void rms_norm_q8_1_launch(const mk_rmsnorm_q8_1_params & p, const dim3 & blocks_num, cudaStream_t stream) {
+    mk_record(MK_OP_RMSNORM_Q8_1, (has_add ? MK_RMSNORM_Q8_1_ADD : 0) | (block_size == 256 ? MK_RMSNORM_Q8_1_W256 : 0),
+              (int64_t) blocks_num.x*blocks_num.y*blocks_num.z, p);
+    const dim3 block_dims(block_size, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_size > WARP_SIZE ? 32 * sizeof(float) : 0, stream};
+    ggml_cuda_kernel_launch(rms_norm_q8_1_f32<block_size, has_add>, launch_params, p);
+}
+
+static mk_rmsnorm_q8_1_params rms_norm_q8_1_params(
         const float * x, float * dst, block_q8_1 * y, const float * mul,
         const int ncols, const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
-        const int64_t mul_stride_row, const int ncols_padded, const float eps,
-        const float * xa, const float * xb) {
+        const int64_t mul_stride_row, const int ncols_padded, const float eps, const float * xa, const float * xb,
+        const dim3 & blocks_num) {
     mk_rmsnorm_q8_1_params p;
     p.x              = x;
     p.dst            = dst;
@@ -622,12 +636,10 @@ static __global__ void rms_norm_q8_1_f32(
     p.mul_stride_row = mul_stride_row;
     p.ncols          = ncols;
     p.ncols_padded   = ncols_padded;
-    p.nrows          = gridDim.x;
-    p.nchannels      = gridDim.y;
+    p.nrows          = blocks_num.x;
+    p.nchannels      = blocks_num.y;
     p.eps            = eps;
-
-    extern __shared__ float s_sum[];
-    mk_rmsnorm_q8_1<block_size, block_size>::template row<has_add>(p, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, true, (char *) s_sum);
+    return p;
 }
 
 static void rms_norm_q8_1_cuda(
@@ -636,14 +648,12 @@ static void rms_norm_q8_1_cuda(
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
         const int64_t mul_stride_row, const int ncols_padded, const float eps, cudaStream_t stream) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
+    const mk_rmsnorm_q8_1_params p = rms_norm_q8_1_params(x, dst, y, mul, ncols, stride_row, stride_channel, stride_sample,
+        mul_stride_row, ncols_padded, eps, nullptr, nullptr, blocks_num);
     if (ncols < 1024) {
-        const dim3 block_dims(256, 1, 1);
-        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-        ggml_cuda_kernel_launch(rms_norm_q8_1_f32<256>, launch_params, x, dst, y, mul, ncols, stride_row, stride_channel, stride_sample, mul_stride_row, ncols_padded, eps, (const float *) nullptr, (const float *) nullptr);
+        rms_norm_q8_1_launch<256, false>(p, blocks_num, stream);
     } else {
-        const dim3 block_dims(1024, 1, 1);
-        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-        ggml_cuda_kernel_launch(rms_norm_q8_1_f32<1024>, launch_params, x, dst, y, mul, ncols, stride_row, stride_channel, stride_sample, mul_stride_row, ncols_padded, eps, (const float *) nullptr, (const float *) nullptr);
+        rms_norm_q8_1_launch<1024, false>(p, blocks_num, stream);
     }
 }
 
@@ -677,13 +687,11 @@ bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor
                                       ncols, dst->ne[1], dst->ne[2], dst->ne[3],
                                       dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), dst->nb[3]/sizeof(float), found);
     const dim3 blocks_num(dst->ne[1], 1, 1);
+    const mk_rmsnorm_q8_1_params p = rms_norm_q8_1_params((const float *) add_node->data, (float *) dst->data,
+        found ? nullptr : (block_q8_1 *) q8_1, (const float *) weight->data, ncols, s01, 0, 0, 0, (int) ne10_padded, eps,
+        (const float *) a->data, (const float *) b->data, blocks_num);
     const auto launch = [&](auto bs_c) {
-        constexpr int BS = decltype(bs_c)::value;
-        const dim3 block_dims(BS, 1, 1);
-        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, BS > WARP_SIZE ? 32 * sizeof(float) : 0, ctx.stream()};
-        ggml_cuda_kernel_launch(rms_norm_q8_1_f32<BS, true>, launch_params, (const float *) add_node->data, (float *) dst->data,
-            found ? nullptr : (block_q8_1 *) q8_1, (const float *) weight->data, ncols, s01, (int64_t) 0, (int64_t) 0,
-            (int64_t) 0, (int) ne10_padded, eps, (const float *) a->data, (const float *) b->data);
+        rms_norm_q8_1_launch<decltype(bs_c)::value, true>(p, blocks_num, ctx.stream());
     };
     if (ncols < 1024) {
         launch(std::integral_constant<int, 256>{});

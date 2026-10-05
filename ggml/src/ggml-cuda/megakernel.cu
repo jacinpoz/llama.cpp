@@ -208,4 +208,8 @@ void ggml_cuda_mk_reset_counters(const mk_stream_desc & desc, cudaStream_t strea
     CUDA_CHECK(cudaMemsetAsync(desc.counters, 0, desc.n_counters*sizeof(uint32_t), stream));
 }
 
+void ggml_cuda_mk_set_recording(std::vector<mk_recorded_op> * rec) {
+    g_mk_recording = rec;
+}
+
 #endif // defined(GGML_USE_HIP)

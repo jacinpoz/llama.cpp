@@ -54,23 +54,8 @@ static __device__ __forceinline__ float nvfp4_native_scale_error(
 static_assert(mk_quantize_q8_1<CUDA_QUANTIZE_BLOCK_SIZE>::threads == CUDA_QUANTIZE_BLOCK_SIZE, "quantize_q8_1 block size");
 
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
-static __global__ void quantize_q8_1(
-        const float * x_ptr, void * vy_ptr,
-        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
+static __global__ void quantize_q8_1(const mk_quantize_q8_1_params p) {
     ggml_cuda_pdl_lc();
-    mk_quantize_q8_1_params p;
-    p.x         = x_ptr;
-    p.vy        = vy_ptr;
-    p.ne00      = ne00;
-    p.s01       = s01;
-    p.s02       = s02;
-    p.s03       = s03;
-    p.ne0       = ne0;
-    p.ne1       = ne1;
-    p.ne2       = ne2;
-    p.nblocks_x = gridDim.x;
-
     ggml_cuda_pdl_sync();
     mk_quantize_q8_1<CUDA_QUANTIZE_BLOCK_SIZE>::block(p, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, true);
 }
@@ -565,8 +550,20 @@ void quantize_row_q8_1_cuda(
     const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+    mk_quantize_q8_1_params p;
+    p.x         = x;
+    p.vy        = vy;
+    p.ne00      = ne00;
+    p.s01       = s01;
+    p.s02       = s02;
+    p.s03       = s03;
+    p.ne0       = ne0;
+    p.ne1       = ne1;
+    p.ne2       = ne2_fastdiv;
+    p.nblocks_x = num_blocks.x;
+    mk_record(MK_OP_QUANTIZE_Q8_1, 0, (int64_t) num_blocks.x*num_blocks.y*num_blocks.z, p);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, p);
     GGML_UNUSED(type_src0);
 }
 
