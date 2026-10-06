@@ -1003,12 +1003,14 @@ bool ggml_cuda_op_attn_head_prep(ggml_backend_cuda_context & ctx, const ggml_ten
 }
 
 bool ggml_cuda_op_hadamard64_set_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * hadamard, ggml_tensor * set_rows) {
-    const ggml_tensor * src = hadamard->src[1];  // [64, 4*n_head, n_tok] view of the [256, n_head, n_tok] V rows
-    if (src->type != GGML_TYPE_F32 || src->ne[0] != 64 || !ggml_is_contiguous(src) || src->ne[1] % 4 != 0 || src->ne[3] != 1) {
+    const ggml_tensor * src = hadamard->src[1];  // the [256, n_head, n_tok] V rows as 64-chunks, in 2 or 3 dims
+    const int64_t n_tok  = ggml_nelements(set_rows->src[1]);
+    const int64_t n_rows = src->ne[1]*src->ne[2];
+    if (src->type != GGML_TYPE_F32 || src->ne[0] != 64 || !ggml_is_contiguous(src) || src->ne[3] != 1 ||
+            n_tok == 0 || n_rows % (4*n_tok) != 0) {
         return false;
     }
-    const int64_t n_head = src->ne[1]/4;
-    const int64_t n_tok  = src->ne[2];
+    const int64_t n_head = n_rows/(4*n_tok);
     if (!attn_set_rows_ok(set_rows, n_head, n_tok)) {
         return false;
     }
