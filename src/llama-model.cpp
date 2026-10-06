@@ -38,6 +38,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -1930,7 +1931,90 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    create_mtp_draft_head();
+
     return true;
+}
+
+// The MTP drafter scores only the first LLAMA_MTP_DRAFT_VOCAB rows of the LM head; a smaller quant of those rows
+// cuts its read per draft step. Drafts are still verified by the full head, so only the acceptance rate can change.
+void llama_model::create_mtp_draft_head() {
+    const char * type_env  = getenv("LLAMA_MTP_DRAFT_HEAD_TYPE");
+    const char * vocab_env = getenv("LLAMA_MTP_DRAFT_VOCAB");
+    if (type_env == nullptr || vocab_env == nullptr) {
+        return;
+    }
+    ggml_type type = GGML_TYPE_COUNT;
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        const char * name = ggml_type_name((ggml_type) t);
+        if (name != nullptr && strcmp(name, type_env) == 0) {
+            type = (ggml_type) t;
+            break;
+        }
+    }
+    const ggml_tensor * src   = output;
+    const ggml_tensor * src_s = output_s;
+    for (const auto & layer : layers) {
+        if (layer.nextn.shared_head_head != nullptr) {
+            src   = layer.nextn.shared_head_head;
+            src_s = layer.nextn.shared_head_head_s;
+        }
+    }
+    const int64_t n_rows = atoll(vocab_env);
+    ggml_backend_buffer_type_t buft = src && src->buffer ? ggml_backend_buffer_get_type(src->buffer) : nullptr;
+    ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+    // only a plain device buffer: a host, repacked or split head has a different layout or no tensor read
+    const bool plain_dev = dev != nullptr && !ggml_backend_buffer_is_host(src->buffer) && ggml_backend_dev_buffer_type(dev) == buft;
+    if (type == GGML_TYPE_COUNT || ggml_get_type_traits(type)->from_float_ref == nullptr || ggml_quantize_requires_imatrix(type) ||
+            !plain_dev || src_s != nullptr || n_rows <= 0 || n_rows >= src->ne[1] || src->ne[0] % ggml_blck_size(type) != 0 ||
+            ggml_get_type_traits(src->type)->to_float == nullptr) {
+        LLAMA_LOG_WARN("%s: LLAMA_MTP_DRAFT_HEAD_TYPE=%s not applicable, keeping the original head\n", __func__, type_env);
+        return;
+    }
+
+    const int64_t n_per_row = src->ne[0];
+    const size_t  row_size  = ggml_row_size(type, n_per_row);
+    const auto    to_float  = ggml_get_type_traits(src->type)->to_float;
+    const int     n_threads = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    const int64_t n_block   = 4096;
+    std::vector<uint8_t> dst_data(n_rows*row_size);
+    std::vector<uint8_t> src_block(n_block*src->nb[1]);
+    for (int64_t r0 = 0; r0 < n_rows; r0 += n_block) {
+        const int64_t nr = std::min(n_block, n_rows - r0);
+        ggml_backend_tensor_get(src, src_block.data(), r0*src->nb[1], nr*src->nb[1]);
+        std::vector<std::thread> workers;
+        for (int it = 0; it < n_threads; ++it) {
+            workers.emplace_back([&, it]() {
+                std::vector<float> f32(n_per_row);
+                for (int64_t r = it; r < nr; r += n_threads) {
+                    to_float(src_block.data() + r*src->nb[1], f32.data(), n_per_row);
+                    ggml_quantize_chunk(type, f32.data(), dst_data.data() + (r0 + r)*row_size, 0, 1, n_per_row, nullptr);
+                }
+            });
+        }
+        for (auto & w : workers) {
+            w.join();
+        }
+    }
+
+    ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+    ggml_context_ptr ctx(ggml_init(ip));
+    ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), type, n_per_row, n_rows);
+    ggml_set_name(t, "mtp_draft_head");
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+    if (!buf) {
+        LLAMA_LOG_WARN("%s: could not allocate the MTP draft head, keeping the original head\n", __func__);
+        return;
+    }
+    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_set(t, dst_data.data(), 0, dst_data.size());
+    LLAMA_LOG_INFO("%s: MTP draft head: %lld rows %s -> %s (%.1f -> %.1f MiB)\n", __func__, (long long) n_rows,
+            ggml_type_name(src->type), ggml_type_name(type), n_rows*src->nb[1]/1048576.0, dst_data.size()/1048576.0);
+
+    mtp_draft_head = t;
+    std::vector<ggml_backend_buffer_ptr> bufs;
+    bufs.emplace_back(std::move(buf));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {

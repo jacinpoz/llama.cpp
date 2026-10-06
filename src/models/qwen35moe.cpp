@@ -750,7 +750,9 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     const int64_t n_dv = n_dv_env;
     if (n_dv > 0 && head_s == nullptr && n_dv + n_tail < n_vocab_h) {
         const int64_t n_mid = n_vocab_h - n_dv - n_tail;
-        ggml_tensor * w_lo = ggml_view_2d(ctx0, head_w, head_w->ne[0], n_dv, head_w->nb[1], 0);
+        ggml_tensor * w_lo = model.mtp_draft_head != nullptr && model.mtp_draft_head->ne[1] == n_dv
+                ? model.mtp_draft_head
+                : ggml_view_2d(ctx0, head_w, head_w->ne[0], n_dv, head_w->nb[1], 0);
         ggml_tensor * lo   = ggml_mul_mat(ctx0, w_lo, cur);
         cb(lo, "mtp_head_lo", -1);
         // -inf filler for the skipped ids: ggml_fill needs a source of the right shape, any values

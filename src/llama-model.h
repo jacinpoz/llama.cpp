@@ -644,6 +644,9 @@ struct llama_model {
     struct ggml_tensor * output_s    = nullptr;
     struct ggml_tensor * output_in_s = nullptr;
 
+    // LLAMA_MTP_DRAFT_HEAD_TYPE: requantized copy of the first LLAMA_MTP_DRAFT_VOCAB rows of the MTP LM head
+    struct ggml_tensor * mtp_draft_head = nullptr;
+
     // NextN/MTP model-level projections
     struct ggml_tensor * nextn_proj_pre  = nullptr;
     struct ggml_tensor * nextn_proj_post = nullptr;
@@ -725,6 +728,8 @@ struct llama_model {
 
     explicit llama_model(const llama_model_params & params);
     virtual ~llama_model();
+
+    void create_mtp_draft_head();
 
     std::string arch_name() const;
     std::string type_name() const;
