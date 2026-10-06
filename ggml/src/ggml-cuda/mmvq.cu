@@ -3696,6 +3696,50 @@ static __global__ void __launch_bounds__(BLOCK, 1) mmvq_triple(
     }
 }
 
+// Two IQ4_XS matvecs reading the same 2..8-token input, as in the triple.
+static int mmvq_pair_ncols(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b) {
+    auto one_row = [](const ggml_cuda_mmvq_capture & x) { return x.valid && x.grid_y == 1 && x.grid_z == 1 && 256 % x.threads == 0; };
+    if (!one_row(a) || !one_row(b)) {
+        return 0;
+    }
+    for (int t = 2; t <= MMVQ_MAX_BATCH_SIZE; ++t) {
+        if (a.variant == mk_mmvq_variant(GGML_TYPE_IQ4_XS, t, false, true) && b.variant == a.variant) {
+            return t;
+        }
+    }
+    return 0;
+}
+
+bool ggml_cuda_mmvq_pair_t_supported(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return mmvq_pair_ncols(a, b) > 0 && get_device_table_id(cc) == MMVQ_PARAMETERS_RDNA3_0;
+}
+
+void ggml_cuda_mmvq_launch_pair_t(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, cudaStream_t stream) {
+    mk_mmvq_params pa, pb;
+    memcpy(&pa, a.params, sizeof(pa));
+    memcpy(&pb, b.params, sizeof(pb));
+    constexpr int BLOCK = 256;
+    const uint32_t nba = mmvq_multi_blocks(a, BLOCK);
+    const uint32_t nbb = mmvq_multi_blocks(b, BLOCK);
+    auto launch = [&](auto t_c) {
+        constexpr int T = decltype(t_c)::value;
+        using Op = mk_mmvq<BLOCK, GGML_TYPE_IQ4_XS, T, false, false, 0, true>;
+        mmvq_pair<BLOCK, Op, Op><<<nba + nbb, BLOCK, 0, stream>>>(pa, a.grid_x, nba, pb, b.grid_x);
+    };
+    switch (mmvq_pair_ncols(a, b)) {
+        case 2: launch(std::integral_constant<int, 2>{}); break;
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        case 6: launch(std::integral_constant<int, 6>{}); break;
+        case 7: launch(std::integral_constant<int, 7>{}); break;
+        case 8: launch(std::integral_constant<int, 8>{}); break;
+        default: GGML_ABORT("mmvq pair: unsupported pair");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static int mmvq_triple_ncols(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, const ggml_cuda_mmvq_capture & c) {
     auto one_row = [](const ggml_cuda_mmvq_capture & x) { return x.valid && x.grid_y == 1 && x.grid_z == 1 && 256 % x.threads == 0; };
     if (!one_row(a) || !one_row(b) || !one_row(c)) {
@@ -3797,3 +3841,64 @@ int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     g_precomputed_nodes.insert(kv[1]);
     return -1;
 }
+
+// GGML_CUDA_VERIFY_PAIR: at 2..8 tokens, an IQ4_XS matvec and the next IQ4_XS matvec on the same input (FFN up and
+// gate, GDN qkv and z) run as one launch; the second one is written early into a private buffer. a_out is the first
+// matvec's destination (the node itself, or a copy pointing at scratch memory). Returns false when nothing ran.
+static bool ggml_cuda_verify_pair() {
+    // the fused gate/up/GLU of GGML_CUDA_VERIFY_GLU claims the FFN matvecs itself
+    static const bool enabled = getenv("GGML_CUDA_VERIFY_PAIR") != nullptr && atoi(getenv("GGML_CUDA_VERIFY_PAIR")) != 0 &&
+        !(getenv("GGML_CUDA_VERIFY_GLU") != nullptr && atoi(getenv("GGML_CUDA_VERIFY_GLU")) != 0);
+    return enabled;
+}
+
+bool ggml_cuda_mmvq_pair_t(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i, ggml_tensor * a_out) {
+    const ggml_tensor * a = cgraph->nodes[i];
+    if (!ggml_cuda_verify_pair() || !g_verify_gdn_single_stream || a->op != GGML_OP_MUL_MAT || a->src[0]->type != GGML_TYPE_IQ4_XS ||
+            a->ne[1] < 2 || a->ne[1] > MMVQ_MAX_BATCH_SIZE || a->ne[2] != 1 || a->src[2] != nullptr) {
+        return false;
+    }
+    const auto is_mmvq = [&](const ggml_tensor * m) {
+        return ggml_cuda_mul_mat_kernel(ctx, m->src[0], m->src[1], m) == GGML_CUDA_MM_MMVQ;
+    };
+    if (!is_mmvq(a)) {
+        return false;
+    }
+    ggml_tensor * b = nullptr;
+    for (int k = i + 1; k < std::min(cgraph->n_nodes, i + 128); ++k) {
+        ggml_tensor * n = cgraph->nodes[k];
+        if (n->op == GGML_OP_MUL_MAT && n->src[1] == a->src[1] && (n->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                n->src[0]->type == GGML_TYPE_IQ4_XS && n->ne[1] == a->ne[1] && n->ne[2] == 1 && n->src[2] == nullptr &&
+                !(n->flags & GGML_TENSOR_FLAG_OUTPUT) && g_precomputed_nodes.count(n) == 0) {
+            b = n;
+            break;
+        }
+    }
+    if (b == nullptr || !is_mmvq(b)) {
+        if (ggml_cuda_fuse_debug()) {
+            fprintf(stderr, "fuse-debug: pair at %s rejected: partner %s\n", a->name, b ? b->name : "none");
+        }
+        return false;
+    }
+    ggml_cuda_redirect_early_output(cgraph, i, b);
+    ggml_cuda_mmvq_capture cap[2];
+    ggml_tensor * mm[2] = { a_out, b };
+    for (int m = 0; m < 2; ++m) {
+        ggml_cuda_mmvq_set_capture(&cap[m]);
+        ggml_cuda_mul_mat_vec_q(ctx, mm[m]->src[0], mm[m]->src[1], nullptr, mm[m], nullptr);
+    }
+    ggml_cuda_mmvq_set_capture(nullptr);
+    if (ggml_cuda_mmvq_pair_t_supported(cap[0], cap[1])) {
+        ggml_cuda_mmvq_launch_pair_t(cap[0], cap[1], ctx.stream());
+    } else {
+        // a captured launch did not run
+        for (int m = 0; m < 2; ++m) {
+            if (cap[m].valid) {
+                ggml_cuda_mul_mat_vec_q(ctx, mm[m]->src[0], mm[m]->src[1], nullptr, mm[m], nullptr);
+            }
+        }
+    }
+    g_precomputed_nodes.insert(b);
+    return true;
+}
+

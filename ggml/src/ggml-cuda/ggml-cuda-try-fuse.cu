@@ -2348,7 +2348,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
         return 0;
     }
     if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
-        const int r = ggml_cuda_try_mmvq_triple(*cuda_ctx, cgraph, i);
+        int r = ggml_cuda_try_mmvq_triple(*cuda_ctx, cgraph, i);
+        if (r == 0 && ggml_cuda_mmvq_pair_t(*cuda_ctx, cgraph, i, cgraph->nodes[i])) {
+            r = -1;
+        }
         if (r != 0) {
             return r;
         }

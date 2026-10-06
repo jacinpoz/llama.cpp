@@ -7600,15 +7600,18 @@ static bool ggml_cuda_try_elide_verify_conv_gather(const ggml_cgraph * cgraph, c
     return true;
 }
 
-static bool ggml_cuda_try_verify_conv_launch(ggml_backend_cuda_context & ctx, ggml_tensor * node) {
+static bool ggml_cuda_try_verify_conv_launch(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
     ggml_cuda_verify_conv_plan & plan = g_verify_conv_plan;
+    ggml_tensor * node = cgraph->nodes[i];
     if (plan.qkv != node) {
         return false;
     }
     ggml_cuda_pool_alloc<float> x(ctx.pool(), ggml_nelements(node));
     ggml_tensor qkv = *node;
     qkv.data = x.get();
-    ggml_cuda_compute_forward(ctx, &qkv);
+    if (!ggml_cuda_mmvq_pair_t(ctx, cgraph, i, &qkv)) {
+        ggml_cuda_compute_forward(ctx, &qkv);
+    }
     plan.p.x = x.get();
     ggml_cuda_gdn_conv(plan.p, ctx.stream());
     g_precomputed_nodes.insert(plan.skip, plan.skip + plan.n_skip);
@@ -7847,7 +7850,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
                 if (g_verify_conv_plan.qkv != nullptr) {
-                    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_try_verify_conv_launch(*cuda_ctx, node)) {
+                    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_try_verify_conv_launch(*cuda_ctx, cgraph, i)) {
                         continue;
                     }
                     if (node->op == GGML_OP_CONCAT) {
