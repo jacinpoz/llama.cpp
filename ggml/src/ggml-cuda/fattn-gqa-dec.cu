@@ -9,8 +9,7 @@
 
 namespace {
 
-// The partial buffer holds kMaxQ*mk_attn_max_chunks (token, chunk) pairs whatever n_kv is, so the pool returns the same
-// buffer every call; a pass takes as many query tokens as fit and wider batches loop.
+// The partial buffer always holds kMaxQ*mk_attn_max_chunks (token, chunk) pairs, so the pool returns the same buffer every call.
 constexpr int kMaxQ = 4;
 
 template <int G, ggml_type T>
