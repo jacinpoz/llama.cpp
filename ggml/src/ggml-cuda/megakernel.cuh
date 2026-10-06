@@ -22,7 +22,7 @@ enum mk_opcode : uint16_t {
     MK_OP_NOP = 0,
     MK_OP_EXIT,
 
-    // WS-A: mk-ops-ffn.cuh
+    // mk-ops-ffn.cuh
     MK_OP_RMSNORM_Q8_1,        // optional residual add; whole row per tile
     MK_OP_MMVQ,                // IQ4_XS / Q6_K / Q8_0 / Q4_K / Q5_K, optional GLU and add; rows per tile
     MK_OP_LM_HEAD_ARGMAX,      // per-tile argmax partials over the LM head logits
@@ -30,13 +30,13 @@ enum mk_opcode : uint16_t {
     MK_OP_RMSNORM_F32,         // optional weight mul
     MK_OP_QUANTIZE_Q8_1,
 
-    // WS-B: mk-ops-gdn.cuh
+    // mk-ops-gdn.cuh
     MK_OP_GDN_GATES,
     MK_OP_GDN_CONV,            // in-place conv state, silu, q/k l2-norm
     MK_OP_GDN_STEP,            // in-place recurrent state update
     MK_OP_GDN_OUT_GATE,        // norm, silu(z) gate, q8_1
 
-    // WS-C: mk-ops-attn.cuh
+    // mk-ops-attn.cuh
     MK_OP_ATTN_PREP_Q,
     MK_OP_ATTN_PREP_K,
     MK_OP_V_HAD_SET_ROWS,
@@ -45,7 +45,7 @@ enum mk_opcode : uint16_t {
 
     MK_OP_COUNT,
 
-    // WS-D: mk-ops-test.cuh, used by test-megakernel
+    // mk-ops-test.cuh, used by test-megakernel
     MK_OP_TEST_ADD = 0xF000,
     MK_OP_TEST_SPIN,
 };
