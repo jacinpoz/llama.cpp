@@ -360,6 +360,12 @@ static constexpr __host__ __device__ int calc_rows_per_block_override(int rows_p
 #define GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS 512
 #endif
 static constexpr __host__ __device__ int calc_rows_per_block_weight(ggml_type type, int ncols_dst, int table_id, bool small_k, int nwarps) {
+    // gfx1100, K = 6144, n = 5: Q6_K 45.6 -> 39.5 us and IQ4_XS 23.5 -> 18.5 us at 2 rows; MTP verify +2.1%.
+    // IQ4_XS at 8 columns would overflow the megakernel's LDS budget.
+    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst >= 2 &&
+            (type == GGML_TYPE_Q6_K || (type == GGML_TYPE_IQ4_XS && ncols_dst <= 7))) {
+        return 2;
+    }
     if (table_id == MMVQ_PARAMETERS_RDNA4 && ncols_dst >= 1 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
         // Multi-row blocks only pay off for one-wave blocks: the 8-wave Q8_0 short-K block
         // (calc_nwarps_weight) was measured slower at every row count (K = 2880, 8 tokens:
