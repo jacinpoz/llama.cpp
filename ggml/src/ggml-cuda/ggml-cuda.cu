@@ -5095,7 +5095,8 @@ static bool ggml_cuda_gdn_conv_make_plan(const ggml_cgraph * cgraph, const int i
 // Qwen3.5/3.8 gated-attention tail after a GQA-decode FLASH_ATTN_EXT (n_q <= 8):
 //   RESHAPE RESHAPE MUL_MAT(hadamard 64) RESHAPE VIEW(gate of Qcur_full) CONT SIGMOID MUL
 // is folded into the attention combine kernel (fwht64 in fwht_cuda's stage order, so bit-identical, then
-// x sigmoid(gate)), saving three launches per attention layer. GGML_CUDA_DISABLE_ATTN_TAIL_FUSION=1 turns it off.
+// x sigmoid(gate)), saving three launches per attention layer; when the result feeds one mmvq matmul it is also written
+// as that matmul's Q8_1 input. GGML_CUDA_DISABLE_ATTN_TAIL_FUSION=1 turns it off.
 static int ggml_cuda_try_fuse_attn_tail(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
     static const bool disabled = getenv("GGML_CUDA_DISABLE_ATTN_TAIL_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_ATTN_TAIL_FUSION")) != 0;
     ggml_tensor * fa = cgraph->nodes[i];
