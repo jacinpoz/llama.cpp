@@ -8,6 +8,7 @@
 #include "cpy-utils.cuh"
 #include "fattn-gqa-dec.cuh"
 #include "megakernel.cuh"
+#include "mk-ops-ffn.cuh"
 #include "rope-yarn.cuh"
 
 // block_reduce<SUM, threads> with the warp index taken from the sub-tile lane.
@@ -660,6 +661,20 @@ struct mk_attn_combine {
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 out[i] = o[i];
+            }
+            if (p.ep.q8 != nullptr) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    w_acc[0][lane*8 + i] = o[i];
+                }
+            }
+        }
+        if (p.ep.q8 != nullptr) {
+            static_assert(mk_attn_combine_waves*QK8_1 == mk_attn_d, "one Q8_1 block per wave");
+            __syncthreads();
+            if (live) {
+                block_q8_1 * yb = p.ep.q8 + (int64_t) (p.q0 + t)*p.ep.q8_row_blocks + hq*(mk_attn_d/QK8_1) + w;
+                mk_quantize_q8_1_group(w_acc[0][w*QK8_1 + lane], yb, lane);
             }
         }
     }
