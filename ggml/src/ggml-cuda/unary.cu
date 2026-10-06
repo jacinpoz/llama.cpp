@@ -393,7 +393,7 @@ static __global__ void unary_gated_q8_1_op_kernel(const T * x, const T * g, bloc
 // finds it via the cache and skips its own quantize.
 template <float (*op)(float)>
 static void ggml_cuda_op_unary_mul_q8_1_impl(ggml_backend_cuda_context & ctx,
-                                             ggml_tensor * unary_node, ggml_tensor * mul_node,
+                                             const ggml_tensor * unary_src, const ggml_tensor * other_src,
                                              const ggml_tensor * mm) {
     const ggml_tensor * src1 = mm->src[1]; // the activation the matmul quantizes
     cudaStream_t stream = ctx.stream();
@@ -421,13 +421,10 @@ static void ggml_cuda_op_unary_mul_q8_1_impl(ggml_backend_cuda_context & ctx,
         return; // already quantized elsewhere; the F32 output is unused
     }
 
-    const ggml_tensor * unary_src = unary_node->src[0];
-    const ggml_tensor * other_src = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
-
-    GGML_ASSERT(unary_src->type == GGML_TYPE_F32 && other_src->type == GGML_TYPE_F32 && mul_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(unary_src->type == GGML_TYPE_F32 && other_src->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous_1(unary_src) && ggml_is_contiguous_1(other_src));
 
-    const int64_t k  = ggml_nelements(mul_node);
+    const int64_t k  = ggml_nelements(unary_src);
     const int64_t nc = unary_src->ne[0];
     const int64_t unary_stride = unary_src->nb[1];
     const int64_t other_stride = other_src->nb[1];
@@ -443,12 +440,20 @@ static void ggml_cuda_op_unary_mul_q8_1_impl(ggml_backend_cuda_context & ctx,
 void ggml_cuda_op_unary_mul_q8_1(ggml_backend_cuda_context & ctx,
                                  ggml_tensor * unary_node, ggml_tensor * mul_node,
                                  const ggml_tensor * mm) {
+    GGML_ASSERT(mul_node->type == GGML_TYPE_F32);
+    const ggml_tensor * unary_src = unary_node->src[0];
+    const ggml_tensor * other_src = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
     switch (ggml_get_unary_op(unary_node)) {
-        case GGML_UNARY_OP_SILU:      ggml_cuda_op_unary_mul_q8_1_impl<op_silu>(ctx, unary_node, mul_node, mm); break;
-        case GGML_UNARY_OP_SIGMOID:   ggml_cuda_op_unary_mul_q8_1_impl<op_sigmoid>(ctx, unary_node, mul_node, mm); break;
-        case GGML_UNARY_OP_SOFTPLUS:  ggml_cuda_op_unary_mul_q8_1_impl<op_softplus>(ctx, unary_node, mul_node, mm); break;
+        case GGML_UNARY_OP_SILU:      ggml_cuda_op_unary_mul_q8_1_impl<op_silu>(ctx, unary_src, other_src, mm); break;
+        case GGML_UNARY_OP_SIGMOID:   ggml_cuda_op_unary_mul_q8_1_impl<op_sigmoid>(ctx, unary_src, other_src, mm); break;
+        case GGML_UNARY_OP_SOFTPLUS:  ggml_cuda_op_unary_mul_q8_1_impl<op_softplus>(ctx, unary_src, other_src, mm); break;
         default: GGML_ABORT("unsupported unary op");
     }
+}
+
+void ggml_cuda_op_swiglu_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, const ggml_tensor * mm) {
+    GGML_ASSERT(glu->type == GGML_TYPE_F32 && glu->src[1] != nullptr);
+    ggml_cuda_op_unary_mul_q8_1_impl<op_silu>(ctx, glu->src[0], glu->src[1], mm);
 }
 
 template <float (*op)(float), typename T>
