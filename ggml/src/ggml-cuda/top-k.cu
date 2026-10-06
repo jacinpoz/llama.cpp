@@ -177,6 +177,142 @@ static __global__ void top_k_radix_gather(
     }
 }
 
+// Small k (<= 16): each thread keeps a sorted top-K list in registers over its strided slice, a block merges its
+// threads' lists by K rounds of argmax, and a second launch merges the per-block lists of each row the same way.
+// Two launches instead of the radix select's ten; ties go to the lower index.
+template <int K>
+static __device__ __forceinline__ void top_k_small_insert(float (&v)[K], int (&id)[K], const float f, const int i) {
+    if (!(f > v[K - 1] || (f == v[K - 1] && i < id[K - 1]))) {
+        return;
+    }
+    v[K - 1]  = f;
+    id[K - 1] = i;
+#pragma unroll
+    for (int j = K - 1; j > 0; --j) {
+        if (v[j] > v[j - 1] || (v[j] == v[j - 1] && id[j] < id[j - 1])) {
+            const float tv = v[j]; v[j] = v[j - 1]; v[j - 1] = tv;
+            const int   ti = id[j]; id[j] = id[j - 1]; id[j - 1] = ti;
+        }
+    }
+}
+
+// K rounds of block argmax over the threads' list heads; out_v/out_i receive the k best of the block, best first.
+template <int K, int BLOCK>
+static __device__ void top_k_small_merge(float (&v)[K], int (&id)[K], const int k, float * out_v, int * out_i) {
+    __shared__ float wv[BLOCK / WARP_SIZE];
+    __shared__ int   wi[BLOCK / WARP_SIZE];
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    for (int r = 0; r < k; ++r) {
+        float bv = v[0];
+        int   bi = id[0];
+#pragma unroll
+        for (int off = WARP_SIZE/2; off > 0; off >>= 1) {
+            const float ov = __shfl_xor(bv, off, WARP_SIZE);
+            const int   oi = __shfl_xor(bi, off, WARP_SIZE);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        if (lane == 0) {
+            wv[warp] = bv;
+            wi[warp] = bi;
+        }
+        __syncthreads();
+        bv = wv[0];
+        bi = wi[0];
+        for (int w = 1; w < BLOCK / WARP_SIZE; ++w) {
+            if (wv[w] > bv || (wv[w] == bv && wi[w] < bi)) {
+                bv = wv[w];
+                bi = wi[w];
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            out_v[r] = bv;
+            out_i[r] = bi;
+        }
+        if (id[0] == bi) {
+#pragma unroll
+            for (int j = 0; j < K - 1; ++j) {
+                v[j]  = v[j + 1];
+                id[j] = id[j + 1];
+            }
+            v[K - 1]  = -INFINITY;
+            id[K - 1] = INT_MAX;
+        }
+    }
+}
+
+template <int K, int BLOCK>
+static __global__ void __launch_bounds__(BLOCK, 1) top_k_small_pass1(
+        const float * src, float * cand_v, int * cand_i, const int ncols, const int k, const int slice) {
+    const int row = blockIdx.y;
+    const int beg = blockIdx.x*slice;
+    const int end = min(ncols, beg + slice);
+    const float * x = src + (int64_t) row*ncols;
+    float v[K];
+    int   id[K];
+#pragma unroll
+    for (int j = 0; j < K; ++j) {
+        v[j]  = -INFINITY;
+        id[j] = INT_MAX;
+    }
+    for (int c = beg + threadIdx.x; c < end; c += BLOCK) {
+        top_k_small_insert<K>(v, id, x[c], c);
+    }
+    const int64_t o = ((int64_t) row*gridDim.x + blockIdx.x)*k;
+    top_k_small_merge<K, BLOCK>(v, id, k, cand_v + o, cand_i + o);
+}
+
+template <int K, int BLOCK>
+static __global__ void __launch_bounds__(BLOCK, 1) top_k_small_pass2(
+        const float * cand_v, const int * cand_i, int * dst, const int n_cand, const int k) {
+    const int row = blockIdx.x;
+    float v[K];
+    int   id[K];
+#pragma unroll
+    for (int j = 0; j < K; ++j) {
+        v[j]  = -INFINITY;
+        id[j] = INT_MAX;
+    }
+    for (int c = threadIdx.x; c < n_cand; c += BLOCK) {
+        top_k_small_insert<K>(v, id, cand_v[(int64_t) row*n_cand + c], cand_i[(int64_t) row*n_cand + c]);
+    }
+    __shared__ float out_v[K];
+    __shared__ int   out_i[K];
+    top_k_small_merge<K, BLOCK>(v, id, k, out_v, out_i);
+    __syncthreads();
+    if (threadIdx.x < k) {
+        dst[(int64_t) row*k + threadIdx.x] = out_i[threadIdx.x];
+    }
+}
+
+static bool top_k_small_cuda(ggml_cuda_pool & pool, const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+    static const bool enabled = getenv("GGML_CUDA_TOP_K_SMALL") != nullptr && atoi(getenv("GGML_CUDA_TOP_K_SMALL")) != 0;
+    if (!enabled || k > 16 || nrows > 64) {
+        return false;
+    }
+    constexpr int BLOCK  = 256;
+    const int n_blocks   = std::min(64, (ncols + 4*BLOCK - 1) / (4*BLOCK));
+    const int slice      = (ncols + n_blocks - 1) / n_blocks;
+    ggml_cuda_pool_alloc<float> cand_v(pool, (size_t) nrows*n_blocks*k);
+    ggml_cuda_pool_alloc<int>   cand_i(pool, (size_t) nrows*n_blocks*k);
+    auto launch = [&](auto k_c) {
+        constexpr int K = decltype(k_c)::value;
+        top_k_small_pass1<K, BLOCK><<<dim3(n_blocks, nrows), BLOCK, 0, stream>>>(src, cand_v.get(), cand_i.get(), ncols, k, slice);
+        top_k_small_pass2<K, BLOCK><<<nrows, BLOCK, 0, stream>>>(cand_v.get(), cand_i.get(), dst, n_blocks*k, k);
+    };
+    if (k <= 8) {
+        launch(std::integral_constant<int, 8>{});
+    } else {
+        launch(std::integral_constant<int, 16>{});
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 static void top_k_radix_cuda(
         ggml_cuda_pool & pool,
         const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
@@ -260,7 +396,9 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #else                             // GGML_CUDA_USE_CUB
 #if defined(GGML_USE_HIP)
     if (ncols > 1024) {
-        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        if (!top_k_small_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream)) {
+            top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        }
     } else {
 #endif // defined(GGML_USE_HIP)
         ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
