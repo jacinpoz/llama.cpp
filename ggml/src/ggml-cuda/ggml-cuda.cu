@@ -1806,7 +1806,7 @@ static bool ggml_cuda_is_pinned_range(const void * p, const size_t size) {
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     {
-        // uploads still queued from this buffer were never consumed; drop them before the memory goes away
+        // queued uploads from this buffer would read freed memory
         std::lock_guard<std::mutex> lock(g_pinned_mutex);
         const uintptr_t b = (uintptr_t) buffer->context;
         const uintptr_t e = b + g_pinned_ranges[b];
@@ -3256,7 +3256,7 @@ struct ggml_cuda_h2d_batch {
     ggml_cuda_h2d_entry e[ggml_cuda_h2d_batch_max];
 };
 
-// Block row y copies entry y, reading the pinned source directly. Entries are 4-byte aligned.
+// Entries are 4-byte aligned.
 static __global__ void k_h2d_gather(const ggml_cuda_h2d_batch b) {
     const ggml_cuda_h2d_entry & e = b.e[blockIdx.y];
     const uint32_t n = e.size/4;
@@ -3265,7 +3265,7 @@ static __global__ void k_h2d_gather(const ggml_cuda_h2d_batch b) {
     }
 }
 
-// Issues the queued GGML_CUDA_BATCH_H2D uploads; every other use of the stream calls this first so order is kept.
+// Every other use of the stream calls this first, so queued uploads stay ordered.
 static void ggml_cuda_flush_h2d(ggml_backend_cuda_context * ctx) {
     auto & q = ctx->h2d_pending;
     if (q.empty()) {
@@ -3292,7 +3292,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     static const bool batch_h2d = getenv("GGML_CUDA_BATCH_H2D") != nullptr && atoi(getenv("GGML_CUDA_BATCH_H2D")) != 0;
     char * dst = (char *) tensor->data + offset;
-    // copies to disjoint destinations need no order between them; an overlapping one is ordered by a flush
+    // only overlapping destinations need ordering
     for (const ggml_cuda_h2d_entry & e : cuda_ctx->h2d_pending) {
         if (dst < e.dst + e.size && e.dst < dst + size) {
             ggml_cuda_flush_h2d(cuda_ctx);
