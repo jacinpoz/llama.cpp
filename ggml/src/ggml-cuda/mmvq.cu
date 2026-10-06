@@ -1224,10 +1224,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             };
             const auto launch_ksplit = [&](auto ncols_tag) {
                 constexpr int c_ncols_dst = decltype(ncols_tag)::value;
-                // A multi-row block reads every row it owns, so a row count that is not a
-                // multiple of the block height would read past the end of the weight; those
-                // shapes keep one row per block, as do weights too short to fill the GPU.
-                // (Only instantiated where a multi-row block exists: HIP builds.)
+                // A multi-row block reads every row it owns, so a row count that is not a multiple of the block height would read past the end of the weight.
 #if defined(GGML_USE_HIP)
                 constexpr int c_rpb_weight = calc_rows_per_block_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, 1);
                 constexpr int c_rpb_rdna3  = calc_rows_per_block_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA3_0, false, 1);

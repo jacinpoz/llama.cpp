@@ -360,8 +360,6 @@ static constexpr __host__ __device__ int calc_rows_per_block_override(int rows_p
 #define GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS 512
 #endif
 static constexpr __host__ __device__ int calc_rows_per_block_weight(ggml_type type, int ncols_dst, int table_id, bool small_k, int nwarps) {
-    // gfx1100 at 2 rows, K = 6144, n = 5: Q6_K 45.6 -> 39.5 us, IQ4_XS 23.5 -> 18.5 us (MTP verify +2.1%).
-    // Q4_0 (the MTP layer) gains at every width, decode included (K = 5120, n = 1: 44 -> 28 us; MTP +0.36%).
     // IQ4_XS, Q4_0 and Q8_0 at 8 columns would overflow the megakernel's LDS budget.
     if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst <= MMVQ_MAX_BATCH_SIZE &&
             (type == GGML_TYPE_Q6_K ? ncols_dst >= 2 :
