@@ -366,7 +366,7 @@ static constexpr __host__ __device__ int calc_rows_per_block_weight(ggml_type ty
             (type == GGML_TYPE_Q6_K || (type == GGML_TYPE_IQ4_XS && ncols_dst <= 7))) {
         return 2;
     }
-    // Q4_0 (the MTP layer) and Q8_0 gain at every width, decode included: K = 5120 Q4_0 44 -> 28 us at n = 1, MTP +0.36%.
+    // Q4_0 (the MTP layer) and Q8_0 gain at every width, decode included (K = 5120 Q4_0, n = 1: 44 -> 28 us; MTP +0.36%).
     if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst <= 7 && (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0)) {
         return 2;
     }
