@@ -1543,10 +1543,17 @@ struct ggml_cuda_graph_key_hash {
 
 struct ggml_cuda_mk_state;
 
+struct ggml_cuda_h2d_entry {
+    char       * dst;
+    const char * src;
+    uint32_t     size;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    std::vector<ggml_cuda_h2d_entry> h2d_pending; // GGML_CUDA_BATCH_H2D: uploads not yet issued on stream()
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

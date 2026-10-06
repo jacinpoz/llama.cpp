@@ -1783,7 +1783,25 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 }
 
+// Pinned host allocations, so GGML_CUDA_BATCH_H2D only batches sources a kernel can read directly.
+static std::mutex g_pinned_mutex;
+static std::map<uintptr_t, size_t> g_pinned_ranges;
+
+static bool ggml_cuda_is_pinned_range(const void * p, const size_t size) {
+    std::lock_guard<std::mutex> lock(g_pinned_mutex);
+    auto it = g_pinned_ranges.upper_bound((uintptr_t) p);
+    if (it == g_pinned_ranges.begin()) {
+        return false;
+    }
+    --it;
+    return (uintptr_t) p + size <= it->first + it->second;
+}
+
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    {
+        std::lock_guard<std::mutex> lock(g_pinned_mutex);
+        g_pinned_ranges.erase((uintptr_t) buffer->context);
+    }
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
@@ -1813,6 +1831,10 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
     }
 
+    {
+        std::lock_guard<std::mutex> lock(g_pinned_mutex);
+        g_pinned_ranges[(uintptr_t) ptr] = size;
+    }
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     buffer->buft = buft;
     buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
@@ -3214,11 +3236,55 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+static constexpr int ggml_cuda_h2d_batch_max = 16;
+
+struct ggml_cuda_h2d_batch {
+    ggml_cuda_h2d_entry e[ggml_cuda_h2d_batch_max];
+};
+
+// Block row y copies entry y, reading the pinned source directly. Entries are 4-byte aligned.
+static __global__ void k_h2d_gather(const ggml_cuda_h2d_batch b) {
+    const ggml_cuda_h2d_entry & e = b.e[blockIdx.y];
+    const uint32_t n = e.size/4;
+    for (uint32_t i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += gridDim.x*blockDim.x) {
+        ((uint32_t *) e.dst)[i] = ((const uint32_t *) e.src)[i];
+    }
+}
+
+// Issues the queued GGML_CUDA_BATCH_H2D uploads; every other use of the stream calls this first so order is kept.
+static void ggml_cuda_flush_h2d(ggml_backend_cuda_context * ctx) {
+    auto & q = ctx->h2d_pending;
+    for (size_t i0 = 0; i0 < q.size(); i0 += ggml_cuda_h2d_batch_max) {
+        const int n = (int) std::min<size_t>(ggml_cuda_h2d_batch_max, q.size() - i0);
+        ggml_cuda_h2d_batch b{};
+        std::copy(q.begin() + i0, q.begin() + i0 + n, b.e);
+        ggml_cuda_set_device(ctx->device);
+        k_h2d_gather<<<dim3(32, n), 256, 0, ctx->stream()>>>(b);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    q.clear();
+}
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+    static const bool batch_h2d = getenv("GGML_CUDA_BATCH_H2D") != nullptr && atoi(getenv("GGML_CUDA_BATCH_H2D")) != 0;
+    char * dst = (char *) tensor->data + offset;
+    if (batch_h2d && size <= (1u << 20) && size % 4 == 0 && (uintptr_t) dst % 4 == 0 && (uintptr_t) data % 4 == 0 &&
+            ggml_cuda_is_pinned_range(data, size)) {
+        cuda_ctx->h2d_pending.push_back({ dst, (const char *) data, (uint32_t) size });
+        return;
+    }
+    // copies to disjoint destinations need no order between them; the flush before compute orders them all
+    for (const ggml_cuda_h2d_entry & e : cuda_ctx->h2d_pending) {
+        if (dst < e.dst + e.size && e.dst < dst + size) {
+            ggml_cuda_flush_h2d(cuda_ctx);
+            break;
+        }
+    }
 
     // exp31: pin the pageable source range so the 1-D copies are truly asynchronous (\u00a720 B1).
     if (g_meta_pinsrc_env != nullptr) {
@@ -3233,6 +3299,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_flush_h2d(cuda_ctx);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
@@ -3243,6 +3310,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_flush_h2d(cuda_ctx);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
@@ -3381,6 +3449,8 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
         return false;
     }
+    ggml_cuda_flush_h2d((ggml_backend_cuda_context *) backend_src->context);
+    ggml_cuda_flush_h2d((ggml_backend_cuda_context *) backend_dst->context);
 
     if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
         return false;
@@ -3435,6 +3505,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_cuda_flush_h2d(cuda_ctx);
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
@@ -8379,6 +8450,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const cuda_gc_timer cuda_gc_timer_inst(cgraph);
     int64_t t_gc = g_cgc_on ? ggml_time_us() : 0;
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_flush_h2d(cuda_ctx);
 
     ggml_cuda_set_device(cuda_ctx->device);
 
@@ -8471,12 +8543,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_cuda_flush_h2d(cuda_ctx);
 
     CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
 }
 
 static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+    ggml_cuda_flush_h2d(cuda_ctx);
 
     if (ggml_backend_is_cuda(backend)) {
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
