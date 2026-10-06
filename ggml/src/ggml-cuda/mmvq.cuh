@@ -108,6 +108,11 @@ struct ggml_cuda_mmvq_capture {
 
 void ggml_cuda_mmvq_set_capture(ggml_cuda_mmvq_capture * cap); // nullptr: launch normally again
 bool ggml_cuda_mmvq_pair_supported(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b);
+// GGML_CUDA_MULTI_OP
+bool ggml_cuda_multi_op();
+// An output computed before its node (from = the current node) goes to a private buffer; t and its views point there
+// for the rest of the evaluation.
+void ggml_cuda_redirect_early_output(ggml_cgraph * cgraph, int from, ggml_tensor * t);
 // Restores the tensors an early (paired) output was redirected for; the graph loop calls it after the evaluation.
 void ggml_cuda_restore_early_outputs();
 // GGML_CUDA_MULTI_OP: the attention q/k/v projections at q's node as one launch; -1 when done (k, v precomputed).

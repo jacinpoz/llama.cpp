@@ -2856,7 +2856,7 @@ static const ggml_tensor * ggml_cuda_find_conv_state_cpy(const ggml_cgraph * cgr
     return nullptr;
 }
 
-static bool ggml_cuda_multi_op() {
+bool ggml_cuda_multi_op() {
     static const bool enabled = getenv("GGML_CUDA_MULTI_OP") != nullptr;
     return enabled;
 }
@@ -2873,7 +2873,7 @@ static thread_local std::vector<std::pair<ggml_tensor *, void *>> g_redirected;
 static thread_local int g_redirect_slot = 0;
 
 // `from` is the current node: t and its views (view_src is always the root) all come after it.
-static void ggml_cuda_redirect_early_output(ggml_cgraph * cgraph, int from, ggml_tensor * t) {
+void ggml_cuda_redirect_early_output(ggml_cgraph * cgraph, int from, ggml_tensor * t) {
     static thread_local std::vector<std::pair<void *, size_t>> buffers[GGML_CUDA_MAX_DEVICES]; // kept: captured graphs keep using them
     const int device = ggml_cuda_get_device();
     const size_t nbytes = ggml_nbytes(t);
