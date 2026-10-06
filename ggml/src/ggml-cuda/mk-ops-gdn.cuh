@@ -350,7 +350,7 @@ static constexpr __device__ int mk_gdn_step_warp_size() {
 }
 
 // tid is the thread's linear index within the tile (the standalone kernel uses a 2D block).
-// Each warp owns ncols adjacent columns; every column's arithmetic is the same for any ncols.
+// Each warp owns ncols adjacent columns, with the same per-column arithmetic for any ncols.
 template <int S_v, bool KDA, bool keep_rs_t, int ncols>
 static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params & p, const uint32_t h_idx,
         const uint32_t col_group, const uint32_t sequence, const int tid) {

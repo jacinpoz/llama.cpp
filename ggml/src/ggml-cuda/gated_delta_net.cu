@@ -24,7 +24,7 @@ bool ggml_cuda_gdn_get_state_src(const ggml_tensor * gdn, ggml_cuda_gdn_state_sr
     return true;
 }
 
-// Four columns per warp keep more state loads in flight; the state comes from DRAM, so the kernel is latency-bound.
+// The kernel is latency-bound on DRAM state loads, so four columns per warp keep more loads in flight.
 static constexpr int gdn_cols_per_warp(int S_v) {
     return S_v == 128 ? 4 : 1;
 }
