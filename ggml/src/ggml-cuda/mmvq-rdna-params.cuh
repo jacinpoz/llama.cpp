@@ -131,6 +131,12 @@ static constexpr __host__ __device__ bool mmvq_decode_grid_loop_type(ggml_type t
 #define GGML_MMVQ_RDNA3_Q4K_WEIGHT_RPB 2
 #endif
 static constexpr __host__ __device__ int calc_rows_per_block_weight(ggml_type type, int ncols_dst, int table_id, bool small_k, int nwarps) {
+    // gfx1100, K = 6144, n = 5: Q6_K 45.6 -> 39.5 us and IQ4_XS 23.5 -> 18.5 us at 2 rows; MTP verify +2.1%.
+    // IQ4_XS at 8 columns would overflow the megakernel's LDS budget.
+    if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst >= 2 &&
+            (type == GGML_TYPE_Q6_K || (type == GGML_TYPE_IQ4_XS && ncols_dst <= 7))) {
+        return 2;
+    }
     if (table_id == MMVQ_PARAMETERS_RDNA3_0 && type == GGML_TYPE_Q4_K && ncols_dst >= 2 && ncols_dst <= MMVQ_MAX_BATCH_SIZE) {
         return GGML_MMVQ_RDNA3_Q4K_WEIGHT_RPB;
     }
