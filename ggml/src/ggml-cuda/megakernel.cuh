@@ -151,3 +151,24 @@ static void mk_record(uint16_t opcode, int variant, int64_t n_tiles, int threads
     memcpy(r.params.data(), &p, sizeof(P));
     g_mk_recording->push_back(std::move(r));
 }
+
+// One Q8_1 block from the 32 lanes of a wave, lane iqs holding value iqs. Every fused Q8_1 producer uses it, so
+// they all quantize exactly like quantize_q8_1.
+static __device__ __forceinline__ void mk_quantize_q8_1_group(const float xi, block_q8_1 * yb, const int iqs) {
+    float amax = fabsf(xi);
+    float sum = xi;
+
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    yb->qs[iqs] = q;
+
+    if (iqs > 0) {
+        return;
+    }
+
+    yb->ds = make_half2(d, sum);
+}

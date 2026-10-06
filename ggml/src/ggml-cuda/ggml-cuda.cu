@@ -5152,9 +5152,8 @@ static int ggml_cuda_try_fuse_attn_tail(ggml_backend_cuda_context & ctx, const g
     ep.gate_nb2 = T > 1 ? gv->nb[2] : 0;
     ep.out      = (float *) mul->data;
     const ggml_tensor * o_proj = ggml_cuda_find_mul_q8_1_matmul(ctx, cgraph, end, mul);
-    if (o_proj != nullptr && WARP_SIZE == QK8_1 && o_proj->src[1]->ne[0] == D*H && (D*H) % MATRIX_ROW_PADDING == 0 &&
-            ggml_is_contiguous(o_proj->src[1])) {
-        const ggml_tensor * src1 = o_proj->src[1];
+    const ggml_tensor * src1 = o_proj != nullptr ? o_proj->src[1] : nullptr;
+    if (src1 != nullptr && WARP_SIZE == QK8_1 && src1->ne[0] == D*H && (D*H) % MATRIX_ROW_PADDING == 0 && ggml_is_contiguous(src1)) {
         const size_t q8_1_size = ggml_nrows(src1)*src1->ne[0]*sizeof(block_q8_1)/QK8_1;
         bool cached = false;
         void * y = ctx.q8_1_cache_get(mul, ctx.curr_stream_no, q8_1_size, src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
