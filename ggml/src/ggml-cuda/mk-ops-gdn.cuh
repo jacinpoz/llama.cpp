@@ -350,7 +350,8 @@ static constexpr __device__ int mk_gdn_step_warp_size() {
 }
 
 // tid is the thread's linear index within the tile (the standalone kernel uses a 2D block).
-template <int S_v, bool KDA, bool keep_rs_t>
+// Each warp owns ncols adjacent columns; every column's arithmetic is the same for any ncols.
+template <int S_v, bool KDA, bool keep_rs_t, int ncols = 1>
 static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params & p, const uint32_t h_idx,
         const uint32_t col_group, const uint32_t sequence, const int tid) {
     constexpr int warp_size = mk_gdn_step_warp_size<S_v>();
@@ -358,9 +359,8 @@ static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params
     constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
 
     const int64_t  n_tokens  = mk_gdn_n_tokens(p);
-    // each warp owns one column, using warp-level primitives to reduce across rows
     const int      lane      = tid % warp_size;
-    const int      col       = col_group * mk_gdn_step_warps + tid / warp_size;
+    const int      col0      = (col_group * mk_gdn_step_warps + tid / warp_size) * ncols;
 
     const uint32_t iq1 = fastmodulo(h_idx, p.neqk1_magic);
     const uint32_t iq3 = fastdiv(sequence, p.rq3_magic);
@@ -375,26 +375,31 @@ static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params
     state += state_out_offset;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
 
-    float s_shard[rows_per_lane];
+    float s_shard[ncols][rows_per_lane];
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
     // state_ids: the state is read in place from cache row state_ids[sequence] (the GET_ROWS gather was elided)
-    const float * curr_state = p.curr_state + (p.state_ids != nullptr ? p.state_ids[sequence] * p.state_row_stride : state_in_offset) + col * S_v;
+    const float * curr_state = p.curr_state + (p.state_ids != nullptr ? p.state_ids[sequence] * p.state_row_stride : state_in_offset) + col0 * S_v;
     if (p.state_ids != nullptr) {
         curr_state += h_idx * S_v * S_v;
     }
 #pragma unroll
-    for (int r = 0; r < rows_per_lane; r++) {
-        const int i = r * warp_size + lane;
-        s_shard[r]  = curr_state[i];
-    }
-
-    // The column is fully loaded before any write, so the slot may alias the row it was read from.
-    if (p.state_pre != nullptr) {
-        float * pre = p.state_pre + state_out_offset + col * S_v;
+    for (int c = 0; c < ncols; c++) {
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
-            pre[r * warp_size + lane] = s_shard[r];
+            s_shard[c][r] = curr_state[c * S_v + r * warp_size + lane];
+        }
+    }
+
+    // The columns are fully loaded before any write, so the slot may alias the rows they were read from.
+    if (p.state_pre != nullptr) {
+        float * pre = p.state_pre + state_out_offset + col0 * S_v;
+#pragma unroll
+        for (int c = 0; c < ncols; c++) {
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                pre[c * S_v + r * warp_size + lane] = s_shard[c][r];
+            }
         }
     }
 
@@ -418,62 +423,66 @@ static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params
             q_reg[r] = q_t[i];
         }
 
-        if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
-
-            // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
-            float kv_shard = 0.0f;
 #pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                kv_shard += s_shard[r] * k_reg[r];
-            }
-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+        for (int c = 0; c < ncols; c++) {
+            const int col = col0 + c;
+            if constexpr (!KDA) {
+                const float g_val = expf(*g_t);
 
-            // delta[col] = (v[col] - g * kv[col]) * beta
-            float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
-
-            // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
-            // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
-            float attn_partial = 0.0f;
+                // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
+                float kv_shard = 0.0f;
 #pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
-                attn_partial += s_shard[r] * q_reg[r];
-            }
+                for (int r = 0; r < rows_per_lane; r++) {
+                    kv_shard += s_shard[c][r] * k_reg[r];
+                }
+                float kv_col = warp_reduce_sum<warp_size>(kv_shard);
 
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+                // delta[col] = (v[col] - g * kv[col]) * beta
+                float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
 
-            if (lane == 0) {
-                attn_data[col] = attn_col * p.scale;
-            }
-        } else {
-            // kv[col] = sum_i g[i] * S[i][col] * k[i]
-            float kv_shard = 0.0f;
+                // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
+                // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
+                float attn_partial = 0.0f;
 #pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
-                kv_shard += expf(g_t[i]) * s_shard[r] * k_reg[r];
-            }
+                for (int r = 0; r < rows_per_lane; r++) {
+                    s_shard[c][r] = g_val * s_shard[c][r] + k_reg[r] * delta_col;
+                    attn_partial += s_shard[c][r] * q_reg[r];
+                }
 
-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+                float attn_col = warp_reduce_sum<warp_size>(attn_partial);
 
-            // delta[col] = (v[col] - kv[col]) * beta
-            float delta_col = (v_t[col] - kv_col) * beta_val;
-
-            // fused: S[i][col] = g[i] * S[i][col] + k[i] * delta[col]
-            // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
-            float attn_partial = 0.0f;
+                if (lane == 0) {
+                    attn_data[col] = attn_col * p.scale;
+                }
+            } else {
+                // kv[col] = sum_i g[i] * S[i][col] * k[i]
+                float kv_shard = 0.0f;
 #pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
-                s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
-                attn_partial += s_shard[r] * q_reg[r];
-            }
+                for (int r = 0; r < rows_per_lane; r++) {
+                    const int i = r * warp_size + lane;
+                    kv_shard += expf(g_t[i]) * s_shard[c][r] * k_reg[r];
+                }
 
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+                float kv_col = warp_reduce_sum<warp_size>(kv_shard);
 
-            if (lane == 0) {
-                attn_data[col] = attn_col * p.scale;
+                // delta[col] = (v[col] - kv[col]) * beta
+                float delta_col = (v_t[col] - kv_col) * beta_val;
+
+                // fused: S[i][col] = g[i] * S[i][col] + k[i] * delta[col]
+                // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
+                float attn_partial = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    const int i = r * warp_size + lane;
+                    s_shard[c][r] = expf(g_t[i]) * s_shard[c][r] + k_reg[r] * delta_col;
+                    attn_partial += s_shard[c][r] * q_reg[r];
+                }
+
+                float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+
+                if (lane == 0) {
+                    attn_data[col] = attn_col * p.scale;
+                }
             }
         }
 
@@ -486,9 +495,11 @@ static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params
             if (target_slot >= 0 && target_slot < p.K) {
                 float * slot_state = state + target_slot * p.state_slot_stride;
 #pragma unroll
-                for (int r = 0; r < rows_per_lane; r++) {
-                    const int i = r * warp_size + lane;
-                    slot_state[col * S_v + i] = s_shard[r];
+                for (int c = 0; c < ncols; c++) {
+#pragma unroll
+                    for (int r = 0; r < rows_per_lane; r++) {
+                        slot_state[(col0 + c) * S_v + r * warp_size + lane] = s_shard[c][r];
+                    }
                 }
             }
         }
@@ -496,9 +507,11 @@ static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params
 
     if constexpr (!keep_rs_t) {
 #pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            const int i          = r * warp_size + lane;
-            state[col * S_v + i] = s_shard[r];
+        for (int c = 0; c < ncols; c++) {
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                state[(col0 + c) * S_v + r * warp_size + lane] = s_shard[c][r];
+            }
         }
     }
 }
