@@ -2511,7 +2511,6 @@ static __global__ void __launch_bounds__(BLOCK, 1) mmvq_triple(
     }
 }
 
-// Two IQ4_XS matvecs reading the same 2..8-token input, as in the triple.
 static int mmvq_pair_ncols(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b) {
     auto one_row = [](const ggml_cuda_mmvq_capture & x) { return x.valid && x.grid_y == 1 && x.grid_z == 1 && 256 % x.threads == 0; };
     if (!one_row(a) || !one_row(b)) {

@@ -179,7 +179,7 @@ static __global__ void top_k_radix_gather(
 
 // Small k (<= 16): each thread keeps a sorted top-K list in registers over its strided slice, a block merges its
 // threads' lists by K rounds of argmax, and a second launch merges the per-block lists of each row the same way.
-// Two launches instead of the radix select's ten; ties go to the lower index.
+// Ties go to the lower index.
 template <int K>
 static __device__ __forceinline__ void top_k_small_insert(float (&v)[K], int (&id)[K], const float f, const int i) {
     if (!(f > v[K - 1] || (f == v[K - 1] && i < id[K - 1]))) {
@@ -196,7 +196,6 @@ static __device__ __forceinline__ void top_k_small_insert(float (&v)[K], int (&i
     }
 }
 
-// K rounds of block argmax over the threads' list heads; out_v/out_i receive the k best of the block, best first.
 template <int K, int BLOCK>
 static __device__ void top_k_small_merge(float (&v)[K], int (&id)[K], const int k, float * out_v, int * out_i) {
     __shared__ float wv[BLOCK / WARP_SIZE];

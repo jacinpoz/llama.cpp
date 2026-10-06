@@ -5375,9 +5375,8 @@ static int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgrap
     return -1;
 }
 
-// GGML_CUDA_VERIFY_PAIR: at 2..8 tokens, an IQ4_XS matvec and the next IQ4_XS matvec on the same input (FFN up and
-// gate, GDN qkv and z) run as one launch; the second one is written early into a private buffer. a_out is the first
-// matvec's destination (the node itself, or a copy pointing at scratch memory). Returns false when nothing ran.
+// GGML_CUDA_VERIFY_PAIR: at 2..8 tokens, runs two IQ4_XS matvecs on the same input as one launch, the second writing early into a private buffer.
+// a_out is the first matvec's destination (the node or a scratch copy). Returns false when nothing ran.
 static bool ggml_cuda_verify_pair() {
     // the fused gate/up/GLU of GGML_CUDA_VERIFY_GLU claims the FFN matvecs itself
     static const bool enabled = getenv("GGML_CUDA_VERIFY_PAIR") != nullptr && atoi(getenv("GGML_CUDA_VERIFY_PAIR")) != 0 &&
@@ -7915,7 +7914,6 @@ static bool ggml_cuda_try_verify_conv_launch(ggml_backend_cuda_context & ctx, gg
         ggml_cuda_compute_forward(ctx, &qkv);
     }
     plan.p.x = x.get();
-    // the GDN gate projections read the same input: as at one token, run them with the conv in one launch
     int g = -1;
     for (int k = i + 1; ggml_cuda_multi_op() && k < std::min(cgraph->n_nodes - 8, i + 64); ++k) {
         const ggml_tensor * n = cgraph->nodes[k];
