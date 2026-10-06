@@ -936,8 +936,8 @@ static bool attn_set_rows_ok(const ggml_tensor * set_rows, const int64_t n_head,
         set_rows->ne[2] == 1 && set_rows->ne[3] == 1;
 }
 
-bool ggml_cuda_op_attn_head_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * mul,
-        const ggml_tensor * rope, ggml_tensor * hadamard, ggml_tensor * set_rows) {
+static bool attn_head_prep_params(const ggml_tensor * rms_norm, const ggml_tensor * mul, const ggml_tensor * rope,
+        ggml_tensor * hadamard, ggml_tensor * set_rows, mk_attn_prep_params & p) {
     const ggml_tensor * x = rms_norm->src[0];
     const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
     const int64_t n_head = x->ne[1];
@@ -956,7 +956,7 @@ bool ggml_cuda_op_attn_head_prep(ggml_backend_cuda_context & ctx, const ggml_ten
         return false;
     }
 
-    mk_attn_prep_params p{};
+    p     = {};
     p.x   = (const float *) x->data;
     p.sx1 = x->nb[1]/sizeof(float);
     p.sx2 = x->nb[2]/sizeof(float);
@@ -991,8 +991,16 @@ bool ggml_cuda_op_attn_head_prep(ggml_backend_cuda_context & ctx, const ggml_ten
     } else {
         p.out = (float *) hadamard->data;
     }
+    return true;
+}
 
-    const dim3 grid((unsigned) n_head, (unsigned) n_tok, 1);
+bool ggml_cuda_op_attn_head_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * mul,
+        const ggml_tensor * rope, ggml_tensor * hadamard, ggml_tensor * set_rows) {
+    mk_attn_prep_params p;
+    if (!attn_head_prep_params(rms_norm, mul, rope, hadamard, set_rows, p)) {
+        return false;
+    }
+    const dim3 grid((unsigned) p.n_head, (unsigned) p.n_tok, 1);
     if (p.freq_factors != nullptr) {
         k_attn_head_prep<true><<<grid, 256, 0, ctx.stream()>>>(p);
     } else {
@@ -1002,7 +1010,7 @@ bool ggml_cuda_op_attn_head_prep(ggml_backend_cuda_context & ctx, const ggml_ten
     return true;
 }
 
-bool ggml_cuda_op_hadamard64_set_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * hadamard, ggml_tensor * set_rows) {
+static bool hadamard64_set_rows_params(const ggml_tensor * hadamard, ggml_tensor * set_rows, mk_v_had_set_rows_params & p) {
     const ggml_tensor * src = hadamard->src[1];  // the [256, n_head, n_tok] V rows as 64-chunks, in 2 or 3 dims
     const int64_t n_tok  = ggml_nelements(set_rows->src[1]);
     const int64_t n_rows = src->ne[1]*src->ne[2];
@@ -1014,8 +1022,7 @@ bool ggml_cuda_op_hadamard64_set_rows(ggml_backend_cuda_context & ctx, const ggm
     if (!attn_set_rows_ok(set_rows, n_head, n_tok)) {
         return false;
     }
-    const dim3 grid((unsigned) n_head, (unsigned) n_tok, 1);
-    mk_v_had_set_rows_params p{};
+    p           = {};
     p.x         = (const float *) src->data;
     p.sx1       = 256;
     p.sx2       = 256*n_head;
@@ -1025,7 +1032,60 @@ bool ggml_cuda_op_hadamard64_set_rows(ggml_backend_cuda_context & ctx, const ggm
     p.idx_i64   = set_rows->src[1]->type == GGML_TYPE_I64;
     p.n_head    = (int) n_head;
     p.n_tok     = (int) n_tok;
+    return true;
+}
+
+bool ggml_cuda_op_hadamard64_set_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * hadamard, ggml_tensor * set_rows) {
+    mk_v_had_set_rows_params p;
+    if (!hadamard64_set_rows_params(hadamard, set_rows, p)) {
+        return false;
+    }
+    const dim3 grid((unsigned) p.n_head, (unsigned) p.n_tok, 1);
     k_hadamard64_set_rows_q5_0<<<grid, 4*WARP_SIZE, 0, ctx.stream()>>>(p);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// Q prep, K prep and the V hadamard in one launch: blocks [0, nq) run Q tiles, [nq, nq + nk) K tiles, and each
+// remaining block runs two V tiles, one per half.
+template <bool has_ff>
+static __global__ void __launch_bounds__(256, 1) k_attn_qkv_prep(const mk_attn_prep_params pq, const mk_attn_prep_params pk,
+        const mk_v_had_set_rows_params pv, const int nq, const int nk, const int nv) {
+    using prep  = mk_attn_prep<256>;
+    using v_had = mk_v_had_set_rows<4*WARP_SIZE>;
+    static_assert(2*v_had::threads == prep::threads && 2*v_had::lds_bytes <= prep::lds_bytes, "two V tiles per prep block");
+    __shared__ __attribute__((aligned(16))) char lds[prep::lds_bytes];
+    const int b = blockIdx.x;
+    if (b < nq) {
+        prep::run(pq, has_ff, b, true, lds);
+    } else if (b < nq + nk) {
+        prep::run(pk, has_ff, b - nq, true, lds);
+    } else {
+        const int half = threadIdx.x / v_had::threads;
+        const int tile = 2*(b - nq - nk) + half;
+        v_had::run(pv, 0, tile, tile < nv, lds + half*v_had::lds_bytes);
+    }
+}
+
+bool ggml_cuda_op_attn_qkv_prep(ggml_backend_cuda_context & ctx, const ggml_cuda_attn_prep_chain & q,
+        const ggml_cuda_attn_prep_chain & k, const ggml_tensor * v_hadamard, ggml_tensor * v_set_rows) {
+    mk_attn_prep_params pq, pk;
+    mk_v_had_set_rows_params pv;
+    if (!attn_head_prep_params(q.rms_norm, q.mul, q.rope, q.hadamard, nullptr, pq) ||
+            !attn_head_prep_params(k.rms_norm, k.mul, k.rope, k.hadamard, k.set_rows, pk) ||
+            !hadamard64_set_rows_params(v_hadamard, v_set_rows, pv) ||
+            (pq.freq_factors == nullptr) != (pk.freq_factors == nullptr) || pq.n_tok != pk.n_tok || pq.n_tok != pv.n_tok) {
+        return false;
+    }
+    const int nq = pq.n_head*pq.n_tok;
+    const int nk = pk.n_head*pk.n_tok;
+    const int nv = pv.n_head*pv.n_tok;
+    const dim3 grid((unsigned) (nq + nk + (nv + 1)/2), 1, 1);
+    if (pq.freq_factors != nullptr) {
+        k_attn_qkv_prep<true><<<grid, 256, 0, ctx.stream()>>>(pq, pk, pv, nq, nk, nv);
+    } else {
+        k_attn_qkv_prep<false><<<grid, 256, 0, ctx.stream()>>>(pq, pk, pv, nq, nk, nv);
+    }
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

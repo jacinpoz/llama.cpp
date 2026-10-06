@@ -15,3 +15,14 @@ bool ggml_cuda_op_attn_head_prep(ggml_backend_cuda_context & ctx, const ggml_ten
         const ggml_tensor * rope, ggml_tensor * hadamard, ggml_tensor * set_rows);
 // V path: Hadamard 64 -> SET_ROWS q5_0.
 bool ggml_cuda_op_hadamard64_set_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * hadamard, ggml_tensor * set_rows);
+
+struct ggml_cuda_attn_prep_chain {
+    const ggml_tensor * rms_norm;
+    const ggml_tensor * mul;
+    const ggml_tensor * rope;
+    ggml_tensor *       hadamard;
+    ggml_tensor *       set_rows;
+};
+
+bool ggml_cuda_op_attn_qkv_prep(ggml_backend_cuda_context & ctx, const ggml_cuda_attn_prep_chain & q,
+        const ggml_cuda_attn_prep_chain & k, const ggml_tensor * v_hadamard, ggml_tensor * v_set_rows);

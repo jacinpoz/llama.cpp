@@ -5316,7 +5316,113 @@ static bool ggml_cuda_attn_prep_uses_ok(const ggml_cgraph * cgraph, const int i,
     return true;
 }
 
-static int ggml_cuda_try_fuse_attn_prep(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+static bool ggml_cuda_nodes_read(const ggml_cgraph * cgraph, const int from, const int to, const ggml_tensor * t) {
+    const ggml_tensor * root = t->view_src ? t->view_src : t;
+    for (int k = from; k < to; ++k) {
+        for (const ggml_tensor * src : cgraph->nodes[k]->src) {
+            while (src != nullptr && src->view_src != nullptr) {
+                src = src->view_src;
+            }
+            if (src == root) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static ggml_tensor * ggml_cuda_root_matmul(ggml_tensor * t) {
+    while (t != nullptr && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW)) {
+        t = t->src[0];
+    }
+    return t != nullptr && t->op == GGML_OP_MUL_MAT ? t : nullptr;
+}
+
+// The K chain RMS_NORM MUL ROPE RESHAPE MUL_MAT(hadamard 256) RESHAPE VIEW SET_ROWS starting at node j.
+static bool ggml_cuda_match_k_prep(const ggml_cgraph * cgraph, const int j, ggml_cuda_attn_prep_chain & k) {
+    if (j + 7 >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_RMS_NORM) {
+        return false;
+    }
+    ggml_tensor * const * n = cgraph->nodes + j;
+    k = { n[0], n[1], n[2], n[4], n[7] };
+    return n[1]->op == GGML_OP_MUL && (n[1]->src[0] == n[0] || n[1]->src[1] == n[0]) && n[2]->op == GGML_OP_ROPE &&
+        n[2]->src[0] == n[1] && n[3]->op == GGML_OP_RESHAPE && n[3]->src[0] == n[2] && n[4]->op == GGML_OP_MUL_MAT &&
+        ggml_get_op_params_i32(n[4], 1) == GGML_HINT_SRC0_IS_HADAMARD && n[4]->src[1] == n[3] && n[5]->op == GGML_OP_RESHAPE &&
+        n[5]->src[0] == n[4] && n[6]->op == GGML_OP_VIEW && n[6]->src[0] == n[5] && n[7]->op == GGML_OP_SET_ROWS &&
+        n[7]->src[0] == n[6];
+}
+
+// The Q chain at i, the V hadamard and the K chain as one launch. The K and V matvecs share the Q matvec's input, so
+// any that has not run yet (no triple matvec) runs now into a private buffer; the K and V nodes are skipped when
+// reached. Returns false when the layout does not match.
+static bool ggml_cuda_try_fuse_qkv_prep(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i,
+        const ggml_cuda_attn_prep_chain & q) {
+    const ggml_tensor * q_mm = ggml_cuda_root_matmul(q.rms_norm->src[0]);
+    auto early_ok = [&](const ggml_tensor * mm) {
+        return mm != nullptr && (g_precomputed_nodes.count(mm) > 0 ||
+            (q_mm != nullptr && mm->src[1] == q_mm->src[1] && !(mm->flags & GGML_TENSOR_FLAG_OUTPUT)));
+    };
+    int vi = -1, v_sr = -1, ki = -1;
+    const int end = std::min(cgraph->n_nodes, i + 40);
+    for (int j = i + 5; j < end && (vi < 0 || ki < 0); ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (vi < 0 && n->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(n, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
+                n->src[1]->ne[0] == 64 && early_ok(ggml_cuda_root_matmul(n->src[1])) && j + 1 < end &&
+                cgraph->nodes[j + 1]->op == GGML_OP_RESHAPE && cgraph->nodes[j + 1]->src[0] == n &&
+                ggml_cuda_attn_prep_uses_ok(cgraph, j, 2)) {
+            vi = j;
+            continue;
+        }
+        if (ki < 0 && n->op == GGML_OP_RMS_NORM) {
+            ggml_cuda_attn_prep_chain k;
+            if (!early_ok(ggml_cuda_root_matmul(n->src[0])) || !ggml_cuda_match_k_prep(cgraph, j, k) ||
+                    !ggml_cuda_attn_prep_uses_ok(cgraph, j, 7)) {
+                return false;
+            }
+            ki = j;
+        }
+    }
+    if (vi < 0 || ki < 0) {
+        return false;
+    }
+    for (int j = vi + 2; j + 1 < cgraph->n_nodes && j < vi + 24; ++j) {
+        const ggml_tensor * vw = cgraph->nodes[j];
+        if (vw->op == GGML_OP_VIEW && vw->src[0] == cgraph->nodes[vi + 1] && ggml_node_get_use_count(cgraph, j) == 1 &&
+                cgraph->nodes[j + 1]->op == GGML_OP_SET_ROWS && cgraph->nodes[j + 1]->src[0] == vw) {
+            v_sr = j + 1;
+            break;
+        }
+    }
+    if (v_sr < 0) {
+        return false;
+    }
+    ggml_cuda_attn_prep_chain k;
+    ggml_cuda_match_k_prep(cgraph, ki, k);
+    // the caches are written at node i, so nothing before their SET_ROWS may read them
+    if (ggml_cuda_nodes_read(cgraph, i, ki + 7, k.set_rows) || ggml_cuda_nodes_read(cgraph, i, v_sr, cgraph->nodes[v_sr])) {
+        return false;
+    }
+    for (ggml_tensor * mm : { ggml_cuda_root_matmul(cgraph->nodes[vi]->src[1]), ggml_cuda_root_matmul(k.rms_norm->src[0]) }) {
+        if (g_precomputed_nodes.count(mm) == 0) {
+            ggml_cuda_redirect_early_output(cgraph, i, mm);
+            if (!ggml_cuda_compute_forward(ctx, mm)) {
+                GGML_ABORT("early %s failed", mm->name);
+            }
+            g_precomputed_nodes.insert(mm);
+        }
+    }
+    if (!ggml_cuda_op_attn_qkv_prep(ctx, q, k, cgraph->nodes[vi], cgraph->nodes[v_sr])) {
+        return false;
+    }
+    for (int j = ki; j <= ki + 7; ++j) {
+        g_precomputed_nodes.insert(cgraph->nodes[j]);
+    }
+    g_precomputed_nodes.insert(cgraph->nodes[vi]);
+    g_precomputed_nodes.insert(cgraph->nodes[v_sr]);
+    return true;
+}
+
+static int ggml_cuda_try_fuse_attn_prep(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
     static const bool disabled = getenv("GGML_CUDA_DISABLE_ATTN_PREP_FUSION") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_ATTN_PREP_FUSION")) != 0;
     if (disabled) {
         return 0;
@@ -5344,6 +5450,9 @@ static int ggml_cuda_try_fuse_attn_prep(ggml_backend_cuda_context & ctx, const g
                     sr->op == GGML_OP_SET_ROWS && sr->src[0] == vw && ggml_cuda_attn_prep_uses_ok(cgraph, i + 4, 3)) {
                 return ggml_cuda_op_attn_head_prep(ctx, node, mul, rope, had, sr) ? 7 : 0;
             }
+        }
+        if (ggml_cuda_try_fuse_qkv_prep(ctx, cgraph, i, { node, mul, rope, had, nullptr })) {
+            return 4;
         }
         return ggml_cuda_op_attn_head_prep(ctx, node, mul, rope, had, nullptr) ? 4 : 0;
     }
