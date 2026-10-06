@@ -1227,12 +1227,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 // A multi-row block reads every row it owns, so a row count that is not a
                 // multiple of the block height would read past the end of the weight; those
                 // shapes keep one row per block, as do weights too short to fill the GPU.
-                // (Only instantiated where a multi-row block exists: HIP builds, 2..8 columns.)
+                // (Only instantiated where a multi-row block exists: HIP builds.)
 #if defined(GGML_USE_HIP)
                 constexpr int c_rpb_weight = calc_rows_per_block_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4, false, 1);
-                if constexpr (c_rpb_weight > 1) {
-                    if (table_id == MMVQ_PARAMETERS_RDNA4 &&
-                        (nrows_x % c_rpb_weight != 0 || nrows_x < c_rpb_weight * GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS)) {
+                constexpr int c_rpb_rdna3  = calc_rows_per_block_weight(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA3_0, false, 1);
+                if constexpr (c_rpb_weight > 1 || c_rpb_rdna3 > 1) {
+                    if ((table_id == MMVQ_PARAMETERS_RDNA4 &&
+                         (nrows_x % c_rpb_weight != 0 || nrows_x < c_rpb_weight * GGML_MMVQ_RDNA4_WEIGHT_MIN_BLOCKS)) ||
+                        (table_id == MMVQ_PARAMETERS_RDNA3_0 && nrows_x % c_rpb_rdna3 != 0)) {
                         if (long_k) {
                             launch_ksplit_rpb(ncols_tag, std::integral_constant<int, 1>{}, std::true_type{});
                         } else {
