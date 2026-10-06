@@ -198,14 +198,21 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     return true;
 }
 
+static bool ggml_cuda_is_split_swiglu(const ggml_tensor * t) {
+    return t->op == GGML_OP_GLU && ggml_get_glu_op(t) == GGML_GLU_OP_SWIGLU && t->src[1] != nullptr;
+}
+
+// ctx: the caller takes GGML_CUDA_VERIFY_NORM_Q8's verify-band consumer check (ggml_cuda_norm_q8_1_consumer), and a
+// split SWIGLU may stand in for the MUL.
 static bool ggml_cuda_should_fuse_mul_q8_1(const ggml_tensor * mul,
-                                           const ggml_tensor * mm) {
-    if (mul->op != GGML_OP_MUL || (mm->op != GGML_OP_MUL_MAT && mm->op != GGML_OP_MUL_MAT_ID)) {
+                                           const ggml_tensor * mm, ggml_backend_cuda_context * ctx = nullptr) {
+    if ((mul->op != GGML_OP_MUL && !(ctx != nullptr && ggml_cuda_is_split_swiglu(mul))) ||
+            (mm->op != GGML_OP_MUL_MAT && mm->op != GGML_OP_MUL_MAT_ID)) {
         return false;
     }
 
     // The matmul must run on the mmvq path (the only consumer of the arena).
-    if (!ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)) {
+    if (ctx != nullptr ? !ggml_cuda_norm_q8_1_consumer(*ctx, mm) : !ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)) {
         return false;
     }
 
@@ -238,7 +245,8 @@ static bool ggml_cuda_should_fuse_mul_q8_1(const ggml_tensor * mul,
 // If the MUL output feeds a single mmvq matmul (directly or via a no-op
 // reshape at the next node), return that matmul; otherwise return nullptr.
 static const ggml_tensor * ggml_cuda_find_mul_q8_1_matmul(const ggml_cgraph * cgraph,
-                                                          int mul_idx, const ggml_tensor * mul) {
+                                                          int mul_idx, const ggml_tensor * mul,
+                                                          ggml_backend_cuda_context * ctx = nullptr) {
     const int n = cgraph->n_nodes;
     const ggml_tensor * n1 = (mul_idx + 1 < n) ? cgraph->nodes[mul_idx + 1] : nullptr;
     if (n1 == nullptr) {
@@ -259,7 +267,7 @@ static const ggml_tensor * ggml_cuda_find_mul_q8_1_matmul(const ggml_cgraph * cg
         return nullptr;
     }
 
-    if (!ggml_cuda_should_fuse_mul_q8_1(mul, mm)) {
+    if (!ggml_cuda_should_fuse_mul_q8_1(mul, mm, ctx)) {
         return nullptr;
     }
     return mm;
@@ -2264,7 +2272,7 @@ static int ggml_cuda_try_fuse_gdn_out_gate(ggml_backend_cuda_context & ctx, ggml
             (norm->flags & GGML_TENSOR_FLAG_OUTPUT) || (nmul->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }
-    const ggml_tensor * mm = ggml_cuda_find_mul_q8_1_matmul(cgraph, i + 5, mul);
+    const ggml_tensor * mm = ggml_cuda_find_mul_q8_1_matmul(cgraph, i + 5, mul, &ctx);
     if (mm == nullptr) {
         return 0;
     }
@@ -2402,6 +2410,15 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
     // GLU -> Q8_1 (GGML_CUDA_FUSE_GLU_Q8_1=0: off): an F32 GLU whose next node (or the one after a reshape) is a verify-band
     // mmvq matmul over it is marked here (RDNA4 / RDNA3_0 only, through ggml_cuda_should_fuse_mul_mat_vec_q(mm, true)); the regular
     // GLU launcher then also writes the matmul's Q8_1 blocks into the quantize cache, which the matmul finds.
+    // GGML_CUDA_VERIFY_NORM_Q8: a split SWIGLU feeding an mmvq matmul writes the matmul's Q8_1 input directly.
+    if (ggml_cuda_verify_norm_q8() && ggml_cuda_is_split_swiglu(node)) {
+        const ggml_tensor * mm = ggml_cuda_find_mul_q8_1_matmul(cgraph, i, node, cuda_ctx);
+        if (mm != nullptr) {
+            ggml_cuda_op_swiglu_q8_1(*cuda_ctx, node, mm);
+            return cgraph->nodes[i + 1] == mm ? -1 : 1;
+        }
+    }
+
     // GLU -> Q8_1 marking (owned by mmvq.cu).
     ggml_cuda_glu_q8_1_mark(*cuda_ctx, cgraph, i);
 
@@ -3517,7 +3534,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
         // If the product feeds a single decode matmul (directly or via a
         // no-op reshape), write its Q8_1 quantized value instead of the F32
         // output; the matmul launcher finds it via the quantize cache.
-        const ggml_tensor * mm = ggml_cuda_find_mul_q8_1_matmul(cgraph, i + 1, mul_node);
+        const ggml_tensor * mm = ggml_cuda_find_mul_q8_1_matmul(cgraph, i + 1, mul_node, cuda_ctx);
         if (mm != nullptr) {
             ggml_cuda_op_unary_mul_q8_1(*cuda_ctx, node, mul_node, mm);
             return cgraph->nodes[i + 2] == mm ? 1 : 2;

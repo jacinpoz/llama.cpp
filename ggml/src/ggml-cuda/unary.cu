@@ -638,6 +638,40 @@ static void ggml_cuda_op_unary_mul_q8_1_impl(ggml_backend_cuda_context & ctx,
             k, nc, unary_stride / sizeof(float), other_stride / sizeof(float), row_len, (float *) nullptr);
 }
 
+// A split SWIGLU (silu(src0) * src1) written straight into the Q8_1 blocks its mmvq consumer mm quantizes, as
+// ggml_cuda_op_unary_mul_q8_1_impl<op_silu> does for UNARY(SILU) * MUL.  The F32 output is not written.
+void ggml_cuda_op_swiglu_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, const ggml_tensor * mm) {
+    const ggml_tensor * unary_src = glu->src[0];
+    const ggml_tensor * other_src = glu->src[1];
+    GGML_ASSERT(glu->type == GGML_TYPE_F32 && other_src != nullptr && unary_src->type == GGML_TYPE_F32 && other_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_1(unary_src) && ggml_is_contiguous_1(other_src));
+
+    const ggml_tensor * src1 = mm->src[1];
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const ggml_tensor * src1_key = src1;
+    while (src1_key->view_src != nullptr && src1->data == src1_key->data) {
+        src1_key = src1_key->view_src;
+    }
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    const size_t q8_1_size = src1->ne[3]*src1->ne[2] * src1->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    bool cached = false;
+    void * y = ctx.q8_1_cache_get(src1_key, ctx.curr_stream_no, q8_1_size, src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                                  src1->nb[1]/ts_src1, src1->nb[2]/ts_src1, src1->nb[3]/ts_src1, cached);
+    if (cached) {
+        return;
+    }
+    if (!ctx.q8_1_src_range_ok(unary_src, unary_src->data) || !ctx.q8_1_src_range_ok(other_src, other_src->data)) {
+        GGML_ABORT("fatal error");
+    }
+    const int64_t k  = ggml_nelements(glu);
+    const int64_t nc = unary_src->ne[0];
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(unary_gated_q8_1_op_kernel<op_silu, float>, lp,
+            (const float *) unary_src->data, (const float *) other_src->data, (block_q8_1 *) y,
+            k, nc, unary_src->nb[1] / (int64_t) sizeof(float), other_src->nb[1] / (int64_t) sizeof(float), src1->ne[0], (float *) nullptr);
+}
+
 void ggml_cuda_op_unary_mul_q8_1(ggml_backend_cuda_context & ctx,
                                  ggml_tensor * unary_node, ggml_tensor * mul_node,
                                  const ggml_tensor * mm, const ggml_tensor * unary_view, const ggml_tensor * norm) {

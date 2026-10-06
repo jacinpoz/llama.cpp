@@ -155,3 +155,5 @@ int  ggml_cuda_sigmoid_mul_add_try_fuse(ggml_backend_cuda_context & ctx, const g
 // GDN output gate: RMS_NORM*w, silu(z)*normed, Q8_1 into mm's quantize cache (see unary.cu).
 bool ggml_cuda_op_norm_silu_gate_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * norm_mul,
         const ggml_tensor * unary_node, const ggml_tensor * mul_node, const ggml_tensor * mm);
+// GGML_CUDA_VERIFY_NORM_Q8: a split SWIGLU written as its mmvq consumer's Q8_1 input (see unary.cu).
+void ggml_cuda_op_swiglu_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, const ggml_tensor * mm);
