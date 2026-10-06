@@ -1046,8 +1046,7 @@ bool ggml_cuda_op_hadamard64_set_rows(ggml_backend_cuda_context & ctx, const ggm
     return true;
 }
 
-// Q prep, K prep and the V hadamard in one launch: blocks [0, nq) run Q tiles, [nq, nq + nk) K tiles, and each
-// remaining block runs two V tiles, one per half.
+// Blocks [0, nq) run Q tiles and [nq, nq + nk) K tiles; each later block runs two V tiles, one per half.
 template <bool has_ff>
 static __global__ void __launch_bounds__(256, 1) k_attn_qkv_prep(const mk_attn_prep_params pq, const mk_attn_prep_params pk,
         const mk_v_had_set_rows_params pv, const int nq, const int nk, const int nv) {

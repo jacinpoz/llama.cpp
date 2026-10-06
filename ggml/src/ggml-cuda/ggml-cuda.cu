@@ -5263,6 +5263,7 @@ static int ggml_cuda_try_fuse_attn_tail(ggml_backend_cuda_context & ctx, const g
 // Attention head prep (Qwen3.5/3.8 with KV rotation): the Q chain RMS_NORM MUL ROPE RESHAPE MUL_MAT(hadamard) and
 // the K chain (the same + RESHAPE VIEW SET_ROWS) each become one launch, and the V chain MUL_MAT(hadamard 64) ...
 // SET_ROWS is written when the MUL_MAT runs and the SET_ROWS is skipped. Bit-identical (see mk-ops-attn.cuh).
+// When the K and V chains follow the Q chain, all three run as one launch at the Q chain (ggml_cuda_try_fuse_qkv_prep).
 // GGML_CUDA_DISABLE_ATTN_PREP_FUSION=1 turns it off.
 static thread_local std::unordered_set<const ggml_tensor *> g_precomputed_nodes;
 
@@ -5349,20 +5350,22 @@ static bool ggml_cuda_match_k_prep(const ggml_cgraph * cgraph, const int j, ggml
         n[7]->src[0] == n[6];
 }
 
-// The Q chain at i, the V hadamard and the K chain as one launch. The K and V matvecs share the Q matvec's input, so
-// any that has not run yet (no triple matvec) runs now into a private buffer; the K and V nodes are skipped when
-// reached. Returns false when the layout does not match.
+// A K or V matvec of decode or verify width that the triple matvec did not run is run here, before its node, into a private buffer.
 static bool ggml_cuda_try_fuse_qkv_prep(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i,
         const ggml_cuda_attn_prep_chain & q) {
+    const int end = std::min(cgraph->n_nodes, i + 40);
     const ggml_tensor * q_mm = ggml_cuda_root_matmul(q.rms_norm->src[0]);
+    auto not_run_yet = [&](const ggml_tensor * mm) {
+        return std::find(cgraph->nodes + i + 1, cgraph->nodes + end, mm) != cgraph->nodes + end;
+    };
     auto early_ok = [&](const ggml_tensor * mm) {
-        return mm != nullptr && (g_precomputed_nodes.count(mm) > 0 ||
-            (q_mm != nullptr && mm->src[1] == q_mm->src[1] && !(mm->flags & GGML_TENSOR_FLAG_OUTPUT)));
+        return mm != nullptr && (g_precomputed_nodes.count(mm) > 0 || (g_verify_gdn_single_stream && q_mm != nullptr && mm != q_mm &&
+            mm->src[1] == q_mm->src[1] && mm->ne[1] <= MMVQ_MAX_BATCH_SIZE && (mm->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+            !(mm->flags & GGML_TENSOR_FLAG_OUTPUT) && not_run_yet(mm)));
     };
     int vi = -1, v_sr = -1, ki = -1;
     ggml_tensor * v_mm = nullptr, * k_mm = nullptr;
     ggml_cuda_attn_prep_chain k;
-    const int end = std::min(cgraph->n_nodes, i + 40);
     for (int j = i + 5; j < end && (vi < 0 || ki < 0); ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
         if (vi < 0 && n->op == GGML_OP_MUL_MAT && ggml_get_op_params_i32(n, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
