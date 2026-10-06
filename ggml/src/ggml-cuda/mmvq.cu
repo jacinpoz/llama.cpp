@@ -2511,6 +2511,50 @@ static __global__ void __launch_bounds__(BLOCK, 1) mmvq_triple(
     }
 }
 
+// Two IQ4_XS matvecs reading the same 2..8-token input, as in the triple.
+static int mmvq_pair_ncols(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b) {
+    auto one_row = [](const ggml_cuda_mmvq_capture & x) { return x.valid && x.grid_y == 1 && x.grid_z == 1 && 256 % x.threads == 0; };
+    if (!one_row(a) || !one_row(b)) {
+        return 0;
+    }
+    for (int t = 2; t <= MMVQ_MAX_BATCH_SIZE; ++t) {
+        if (a.variant == mk_mmvq_variant(GGML_TYPE_IQ4_XS, t, false, true) && b.variant == a.variant) {
+            return t;
+        }
+    }
+    return 0;
+}
+
+bool ggml_cuda_mmvq_pair_t_supported(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return mmvq_pair_ncols(a, b) > 0 && get_device_table_id(cc) == MMVQ_PARAMETERS_RDNA3_0;
+}
+
+void ggml_cuda_mmvq_launch_pair_t(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, cudaStream_t stream) {
+    mk_mmvq_params pa, pb;
+    memcpy(&pa, a.params, sizeof(pa));
+    memcpy(&pb, b.params, sizeof(pb));
+    constexpr int BLOCK = 256;
+    const uint32_t nba = mmvq_multi_blocks(a, BLOCK);
+    const uint32_t nbb = mmvq_multi_blocks(b, BLOCK);
+    auto launch = [&](auto t_c) {
+        constexpr int T = decltype(t_c)::value;
+        using Op = mk_mmvq<BLOCK, GGML_TYPE_IQ4_XS, T, false, false, 0, true>;
+        mmvq_pair<BLOCK, Op, Op><<<nba + nbb, BLOCK, 0, stream>>>(pa, a.grid_x, nba, pb, b.grid_x);
+    };
+    switch (mmvq_pair_ncols(a, b)) {
+        case 2: launch(std::integral_constant<int, 2>{}); break;
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 5: launch(std::integral_constant<int, 5>{}); break;
+        case 6: launch(std::integral_constant<int, 6>{}); break;
+        case 7: launch(std::integral_constant<int, 7>{}); break;
+        case 8: launch(std::integral_constant<int, 8>{}); break;
+        default: GGML_ABORT("mmvq pair: unsupported pair");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static int mmvq_triple_ncols(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, const ggml_cuda_mmvq_capture & c) {
     auto one_row = [](const ggml_cuda_mmvq_capture & x) { return x.valid && x.grid_y == 1 && x.grid_z == 1 && 256 % x.threads == 0; };
     if (!one_row(a) || !one_row(b) || !one_row(c)) {

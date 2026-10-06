@@ -68,6 +68,8 @@ struct ggml_cuda_mmvq_capture {
 void ggml_cuda_mmvq_set_capture(ggml_cuda_mmvq_capture * cap); // nullptr: launch normally again
 bool ggml_cuda_mmvq_pair_supported(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b);
 void ggml_cuda_mmvq_launch_pair(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, cudaStream_t stream);
+bool ggml_cuda_mmvq_pair_t_supported(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b);
+void ggml_cuda_mmvq_launch_pair_t(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, cudaStream_t stream);
 bool ggml_cuda_mmvq_triple_supported(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, const ggml_cuda_mmvq_capture & c);
 void ggml_cuda_mmvq_launch_triple(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, const ggml_cuda_mmvq_capture & c,
                                   cudaStream_t stream);

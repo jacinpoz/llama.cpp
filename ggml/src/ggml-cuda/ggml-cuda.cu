@@ -5375,6 +5375,66 @@ static int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgrap
     return -1;
 }
 
+// GGML_CUDA_VERIFY_PAIR: at 2..8 tokens, an IQ4_XS matvec and the next IQ4_XS matvec on the same input (FFN up and
+// gate, GDN qkv and z) run as one launch; the second one is written early into a private buffer. a_out is the first
+// matvec's destination (the node itself, or a copy pointing at scratch memory). Returns false when nothing ran.
+static bool ggml_cuda_verify_pair() {
+    // the fused gate/up/GLU of GGML_CUDA_VERIFY_GLU claims the FFN matvecs itself
+    static const bool enabled = getenv("GGML_CUDA_VERIFY_PAIR") != nullptr && atoi(getenv("GGML_CUDA_VERIFY_PAIR")) != 0 &&
+        !(getenv("GGML_CUDA_VERIFY_GLU") != nullptr && atoi(getenv("GGML_CUDA_VERIFY_GLU")) != 0);
+    return enabled;
+}
+
+static bool ggml_cuda_mmvq_pair_t(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i, ggml_tensor * a_out) {
+    const ggml_tensor * a = cgraph->nodes[i];
+    if (!ggml_cuda_verify_pair() || !g_verify_gdn_single_stream || a->op != GGML_OP_MUL_MAT || a->src[0]->type != GGML_TYPE_IQ4_XS ||
+            a->ne[1] < 2 || a->ne[1] > MMVQ_MAX_BATCH_SIZE || a->ne[2] != 1 || a->src[2] != nullptr) {
+        return false;
+    }
+    const auto is_mmvq = [&](const ggml_tensor * m) {
+        return ggml_cuda_mul_mat_kernel(ctx, m->src[0], m->src[1], m) == GGML_CUDA_MM_MMVQ;
+    };
+    if (!is_mmvq(a)) {
+        return false;
+    }
+    ggml_tensor * b = nullptr;
+    for (int k = i + 1; k < std::min(cgraph->n_nodes, i + 128); ++k) {
+        ggml_tensor * n = cgraph->nodes[k];
+        if (n->op == GGML_OP_MUL_MAT && n->src[1] == a->src[1] && (n->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                n->src[0]->type == GGML_TYPE_IQ4_XS && n->ne[1] == a->ne[1] && n->ne[2] == 1 && n->src[2] == nullptr &&
+                !(n->flags & GGML_TENSOR_FLAG_OUTPUT) && g_precomputed_nodes.count(n) == 0) {
+            b = n;
+            break;
+        }
+    }
+    if (b == nullptr || !is_mmvq(b)) {
+        if (ggml_cuda_fuse_debug()) {
+            fprintf(stderr, "fuse-debug: pair at %s rejected: partner %s\n", a->name, b ? b->name : "none");
+        }
+        return false;
+    }
+    ggml_cuda_redirect_early_output(cgraph, i, b);
+    ggml_cuda_mmvq_capture cap[2];
+    ggml_tensor * mm[2] = { a_out, b };
+    for (int m = 0; m < 2; ++m) {
+        ggml_cuda_mmvq_set_capture(&cap[m]);
+        ggml_cuda_mul_mat_vec_q(ctx, mm[m]->src[0], mm[m]->src[1], nullptr, mm[m], nullptr);
+    }
+    ggml_cuda_mmvq_set_capture(nullptr);
+    if (ggml_cuda_mmvq_pair_t_supported(cap[0], cap[1])) {
+        ggml_cuda_mmvq_launch_pair_t(cap[0], cap[1], ctx.stream());
+    } else {
+        // a captured launch did not run
+        for (int m = 0; m < 2; ++m) {
+            if (cap[m].valid) {
+                ggml_cuda_mul_mat_vec_q(ctx, mm[m]->src[0], mm[m]->src[1], nullptr, mm[m], nullptr);
+            }
+        }
+    }
+    g_precomputed_nodes.insert(b);
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -5383,7 +5443,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
-        const int r = ggml_cuda_try_mmvq_triple(*cuda_ctx, cgraph, i);
+        int r = ggml_cuda_try_mmvq_triple(*cuda_ctx, cgraph, i);
+        if (r == 0 && ggml_cuda_mmvq_pair_t(*cuda_ctx, cgraph, i, cgraph->nodes[i])) {
+            r = -1;
+        }
         if (r != 0) {
             return r;
         }
@@ -7839,15 +7902,18 @@ static bool ggml_cuda_try_elide_verify_conv_gather(const ggml_cgraph * cgraph, c
     return true;
 }
 
-static bool ggml_cuda_try_verify_conv_launch(ggml_backend_cuda_context & ctx, ggml_tensor * node) {
+static bool ggml_cuda_try_verify_conv_launch(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
     ggml_cuda_verify_conv_plan & plan = g_verify_conv_plan;
+    ggml_tensor * node = cgraph->nodes[i];
     if (plan.qkv != node) {
         return false;
     }
     ggml_cuda_pool_alloc<float> x(ctx.pool(), ggml_nelements(node));
     ggml_tensor qkv = *node;
     qkv.data = x.get();
-    ggml_cuda_compute_forward(ctx, &qkv);
+    if (!ggml_cuda_mmvq_pair_t(ctx, cgraph, i, &qkv)) {
+        ggml_cuda_compute_forward(ctx, &qkv);
+    }
     plan.p.x = x.get();
     ggml_cuda_gdn_conv(plan.p, ctx.stream());
     g_precomputed_nodes.insert(plan.skip, plan.skip + plan.n_skip);
@@ -8054,7 +8120,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
                 if (g_verify_conv_plan.qkv != nullptr) {
-                    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_try_verify_conv_launch(*cuda_ctx, node)) {
+                    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_try_verify_conv_launch(*cuda_ctx, cgraph, i)) {
                         continue;
                     }
                     if (node->op == GGML_OP_CONCAT) {
