@@ -4,11 +4,14 @@
 
 // Optional output epilogue (the Qwen3.5/3.8 gated-attention tail): out = fwht64(o) * sigmoid(gate), written to out
 // instead of dst. gate is a [256, n_head, n_q] float view (byte strides gate_nb1/gate_nb2); out is contiguous.
+// With q8 set, out is also quantized to Q8_1 rows of q8_row_blocks blocks for the next matmul.
 struct gqa_dec_epilogue {
     const char * gate     = nullptr;
     int64_t      gate_nb1 = 0;
     int64_t      gate_nb2 = 0;
     float *      out      = nullptr;
+    block_q8_1 * q8       = nullptr;
+    int64_t      q8_row_blocks = 0;
 };
 
 bool ggml_cuda_fattn_gqa_dec_supported(int device, const ggml_tensor * dst);
