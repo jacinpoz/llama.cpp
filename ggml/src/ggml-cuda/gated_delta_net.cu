@@ -26,6 +26,11 @@ bool ggml_cuda_gdn_get_state_src(const ggml_tensor * gdn, ggml_cuda_gdn_state_sr
     return true;
 }
 
+// Four columns per warp keep more state loads in flight; the state comes from DRAM, so the kernel is latency-bound.
+static constexpr int gdn_cols_per_warp(int S_v) {
+    return S_v == 128 ? 4 : 1;
+}
+
 template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__(mk_gdn_step_warp_size<S_v>() * mk_gdn_step_warps, 2)
 gated_delta_net_cuda(const float * q,
@@ -64,7 +69,7 @@ gated_delta_net_cuda(const float * q,
     };
     p.beta_sigmoid = beta_sigmoid;
     ggml_cuda_pdl_sync();
-    mk_gdn_step_tile<S_v, KDA, keep_rs_t>(p, blockIdx.x, blockIdx.z, blockIdx.y, threadIdx.y*blockDim.x + threadIdx.x);
+    mk_gdn_step_tile<S_v, KDA, keep_rs_t, gdn_cols_per_warp(S_v)>(p, blockIdx.x, blockIdx.z, blockIdx.y, threadIdx.y*blockDim.x + threadIdx.x);
 }
 
 template <bool KDA, bool keep_rs_t>
@@ -82,7 +87,8 @@ static void launch_gated_delta_net(
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = mk_gdn_step_warps;
-    dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
+    const int ncols = gdn_cols_per_warp(S_v);
+    dim3      grid_dims(H, n_seqs, (S_v + num_warps*ncols - 1) / (num_warps*ncols));
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
