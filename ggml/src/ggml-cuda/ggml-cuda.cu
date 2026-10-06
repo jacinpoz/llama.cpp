@@ -7915,7 +7915,28 @@ static bool ggml_cuda_try_verify_conv_launch(ggml_backend_cuda_context & ctx, gg
         ggml_cuda_compute_forward(ctx, &qkv);
     }
     plan.p.x = x.get();
-    ggml_cuda_gdn_conv(plan.p, ctx.stream());
+    // the GDN gate projections read the same input: as at one token, run them with the conv in one launch
+    int g = -1;
+    for (int k = i + 1; ggml_cuda_multi_op() && k < std::min(cgraph->n_nodes - 8, i + 64); ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (n->op == GGML_OP_MUL_MAT && n->src[1] == node->src[1] && (n->flags & GGML_TENSOR_FLAG_COMPUTE) && g_precomputed_nodes.count(n) == 0) {
+            g = k;
+            break;
+        }
+    }
+    mk_gdn_gates_params gates_p;
+    if (g >= 0 && ggml_cuda_gdn_gates_prepare(cgraph, g, gates_p)) {
+        ggml_cuda_redirect_early_output(cgraph, i, cgraph->nodes[g + 4]);
+        ggml_cuda_redirect_early_output(cgraph, i, cgraph->nodes[g + 8]);
+        gates_p.gate = (float *) cgraph->nodes[g + 4]->data;
+        gates_p.beta = (float *) cgraph->nodes[g + 8]->data;
+        ggml_cuda_gdn_conv_gates(plan.p, gates_p, ctx.stream());
+        for (int k = g; k <= g + 8; ++k) {
+            g_precomputed_nodes.insert(cgraph->nodes[k]);
+        }
+    } else {
+        ggml_cuda_gdn_conv(plan.p, ctx.stream());
+    }
     g_precomputed_nodes.insert(plan.skip, plan.skip + plan.n_skip);
     plan.qkv = nullptr;
     return true;
