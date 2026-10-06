@@ -2529,8 +2529,8 @@ void llama_model_base::load_tensors_hadamard() {
             __func__, hdmd.rot.size() + hdmd.inv.size(), hdmd.inv.size(), rotations.size(), sign_tensors.size());
 }
 
-// The MTP drafter scores only the first LLAMA_MTP_DRAFT_VOCAB rows of the LM head; a smaller quant of those rows
-// cuts its read per draft step. Drafts are still verified by the full head, so only the acceptance rate can change.
+// The MTP drafter scores only the first LLAMA_MTP_DRAFT_VOCAB rows of the LM head; a smaller quant of those rows cuts its read per draft step.
+// The full head still verifies drafts, so only the acceptance rate changes.
 void llama_model::create_mtp_draft_head() {
     const char * type_env  = getenv("LLAMA_MTP_DRAFT_HEAD_TYPE");
     const char * vocab_env = getenv("LLAMA_MTP_DRAFT_VOCAB");

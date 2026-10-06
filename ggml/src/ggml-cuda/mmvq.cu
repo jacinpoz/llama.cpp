@@ -3696,7 +3696,6 @@ static __global__ void __launch_bounds__(BLOCK, 1) mmvq_triple(
     }
 }
 
-// Two IQ4_XS matvecs reading the same 2..8-token input, as in the triple.
 static int mmvq_pair_ncols(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b) {
     auto one_row = [](const ggml_cuda_mmvq_capture & x) { return x.valid && x.grid_y == 1 && x.grid_z == 1 && 256 % x.threads == 0; };
     if (!one_row(a) || !one_row(b)) {
@@ -3842,9 +3841,8 @@ int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     return -1;
 }
 
-// GGML_CUDA_VERIFY_PAIR: at 2..8 tokens, an IQ4_XS matvec and the next IQ4_XS matvec on the same input (FFN up and
-// gate, GDN qkv and z) run as one launch; the second one is written early into a private buffer. a_out is the first
-// matvec's destination (the node itself, or a copy pointing at scratch memory). Returns false when nothing ran.
+// GGML_CUDA_VERIFY_PAIR: at 2..8 tokens, runs two IQ4_XS matvecs on the same input as one launch, the second writing early into a private buffer.
+// a_out is the first matvec's destination (the node or a scratch copy). Returns false when nothing ran.
 static bool ggml_cuda_verify_pair() {
     // the fused gate/up/GLU of GGML_CUDA_VERIFY_GLU claims the FFN matvecs itself
     static const bool enabled = getenv("GGML_CUDA_VERIFY_PAIR") != nullptr && atoi(getenv("GGML_CUDA_VERIFY_PAIR")) != 0 &&

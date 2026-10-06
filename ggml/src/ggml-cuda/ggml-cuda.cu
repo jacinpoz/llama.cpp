@@ -7614,7 +7614,6 @@ static bool ggml_cuda_try_verify_conv_launch(ggml_backend_cuda_context & ctx, gg
         ggml_cuda_compute_forward(ctx, &qkv);
     }
     plan.p.x = x.get();
-    // the GDN gate projections read the same input: as at one token, run them with the conv in one launch
     int g = -1;
     for (int k = i + 1; ggml_cuda_multi_op() && k < std::min(cgraph->n_nodes - 8, i + 64); ++k) {
         const ggml_tensor * n = cgraph->nodes[k];
