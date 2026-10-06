@@ -9,7 +9,9 @@
 
 namespace {
 
-constexpr int kMaxQ = 4;  // query tokens per pass; larger widths loop, so the partial buffer has a fixed size
+// The partial buffer holds kMaxQ*mk_attn_max_chunks (token, chunk) pairs whatever n_kv is, so the pool returns the same
+// buffer every call; a pass takes as many query tokens as fit and wider batches loop.
+constexpr int kMaxQ = 4;
 
 template <int G, ggml_type T>
 __launch_bounds__(WARP_SIZE, 1) __global__ void gqa_dec_partial(const mk_attn_partial_params p) {
@@ -42,7 +44,6 @@ void gqa_dec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const gq
     const int n_kv      = (int) K->ne[1];
     const int n_chunks  = mk_attn_chunking(n_kv).n;
 
-    // Fixed size (independent of n_kv and n_q), so the pool returns the same buffer every call.
     ggml_cuda_pool_alloc<float>  part_acc(ctx.pool(), (size_t) kMaxQ*n_head_kv*mk_attn_max_chunks*G*mk_attn_d);
     ggml_cuda_pool_alloc<float2> part_ms (ctx.pool(), (size_t) kMaxQ*n_head_kv*mk_attn_max_chunks*G);
 
@@ -71,8 +72,9 @@ void gqa_dec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const gq
     cp.n_head    = n_head;
     cp.ep        = ep;
 
-    for (int q0 = 0; q0 < n_q; q0 += kMaxQ) {
-        const int nq = std::min(kMaxQ, n_q - q0);
+    const int q_per_pass = std::max(1, kMaxQ*mk_attn_max_chunks/n_chunks);
+    for (int q0 = 0; q0 < n_q; q0 += q_per_pass) {
+        const int nq = std::min(q_per_pass, n_q - q0);
         pp.q0 = cp.q0 = q0;
         pp.nq = cp.nq = nq;
         gqa_dec_partial<G, T><<<dim3(n_chunks, n_head_kv, nq), WARP_SIZE, 0, stream>>>(pp);
