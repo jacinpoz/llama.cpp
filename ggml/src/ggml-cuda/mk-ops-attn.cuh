@@ -481,6 +481,7 @@ struct mk_attn_partial {
             }
             __syncwarp();
 
+#pragma unroll 4
             for (int j = 0; j < nk; ++j) {
                 float vv[8];
                 gqa_dec_load_slice<T>(Vh + (int64_t) (k0 + j)*p.nbv1, lane, vv);
