@@ -1784,10 +1784,17 @@ bool ggml_cuda_fusion_disabled();
 
 struct ggml_cuda_mk_state;
 
+struct ggml_cuda_h2d_entry {
+    char       * dst;
+    const char * src;
+    uint32_t     size;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    std::vector<ggml_cuda_h2d_entry> h2d_pending; // GGML_CUDA_BATCH_H2D: uploads not yet issued on stream()
 
     // Host-pinned ring for the strided splice H2D (see `ggml_backend_cuda_set_tensor_2d_async`,
     // `stride_tensor == size && n_copies > 1`).  Owned by the context so the events and pinned
