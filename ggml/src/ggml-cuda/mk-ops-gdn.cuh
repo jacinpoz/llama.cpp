@@ -351,7 +351,7 @@ static constexpr __device__ int mk_gdn_step_warp_size() {
 
 // tid is the thread's linear index within the tile (the standalone kernel uses a 2D block).
 // Each warp owns ncols adjacent columns; every column's arithmetic is the same for any ncols.
-template <int S_v, bool KDA, bool keep_rs_t, int ncols = 1>
+template <int S_v, bool KDA, bool keep_rs_t, int ncols>
 static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params & p, const uint32_t h_idx,
         const uint32_t col_group, const uint32_t sequence, const int tid) {
     constexpr int warp_size = mk_gdn_step_warp_size<S_v>();
@@ -423,11 +423,21 @@ static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params
             q_reg[r] = q_t[i];
         }
 
+        float g_reg[KDA ? rows_per_lane : 1];
+        if constexpr (KDA) {
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                g_reg[r] = expf(g_t[r * warp_size + lane]);
+            }
+        } else {
+            g_reg[0] = expf(*g_t);
+        }
+
 #pragma unroll
         for (int c = 0; c < ncols; c++) {
             const int col = col0 + c;
             if constexpr (!KDA) {
-                const float g_val = expf(*g_t);
+                const float g_val = g_reg[0];
 
                 // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
                 float kv_shard = 0.0f;
@@ -459,8 +469,7 @@ static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params
                 float kv_shard = 0.0f;
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
-                    const int i = r * warp_size + lane;
-                    kv_shard += expf(g_t[i]) * s_shard[c][r] * k_reg[r];
+                    kv_shard += g_reg[r] * s_shard[c][r] * k_reg[r];
                 }
 
                 float kv_col = warp_reduce_sum<warp_size>(kv_shard);
@@ -473,8 +482,7 @@ static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params
                 float attn_partial = 0.0f;
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
-                    const int i = r * warp_size + lane;
-                    s_shard[c][r] = expf(g_t[i]) * s_shard[c][r] + k_reg[r] * delta_col;
+                    s_shard[c][r] = g_reg[r] * s_shard[c][r] + k_reg[r] * delta_col;
                     attn_partial += s_shard[c][r] * q_reg[r];
                 }
 
@@ -533,9 +541,9 @@ struct mk_gdn_step {
         const uint32_t col_group = (tile / p.H) % p.n_col_groups;
         const uint32_t sequence  = tile / (p.H*p.n_col_groups);
         if (variant & 1) {
-            mk_gdn_step_tile<S_v, false, true>(p, h_idx, col_group, sequence, tid);
+            mk_gdn_step_tile<S_v, false, true, 1>(p, h_idx, col_group, sequence, tid);
         } else {
-            mk_gdn_step_tile<S_v, false, false>(p, h_idx, col_group, sequence, tid);
+            mk_gdn_step_tile<S_v, false, false, 1>(p, h_idx, col_group, sequence, tid);
         }
     }
 };

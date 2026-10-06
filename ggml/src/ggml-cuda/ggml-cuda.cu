@@ -5317,13 +5317,10 @@ static bool ggml_cuda_attn_prep_uses_ok(const ggml_cgraph * cgraph, const int i,
 }
 
 static bool ggml_cuda_nodes_read(const ggml_cgraph * cgraph, const int from, const int to, const ggml_tensor * t) {
-    const ggml_tensor * root = t->view_src ? t->view_src : t;
+    const ggml_tensor * root = ggml_cuda_view_root(t);
     for (int k = from; k < to; ++k) {
         for (const ggml_tensor * src : cgraph->nodes[k]->src) {
-            while (src != nullptr && src->view_src != nullptr) {
-                src = src->view_src;
-            }
-            if (src == root) {
+            if (src != nullptr && ggml_cuda_view_root(src) == root) {
                 return true;
             }
         }
@@ -5363,6 +5360,8 @@ static bool ggml_cuda_try_fuse_qkv_prep(ggml_backend_cuda_context & ctx, ggml_cg
             (q_mm != nullptr && mm->src[1] == q_mm->src[1] && !(mm->flags & GGML_TENSOR_FLAG_OUTPUT)));
     };
     int vi = -1, v_sr = -1, ki = -1;
+    ggml_tensor * v_mm = nullptr, * k_mm = nullptr;
+    ggml_cuda_attn_prep_chain k;
     const int end = std::min(cgraph->n_nodes, i + 40);
     for (int j = i + 5; j < end && (vi < 0 || ki < 0); ++j) {
         const ggml_tensor * n = cgraph->nodes[j];
@@ -5370,13 +5369,13 @@ static bool ggml_cuda_try_fuse_qkv_prep(ggml_backend_cuda_context & ctx, ggml_cg
                 n->src[1]->ne[0] == 64 && early_ok(ggml_cuda_root_matmul(n->src[1])) && j + 1 < end &&
                 cgraph->nodes[j + 1]->op == GGML_OP_RESHAPE && cgraph->nodes[j + 1]->src[0] == n &&
                 ggml_cuda_attn_prep_uses_ok(cgraph, j, 2)) {
-            vi = j;
+            vi   = j;
+            v_mm = ggml_cuda_root_matmul(n->src[1]);
             continue;
         }
         if (ki < 0 && n->op == GGML_OP_RMS_NORM) {
-            ggml_cuda_attn_prep_chain k;
-            if (!early_ok(ggml_cuda_root_matmul(n->src[0])) || !ggml_cuda_match_k_prep(cgraph, j, k) ||
-                    !ggml_cuda_attn_prep_uses_ok(cgraph, j, 7)) {
+            k_mm = ggml_cuda_root_matmul(n->src[0]);
+            if (!early_ok(k_mm) || !ggml_cuda_match_k_prep(cgraph, j, k) || !ggml_cuda_attn_prep_uses_ok(cgraph, j, 7)) {
                 return false;
             }
             ki = j;
@@ -5396,13 +5395,11 @@ static bool ggml_cuda_try_fuse_qkv_prep(ggml_backend_cuda_context & ctx, ggml_cg
     if (v_sr < 0) {
         return false;
     }
-    ggml_cuda_attn_prep_chain k;
-    ggml_cuda_match_k_prep(cgraph, ki, k);
     // the caches are written at node i, so nothing before their SET_ROWS may read them
     if (ggml_cuda_nodes_read(cgraph, i, ki + 7, k.set_rows) || ggml_cuda_nodes_read(cgraph, i, v_sr, cgraph->nodes[v_sr])) {
         return false;
     }
-    for (ggml_tensor * mm : { ggml_cuda_root_matmul(cgraph->nodes[vi]->src[1]), ggml_cuda_root_matmul(k.rms_norm->src[0]) }) {
+    for (ggml_tensor * mm : { v_mm, k_mm }) {
         if (g_precomputed_nodes.count(mm) == 0) {
             ggml_cuda_redirect_early_output(cgraph, i, mm);
             if (!ggml_cuda_compute_forward(ctx, mm)) {
@@ -5414,11 +5411,8 @@ static bool ggml_cuda_try_fuse_qkv_prep(ggml_backend_cuda_context & ctx, ggml_cg
     if (!ggml_cuda_op_attn_qkv_prep(ctx, q, k, cgraph->nodes[vi], cgraph->nodes[v_sr])) {
         return false;
     }
-    for (int j = ki; j <= ki + 7; ++j) {
-        g_precomputed_nodes.insert(cgraph->nodes[j]);
-    }
-    g_precomputed_nodes.insert(cgraph->nodes[vi]);
-    g_precomputed_nodes.insert(cgraph->nodes[v_sr]);
+    g_precomputed_nodes.insert(cgraph->nodes + ki, cgraph->nodes + ki + 8);
+    g_precomputed_nodes.insert({ cgraph->nodes[vi], cgraph->nodes[v_sr] });
     return true;
 }
 
@@ -5441,15 +5435,9 @@ static int ggml_cuda_try_fuse_attn_prep(ggml_backend_cuda_context & ctx, ggml_cg
                 had->src[1] != rsh || !ggml_cuda_attn_prep_uses_ok(cgraph, i, 4)) {
             return 0;
         }
-        // K: RESHAPE VIEW SET_ROWS follow
-        if (i + 7 < cgraph->n_nodes) {
-            const ggml_tensor * r2 = cgraph->nodes[i + 5];
-            const ggml_tensor * vw = cgraph->nodes[i + 6];
-            ggml_tensor *       sr = cgraph->nodes[i + 7];
-            if (r2->op == GGML_OP_RESHAPE && r2->src[0] == had && vw->op == GGML_OP_VIEW && vw->src[0] == r2 &&
-                    sr->op == GGML_OP_SET_ROWS && sr->src[0] == vw && ggml_cuda_attn_prep_uses_ok(cgraph, i + 4, 3)) {
-                return ggml_cuda_op_attn_head_prep(ctx, node, mul, rope, had, sr) ? 7 : 0;
-            }
+        ggml_cuda_attn_prep_chain k;
+        if (ggml_cuda_match_k_prep(cgraph, i, k) && ggml_cuda_attn_prep_uses_ok(cgraph, i + 4, 3)) {
+            return ggml_cuda_op_attn_head_prep(ctx, node, mul, rope, had, k.set_rows) ? 7 : 0;
         }
         if (ggml_cuda_try_fuse_qkv_prep(ctx, cgraph, i, { node, mul, rope, had, nullptr })) {
             return 4;
@@ -5472,20 +5460,7 @@ static int ggml_cuda_try_fuse_attn_prep(ggml_backend_cuda_context & ctx, ggml_cg
                 return 0;
             }
             // nothing between may touch the destination cache (it is written early)
-            for (int k = i + 1; k < j; ++k) {
-                const ggml_tensor * n = cgraph->nodes[k];
-                for (int sidx = 0; sidx < GGML_MAX_SRC; ++sidx) {
-                    const ggml_tensor * t = n->src[sidx];
-                    while (t != nullptr && t->view_src != nullptr) {
-                        t = t->view_src;
-                    }
-                    const ggml_tensor * d = sr->view_src ? sr->view_src : sr;
-                    if (t == d) {
-                        return 0;
-                    }
-                }
-            }
-            if (!ggml_cuda_op_hadamard64_set_rows(ctx, node, sr)) {
+            if (ggml_cuda_nodes_read(cgraph, i + 1, j, sr) || !ggml_cuda_op_hadamard64_set_rows(ctx, node, sr)) {
                 return 0;
             }
             g_precomputed_nodes.insert(sr);
