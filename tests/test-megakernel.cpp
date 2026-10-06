@@ -474,7 +474,7 @@ static void test_timing(hipStream_t stream, int n_blocks) {
 #include "ggml-cuda.h"
 
 // Qwen3.8-27B FFN block at T = 1: rms_norm_q8_1 -> mmvq gate/up + GLU -> mmvq down + residual add.
-// The reference is today's ggml-cuda path (3 launches); the megakernel stream must match it bit for bit.
+// The reference is the regular ggml-cuda path (3 launches); the megakernel stream must match it bit for bit.
 struct ffn_case {
     static constexpr int n_embd = 5120;
     static constexpr int n_ff   = 17408;
@@ -605,7 +605,7 @@ static const char * mk_opname(uint16_t opc) {
 
 struct mk_param_blob { alignas(16) uint8_t b[256]; };
 
-// DeepGEMM-style dynamic schedule: each sub-tile claims its next tile from a global counter (starting at 0),
+// Dynamic schedule: each sub-tile claims its next tile from a global counter (starting at 0),
 // so waves that finish early take more work instead of idling through the static split's tail.
 template <typename Op>
 __global__ void __launch_bounds__(MK_THREADS, 1) k_split_dyn(const mk_op_params<Op> p, int n_tiles, uint32_t * claim) {

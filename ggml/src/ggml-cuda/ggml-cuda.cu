@@ -2385,10 +2385,9 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 // RDNA3_5 (Strix Halo, gfx1151): the dense gate+up+GLU mmvq fusion (single-token unless
 // GGML_CUDA_VERIFY_GLU is set) and its fused kernel does not reproduce the
 // standalone mul_mat_vec_q arithmetic, so a 1-token decode and an n-token speculative verify
-// batch of the same layer are not bit-identical - the decode==verify invariant greedy MTP
-// depends on.  Measured 2026-09-12: W=1 8abc6206... vs W=8 453eaa61...; skipping it (together
-// with the weighted-down MoE tail, gated in ggml_cuda_mul_mat_id_weighted_rdna3_5_ok) restores
-// W=1..8 == 453eaa61... .  Skip it on that arch unless explicitly re-enabled for A/B.
+// batch of the same layer are not bit-identical, which breaks the decode==verify invariant greedy MTP
+// depends on. Skipped on that arch (as is the weighted-down MoE tail, see
+// ggml_cuda_mul_mat_id_weighted_rdna3_5_ok) unless re-enabled for A/B.
 static bool ggml_cuda_rdna3_5_dense_glu_disabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_ENABLE_RDNA3_5_SINGLE_TOKEN_FUSIONS");
