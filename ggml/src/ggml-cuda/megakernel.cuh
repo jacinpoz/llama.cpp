@@ -153,7 +153,7 @@ static void mk_record(uint16_t opcode, int variant, int64_t n_tiles, int threads
 }
 
 #ifndef GGML_MK_HOST_ONLY
-// One Q8_1 block from the 32 lanes of a wave (lane iqs holds value iqs), shared by every Q8_1 producer so all quantize alike.
+// One Q8_1 block from the 32 lanes of a wave, lane iqs holding value iqs.
 static __device__ __forceinline__ void mk_quantize_q8_1_group(const float xi, block_q8_1 * yb, const int iqs) {
     float amax = fabsf(xi);
     float sum = xi;
