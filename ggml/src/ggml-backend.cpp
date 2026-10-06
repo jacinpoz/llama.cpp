@@ -2441,9 +2441,6 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             ggml_backend_event_free(sched->stage_free_ev[b][s]);
         }
         for (int c = 0; c < GGML_SCHED_MAX_COPIES; c++) {
-            if (sched->input_stage[b][c].buf != NULL) {
-                ggml_backend_synchronize(sched->backends[b]);
-            }
             ggml_backend_buffer_free(sched->input_stage[b][c].buf);
         }
     }
