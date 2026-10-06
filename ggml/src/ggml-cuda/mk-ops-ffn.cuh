@@ -91,11 +91,13 @@ struct mk_rmsnorm_q8_1 {
         constexpr int kRegs = 8;
         if (ncols <= kRegs*block_size) {
             float v[kRegs];
+            float w[kRegs];
             float tmp = 0.0f;
 #pragma unroll
             for (int k = 0; k < kRegs; ++k) {
                 const int col = tid + k*block_size;
                 if (col < ncols_v) {
+                    w[k] = mul == nullptr ? 1.0f : mul[col];
                     float xi;
                     if constexpr (has_add) {
                         const int64_t off = sample*p.stride_sample + channel*p.stride_channel + row*p.stride_row;
@@ -118,7 +120,7 @@ struct mk_rmsnorm_q8_1 {
             for (int k = 0; k < kRegs; ++k) {
                 const int col = tid + k*block_size;
                 if (col < ncols_v) {
-                    v[k] = mul == nullptr ? scale * v[k] : scale * v[k] * mul[col];
+                    v[k] = mul == nullptr ? scale * v[k] : scale * v[k] * w[k];
                     dst[col] = v[k];
                 }
             }
