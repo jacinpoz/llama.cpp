@@ -27,7 +27,11 @@ void ggml_cuda_op_l2_norm_pair(ggml_backend_cuda_context & ctx,
                                const ggml_tensor * src0_1, ggml_tensor * dst1,
                                const float eps);
 
-void ggml_cuda_op_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * norm_node, const ggml_tensor * mul_node);
+void ggml_cuda_op_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * norm_node, const ggml_tensor * mul_node,
+        const ggml_tensor * q8_1_key = nullptr);
+
+bool ggml_cuda_op_rms_norm_pair_concat_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * norm_lo, const ggml_tensor * mul_lo,
+        ggml_tensor * norm_hi, const ggml_tensor * mul_hi, ggml_tensor * cat_node, bool quantize);
 
 bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * add_node, ggml_tensor * norm_node, const ggml_tensor * mul_node,
         bool quantize);

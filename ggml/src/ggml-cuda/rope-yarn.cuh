@@ -56,26 +56,27 @@ static __device__ __forceinline__ void rope_multi_cos_sin(
     const int sec_w = sections.v[1] + sections.v[0];
     const int sector = (iw / 2) % sect_dims;
 
-    float theta_base = 0.0;
+    const float p = powf(theta_scale, iw / 2.0f);
+    float theta_base = 0.0f;
     if (is_imrope) {
         if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
+            theta_base = pos[i2 + ne02 * 1] * p;
         } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
+            theta_base = pos[i2 + ne02 * 2] * p;
         } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
-            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
+            theta_base = pos[i2] * p;
         } else {
-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
+            theta_base = pos[i2 + ne02 * 3] * p;
         }
     } else {
         if (sector < sections.v[0]) {
-            theta_base = pos[i2] * powf(theta_scale, iw / 2.0f);
+            theta_base = pos[i2] * p;
         } else if (sector >= sections.v[0] && sector < sec_w) {
-            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, iw / 2.0f);
+            theta_base = pos[i2 + ne02 * 1] * p;
         } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
-            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, iw / 2.0f);
+            theta_base = pos[i2 + ne02 * 2] * p;
         } else if (sector >= sec_w + sections.v[2]) {
-            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, iw / 2.0f);
+            theta_base = pos[i2 + ne02 * 3] * p;
         }
     }
 

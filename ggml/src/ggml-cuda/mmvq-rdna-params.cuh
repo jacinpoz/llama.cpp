@@ -133,7 +133,7 @@ static constexpr __host__ __device__ bool mmvq_decode_grid_loop_type(ggml_type t
 static constexpr __host__ __device__ int calc_rows_per_block_weight(ggml_type type, int ncols_dst, int table_id, bool small_k, int nwarps) {
     // IQ4_XS, Q4_0 and Q8_0 at 8 columns would overflow the megakernel's LDS budget.
     if (table_id == MMVQ_PARAMETERS_RDNA3_0 && ncols_dst <= MMVQ_MAX_BATCH_SIZE &&
-            (type == GGML_TYPE_Q6_K ? ncols_dst >= 2 :
+            (type == GGML_TYPE_Q6_K ? ncols_dst >= 1 :
              type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_Q8_0 ? ncols_dst >= 2 && ncols_dst <= 7 :
              type == GGML_TYPE_Q4_0 && ncols_dst <= 7)) {
         return 2;

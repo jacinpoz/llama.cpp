@@ -1047,9 +1047,11 @@ bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor
 // following MUL node scales it by the norm weight; the fused kernel writes the
 // MUL output (F32) and quantizes it into the mmvq cache so the matmuls over it
 // skip their own quantize kernel.
-void ggml_cuda_op_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * norm_node, const ggml_tensor * mul_node) {
+void ggml_cuda_op_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * norm_node, const ggml_tensor * mul_node,
+        const ggml_tensor * q8_1_key) {
     const ggml_tensor * src0 = norm_node->src[0];
     const ggml_tensor * dst  = mul_node;
+    const ggml_tensor * key  = q8_1_key != nullptr ? q8_1_key : dst;
     const ggml_tensor * weight = mul_node->src[1];
     const float * src0_d = (const float *) src0->data;
     float * dst_d = (float *) dst->data;
@@ -1079,13 +1081,13 @@ void ggml_cuda_op_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * n
     // matmuls skip their own quantize kernel. The key must match the mmvq
     // launcher's (view root of src1, stream, ne, strides).
     const int64_t ne10_padded = GGML_PAD(ncols, MATRIX_ROW_PADDING);
-    const size_t q8_1_size = dst->ne[3]*dst->ne[2] * dst->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    const size_t q8_1_size = key->ne[3]*key->ne[2] * key->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
     bool found = false;
-    void * q8_1 = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, q8_1_size,
-                                      ncols, dst->ne[1], dst->ne[2], dst->ne[3],
-                                      dst->nb[1]/ggml_type_size(dst->type),
-                                      dst->nb[2]/ggml_type_size(dst->type),
-                                      dst->nb[3]/ggml_type_size(dst->type), found);
+    void * q8_1 = ctx.q8_1_cache_get(key, ctx.curr_stream_no, q8_1_size,
+                                      ncols, key->ne[1], key->ne[2], key->ne[3],
+                                      key->nb[1]/ggml_type_size(key->type),
+                                      key->nb[2]/ggml_type_size(key->type),
+                                      key->nb[3]/ggml_type_size(key->type), found);
 
     if (found) {
         // another node already quantized this tensor; run the plain norm+mul
@@ -1100,6 +1102,153 @@ void ggml_cuda_op_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * n
 
     rms_norm_q8_1_cuda(src0_d, dst_d, (block_q8_1 *) q8_1, mul_d,
                        ncols, dst->ne[1], dst->ne[2], dst->ne[3], s01, s02, s03, mul_s01, ne10_padded, eps, stream);
+}
+
+template <int block_size>
+static __global__ void rms_norm_pair_concat_q8_1_f32(
+        const float * x0, const float * w0, const int64_t s01_0, const float eps0,
+        const float * x1, const float * w1, const int64_t s01_1, const float eps1,
+        float * dst_cat, block_q8_1 * y_cat, const int ncols, const int nrows) {
+    const bool second = blockIdx.x >= (unsigned) nrows;
+    const int row = second ? (int) blockIdx.x - nrows : (int) blockIdx.x;
+    const int tid = threadIdx.x;
+
+    const float * x = (second ? x1 : x0) + row * (second ? s01_1 : s01_0);
+    const float * w = second ? w1 : w0;
+    const float eps = second ? eps1 : eps0;
+    float * dst = dst_cat + (int64_t) row * (2 * ncols) + (second ? ncols : 0);
+    const int nblocks_half = ncols / QK8_1;
+    block_q8_1 * y = y_cat != nullptr ? y_cat + (int64_t) row * (2 * nblocks_half) + (second ? nblocks_half : 0) : nullptr;
+
+    constexpr int kRegs = 8;
+    float v[kRegs];
+    float wm[kRegs];
+    float tmp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < kRegs; ++k) {
+        const int col = tid + k * block_size;
+        if (col < ncols) {
+            wm[k] = w[col];
+            const float xi = x[col];
+            v[k] = xi;
+            tmp += xi * xi;
+        }
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float scale = rsqrtf(tmp / ncols + eps);
+#pragma unroll
+    for (int k = 0; k < kRegs; ++k) {
+        const int col = tid + k * block_size;
+        if (col < ncols) {
+            v[k] = scale * v[k] * wm[k];
+            dst[col] = v[k];
+        }
+    }
+
+    if (y == nullptr) {
+        return;
+    }
+
+#pragma unroll
+    for (int k = 0; k < kRegs; ++k) {
+        const int col = tid + k * block_size;
+        if (k * block_size >= ncols) {
+            break;
+        }
+        const int ib = col / QK8_1;
+        const int lane = col % QK8_1;
+        const float xi = col < ncols ? v[k] : 0.0f;
+        float amax = fabsf(xi);
+        float sum  = xi;
+        amax = warp_reduce_max(amax);
+        sum  = warp_reduce_sum(sum);
+        if (col < ncols) {
+            const float d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+            y[ib].qs[lane] = q;
+            if (lane == 0) {
+                y[ib].ds = make_half2(d, sum);
+            }
+        }
+    }
+}
+
+bool ggml_cuda_op_rms_norm_pair_concat_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * norm_lo, const ggml_tensor * mul_lo,
+        ggml_tensor * norm_hi, const ggml_tensor * mul_hi, ggml_tensor * cat_node, const bool quantize) {
+    const ggml_tensor * x0 = norm_lo->src[0];
+    const ggml_tensor * x1 = norm_hi->src[0];
+    const ggml_tensor * w0 = mul_lo->src[0] == norm_lo ? mul_lo->src[1] : mul_lo->src[0];
+    const ggml_tensor * w1 = mul_hi->src[0] == norm_hi ? mul_hi->src[1] : mul_hi->src[0];
+    if (x0 == nullptr || x1 == nullptr || w0 == nullptr || w1 == nullptr ||
+            x0->type != GGML_TYPE_F32 || x1->type != GGML_TYPE_F32 ||
+            w0->type != GGML_TYPE_F32 || w1->type != GGML_TYPE_F32 ||
+            norm_lo->type != GGML_TYPE_F32 || norm_hi->type != GGML_TYPE_F32 ||
+            mul_lo->type != GGML_TYPE_F32 || mul_hi->type != GGML_TYPE_F32 || cat_node->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(x0, norm_lo) || !ggml_are_same_shape(norm_lo, mul_lo) ||
+            !ggml_are_same_shape(x1, norm_hi) || !ggml_are_same_shape(norm_hi, mul_hi) ||
+            !ggml_are_same_shape(mul_lo, mul_hi) ||
+            !ggml_is_contiguous(mul_lo) || !ggml_is_contiguous(mul_hi) || !ggml_is_contiguous(cat_node) ||
+            x0->nb[0] != sizeof(float) || x1->nb[0] != sizeof(float) ||
+            w0->nb[0] != sizeof(float) || w1->nb[0] != sizeof(float) ||
+            x0->ne[2] != 1 || x0->ne[3] != 1 || cat_node->ne[2] != 1 || cat_node->ne[3] != 1 ||
+            cat_node->ne[0] != 2 * x0->ne[0] || cat_node->ne[1] != x0->ne[1] ||
+            w0->ne[0] != x0->ne[0] || ggml_nelements(w0) != x0->ne[0] ||
+            w1->ne[0] != x1->ne[0] || ggml_nelements(w1) != x1->ne[0] ||
+            x0->ne[0] % QK8_1 != 0 || (2 * x0->ne[0]) % MATRIX_ROW_PADDING != 0 || x0->ne[0] > 8 * 1024 ||
+            cat_node->data == x0->data || cat_node->data == x1->data ||
+            ggml_cuda_mmb_is_bf16_only(mul_lo) || ggml_cuda_mmb_wants_bf16_copy(mul_lo) ||
+            ggml_cuda_mmb_is_bf16_only(mul_hi) || ggml_cuda_mmb_wants_bf16_copy(mul_hi) ||
+            ggml_cuda_mmb_is_bf16_only(cat_node) || ggml_cuda_mmb_wants_bf16_copy(cat_node)) {
+        return false;
+    }
+
+    float eps0 = 0.0f;
+    float eps1 = 0.0f;
+    memcpy(&eps0, norm_lo->op_params, sizeof(float));
+    memcpy(&eps1, norm_hi->op_params, sizeof(float));
+    if (eps0 < 0.0f || eps1 < 0.0f) {
+        return false;
+    }
+
+    const int ncols = (int) x0->ne[0];
+    const int nrows = (int) x0->ne[1];
+    const int64_t s01_0 = x0->nb[1] / sizeof(float);
+    const int64_t s01_1 = x1->nb[1] / sizeof(float);
+
+    block_q8_1 * y_cat = nullptr;
+    if (quantize) {
+        const int64_t ne10_padded = 2 * ncols;
+        const size_t q8_1_size = (size_t) nrows * ne10_padded * sizeof(block_q8_1) / QK8_1;
+        bool found = false;
+        void * q8_1 = ctx.q8_1_cache_get(cat_node, ctx.curr_stream_no, q8_1_size,
+                                          2 * ncols, nrows, 1, 1,
+                                          cat_node->nb[1] / sizeof(float),
+                                          cat_node->nb[2] / sizeof(float),
+                                          cat_node->nb[3] / sizeof(float), found);
+        y_cat = found ? nullptr : (block_q8_1 *) q8_1;
+    }
+
+    const dim3 blocks_num(2 * nrows, 1, 1);
+    cudaStream_t stream = ctx.stream();
+    if (ncols < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        const ggml_cuda_kernel_launch_params lp = { blocks_num, block_dims, 32 * sizeof(float), stream };
+        ggml_cuda_kernel_launch(rms_norm_pair_concat_q8_1_f32<256>, lp,
+            (const float *) x0->data, (const float *) w0->data, s01_0, eps0,
+            (const float *) x1->data, (const float *) w1->data, s01_1, eps1,
+            (float *) cat_node->data, y_cat, ncols, nrows);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params lp = { blocks_num, block_dims, 32 * sizeof(float), stream };
+        ggml_cuda_kernel_launch(rms_norm_pair_concat_q8_1_f32<1024>, lp,
+            (const float *) x0->data, (const float *) w0->data, s01_0, eps0,
+            (const float *) x1->data, (const float *) w1->data, s01_1, eps1,
+            (float *) cat_node->data, y_cat, ncols, nrows);
+    }
+    return true;
 }
 
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -1434,6 +1583,27 @@ int ggml_cuda_norm_q8_1_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgr
     if (mul->op != GGML_OP_MUL || mul->src[0] != node || mul->src[1]->ne[0] != node->ne[0] ||
             !ggml_node_has_n_uses(cgraph, i, 1)) {
         return 0;
+    }
+    if (g_mk_recording == nullptr && i + 3 < cgraph->n_nodes &&
+            node->ne[0] % QK8_1 == 0 && mul->ne[1] == 1 && mul->ne[2] == 1 && mul->ne[3] == 1 &&
+            ggml_is_contiguous(mul)) {
+        const ggml_tensor * gr = cgraph->nodes[i + 2];
+        if (gr->op == GGML_OP_GET_ROWS && gr->src[0] == mul &&
+                gr->type == GGML_TYPE_F32 && ggml_is_contiguous(gr) &&
+                ggml_are_same_shape(mul, gr) && !gr->view_src && !(gr->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            int gr_mmvq_uses = 0;
+            for (int j = i + 3; j < cgraph->n_nodes; ++j) {
+                const ggml_tensor * n = cgraph->nodes[j];
+                if (n->op == GGML_OP_MUL_MAT && n->src[1] == gr && n->src[0] != gr &&
+                        ggml_cuda_norm_q8_1_consumer(ctx, n)) {
+                    gr_mmvq_uses++;
+                }
+            }
+            if (gr_mmvq_uses > 0 && gr_mmvq_uses == ggml_node_get_use_count(cgraph, i + 2)) {
+                ggml_cuda_op_rms_norm_q8_1(ctx, node, mul, gr);
+                return 2;
+            }
+        }
     }
     const int scan_end = std::min(cgraph->n_nodes, i + 32);
     for (int j = i + 2; j < scan_end; ++j) {

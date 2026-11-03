@@ -2583,6 +2583,34 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
         return n_add_rms_q8;
     }
 
+    if (node->op == GGML_OP_RMS_NORM && g_mk_recording == nullptr && i + 5 < cgraph->n_nodes) {
+        ggml_tensor * norm_a = cgraph->nodes[i];
+        const ggml_tensor * mul_a = cgraph->nodes[i + 1];
+        ggml_tensor * norm_b = cgraph->nodes[i + 2];
+        const ggml_tensor * mul_b = cgraph->nodes[i + 3];
+        ggml_tensor * cat = cgraph->nodes[i + 4];
+        const ggml_tensor * mm = cgraph->nodes[i + 5];
+        if (mul_a->op == GGML_OP_MUL && (mul_a->src[0] == norm_a || mul_a->src[1] == norm_a) &&
+                norm_b->op == GGML_OP_RMS_NORM &&
+                mul_b->op == GGML_OP_MUL && (mul_b->src[0] == norm_b || mul_b->src[1] == norm_b) &&
+                cat->op == GGML_OP_CONCAT && ggml_get_op_params_i32(cat, 0) == 0 &&
+                ((cat->src[0] == mul_a && cat->src[1] == mul_b) || (cat->src[0] == mul_b && cat->src[1] == mul_a)) &&
+                mm->op == GGML_OP_MUL_MAT && mm->src[1] == cat &&
+                ggml_node_has_n_uses(cgraph, i, 1) && ggml_node_has_n_uses(cgraph, i + 1, 1) &&
+                ggml_node_has_n_uses(cgraph, i + 2, 1) && ggml_node_has_n_uses(cgraph, i + 3, 1)) {
+            const bool lo_is_a = cat->src[0] == mul_a;
+            ggml_tensor * norm_lo = lo_is_a ? norm_a : norm_b;
+            const ggml_tensor * mul_lo = lo_is_a ? mul_a : mul_b;
+            ggml_tensor * norm_hi = lo_is_a ? norm_b : norm_a;
+            const ggml_tensor * mul_hi = lo_is_a ? mul_b : mul_a;
+            const bool quantize = ggml_cuda_norm_q8_1_consumer(*cuda_ctx, mm);
+            if (ggml_cuda_op_rms_norm_pair_concat_q8_1(*cuda_ctx, norm_lo, mul_lo, norm_hi, mul_hi, cat, quantize)) {
+                return 4;
+            }
+        }
+    }
+
+
     // rms_norm + norm-weight MUL whose output feeds an mmvq matmul (norm surface).
     // GGML_CUDA_DISABLE_NORM_Q8_1=1 turns it off.
     if (const int n_norm_q8_1 = ggml_cuda_norm_q8_1_try_fuse(*cuda_ctx, cgraph, i)) {
@@ -2729,6 +2757,84 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
 
     bool fused_mul_mat_vec = false;
     int  fused_node_count  = 0;
+
+    if (node->op == GGML_OP_MUL_MAT && g_mk_recording == nullptr &&
+            node->ne[1] == 1 && node->ne[2] == 1 && node->ne[3] == 1 &&
+            node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
+            !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        auto next_op = [&](int & cur, int * idx_out = nullptr) -> ggml_tensor * {
+            while (cur < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[cur])) {
+                cur++;
+            }
+            if (cur >= cgraph->n_nodes) {
+                return nullptr;
+            }
+            if (idx_out != nullptr) {
+                *idx_out = cur;
+            }
+            return cgraph->nodes[cur++];
+        };
+        int cur = i + 1;
+        int mid_src_idx = -1, fill_idx = -1, cat1_idx = -1;
+        ggml_tensor * mid_src = next_op(cur, &mid_src_idx);
+        ggml_tensor * fill    = next_op(cur, &fill_idx);
+        ggml_tensor * cat1    = next_op(cur, &cat1_idx);
+        const ggml_tensor * mid_root = mid_src != nullptr ? mid_src->src[0] : nullptr;
+        while (mid_root != nullptr && mid_root->view_src != nullptr) {
+            mid_root = mid_root->view_src;
+        }
+        if (mid_src != nullptr && fill != nullptr && cat1 != nullptr &&
+                (mid_src->op == GGML_OP_PAD || mid_src->op == GGML_OP_CONT) && mid_root == node &&
+                fill->op == GGML_OP_FILL && fill->src[0] == mid_src &&
+                fill->type == GGML_TYPE_F32 && ggml_is_contiguous(fill) &&
+                fill->ne[1] == 1 && fill->ne[2] == 1 && fill->ne[3] == 1 &&
+                cat1->op == GGML_OP_CONCAT && ggml_get_op_params_i32(cat1, 0) == 0 &&
+                cat1->src[0] == node && cat1->src[1] == fill &&
+                ggml_node_has_n_uses(cgraph, mid_src_idx, 1) &&
+                ggml_node_has_n_uses(cgraph, fill_idx, 1)) {
+            ggml_tensor * out = cat1;
+            ggml_tensor * hi  = nullptr;
+            int end_idx = cat1_idx;
+            int cur2 = cur;
+            int hi_idx = -1, cat2_idx = -1;
+            ggml_tensor * cand_hi   = next_op(cur2, &hi_idx);
+            ggml_tensor * cand_cat2 = next_op(cur2, &cat2_idx);
+            if (cand_hi != nullptr && cand_cat2 != nullptr &&
+                    cand_hi->op == GGML_OP_MUL_MAT && cand_hi->src[1] == node->src[1] &&
+                    cand_hi->type == GGML_TYPE_F32 && ggml_is_contiguous(cand_hi) &&
+                    cand_hi->ne[1] == 1 && cand_hi->ne[2] == 1 && cand_hi->ne[3] == 1 &&
+                    cand_cat2->op == GGML_OP_CONCAT && ggml_get_op_params_i32(cand_cat2, 0) == 0 &&
+                    cand_cat2->src[0] == cat1 && cand_cat2->src[1] == cand_hi &&
+                    ggml_node_has_n_uses(cgraph, cat1_idx, 1) &&
+                    ggml_node_has_n_uses(cgraph, hi_idx, 1)) {
+                hi      = cand_hi;
+                out     = cand_cat2;
+                end_idx = cat2_idx;
+            }
+            if (end_idx == cgraph->n_nodes - 1 && out->type == GGML_TYPE_F32 && ggml_is_contiguous(out) &&
+                    out->data != node->src[1]->data && out->data != node->src[0]->data &&
+                    (hi == nullptr || out->data != hi->src[0]->data)) {
+                void * orig_lo = node->data;
+                node->data = out->data;
+                ggml_cuda_compute_forward(*cuda_ctx, node);
+                node->data = orig_lo;
+
+                void * orig_fill = fill->data;
+                fill->data = (float *) out->data + node->ne[0];
+                ggml_cuda_op_fill(*cuda_ctx, fill);
+                fill->data = orig_fill;
+
+                if (hi != nullptr) {
+                    void * orig_hi = hi->data;
+                    hi->data = (float *) out->data + node->ne[0] + fill->ne[0];
+                    ggml_cuda_compute_forward(*cuda_ctx, hi);
+                    hi->data = orig_hi;
+                }
+                return end_idx - i;
+            }
+        }
+    }
+
 
     // SSM conv-input fusion (owned by mmvq.cu). GGML_CUDA_DISABLE_SSM_CONV_IN=1 turns it off.
     if (const int n_ssm_conv_in = ggml_cuda_ssm_conv_in_try_fuse(*cuda_ctx, cgraph, i)) {
