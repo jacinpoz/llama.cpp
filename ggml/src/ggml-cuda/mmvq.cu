@@ -3696,12 +3696,15 @@ static __global__ void __launch_bounds__(BLOCK, 1) mmvq_triple(
 
 static int mmvq_pair_ncols(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b) {
     auto one_row = [](const ggml_cuda_mmvq_capture & x) { return x.valid && x.grid_y == 1 && x.grid_z == 1 && 256 % x.threads == 0; };
-    if (!one_row(a) || !one_row(b)) {
+    if (!one_row(a) || !one_row(b) || b.variant != a.variant) {
         return 0;
     }
     for (int t = 2; t <= MMVQ_MAX_BATCH_SIZE; ++t) {
-        if (a.variant == mk_mmvq_variant(GGML_TYPE_IQ4_XS, t, false, true) && b.variant == a.variant) {
+        if (a.variant == mk_mmvq_variant(GGML_TYPE_IQ4_XS, t, false, true)) {
             return t;
+        }
+        if (a.variant == mk_mmvq_variant(GGML_TYPE_Q6_K, t, false, true)) {
+            return -t;
         }
     }
     return 0;
@@ -3709,7 +3712,7 @@ static int mmvq_pair_ncols(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmv
 
 bool ggml_cuda_mmvq_pair_t_supported(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    return mmvq_pair_ncols(a, b) > 0 && get_device_table_id(cc) == MMVQ_PARAMETERS_RDNA3_0;
+    return mmvq_pair_ncols(a, b) != 0 && get_device_table_id(cc) == MMVQ_PARAMETERS_RDNA3_0;
 }
 
 void ggml_cuda_mmvq_launch_pair_t(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, cudaStream_t stream) {
@@ -3719,12 +3722,18 @@ void ggml_cuda_mmvq_launch_pair_t(const ggml_cuda_mmvq_capture & a, const ggml_c
     constexpr int BLOCK = 256;
     const uint32_t nba = mmvq_multi_blocks(a, BLOCK);
     const uint32_t nbb = mmvq_multi_blocks(b, BLOCK);
+    const int ncols = mmvq_pair_ncols(a, b);
     auto launch = [&](auto t_c) {
         constexpr int T = decltype(t_c)::value;
-        using Op = mk_mmvq<BLOCK, GGML_TYPE_IQ4_XS, T, false, false, 0, true>;
-        mmvq_pair<BLOCK, Op, Op><<<nba + nbb, BLOCK, 0, stream>>>(pa, a.grid_x, nba, pb, b.grid_x);
+        if (ncols > 0) {
+            using Op = mk_mmvq<BLOCK, GGML_TYPE_IQ4_XS, T, false, false, 0, true>;
+            mmvq_pair<BLOCK, Op, Op><<<nba + nbb, BLOCK, 0, stream>>>(pa, a.grid_x, nba, pb, b.grid_x);
+        } else {
+            using Op = mk_mmvq<BLOCK, GGML_TYPE_Q6_K, T, false, false, 0, true>;
+            mmvq_pair<BLOCK, Op, Op><<<nba + nbb, BLOCK, 0, stream>>>(pa, a.grid_x, nba, pb, b.grid_x);
+        }
     };
-    switch (mmvq_pair_ncols(a, b)) {
+    switch (ncols < 0 ? -ncols : ncols) {
         case 2: launch(std::integral_constant<int, 2>{}); break;
         case 3: launch(std::integral_constant<int, 3>{}); break;
         case 4: launch(std::integral_constant<int, 4>{}); break;
@@ -3743,10 +3752,14 @@ static int mmvq_triple_ncols(const ggml_cuda_mmvq_capture & a, const ggml_cuda_m
         return 0;
     }
     for (int t = 1; t <= MMVQ_MAX_BATCH_SIZE; ++t) {
-        if (a.variant == mk_mmvq_variant(GGML_TYPE_IQ4_XS, t, false, true) &&
-                b.variant == mk_mmvq_variant(GGML_TYPE_Q8_0, t, false, true) &&
+        if (b.variant == mk_mmvq_variant(GGML_TYPE_Q8_0, t, false, true) &&
                 c.variant == mk_mmvq_variant(GGML_TYPE_Q8_0, t, false, true)) {
-            return t;
+            if (a.variant == mk_mmvq_variant(GGML_TYPE_IQ4_XS, t, false, true)) {
+                return t;
+            }
+            if (a.variant == mk_mmvq_variant(GGML_TYPE_Q6_K, t, false, true)) {
+                return -t;
+            }
         }
     }
     return 0;
@@ -3754,7 +3767,7 @@ static int mmvq_triple_ncols(const ggml_cuda_mmvq_capture & a, const ggml_cuda_m
 
 bool ggml_cuda_mmvq_triple_supported(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, const ggml_cuda_mmvq_capture & c) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    return mmvq_triple_ncols(a, b, c) > 0 && get_device_table_id(cc) == MMVQ_PARAMETERS_RDNA3_0;
+    return mmvq_triple_ncols(a, b, c) != 0 && get_device_table_id(cc) == MMVQ_PARAMETERS_RDNA3_0;
 }
 
 void ggml_cuda_mmvq_launch_triple(const ggml_cuda_mmvq_capture & a, const ggml_cuda_mmvq_capture & b, const ggml_cuda_mmvq_capture & c,
@@ -3767,13 +3780,19 @@ void ggml_cuda_mmvq_launch_triple(const ggml_cuda_mmvq_capture & a, const ggml_c
     const uint32_t nba = mmvq_multi_blocks(a, BLOCK);
     const uint32_t nbb = mmvq_multi_blocks(b, BLOCK);
     const uint32_t nbc = mmvq_multi_blocks(c, BLOCK);
+    const int ncols = mmvq_triple_ncols(a, b, c);
     auto launch = [&](auto t_c) {
         constexpr int T = decltype(t_c)::value;
-        using OpA = mk_mmvq<BLOCK, GGML_TYPE_IQ4_XS, T, false, false, 0, true>;
         using OpQ8 = mk_mmvq<BLOCK, GGML_TYPE_Q8_0, T, false, false, 0, true>;
-        mmvq_triple<BLOCK, OpA, OpQ8, OpQ8><<<nba + nbb + nbc, BLOCK, 0, stream>>>(pa, a.grid_x, nba, pb, b.grid_x, nbb, pc, c.grid_x);
+        if (ncols > 0) {
+            using OpA = mk_mmvq<BLOCK, GGML_TYPE_IQ4_XS, T, false, false, 0, true>;
+            mmvq_triple<BLOCK, OpA, OpQ8, OpQ8><<<nba + nbb + nbc, BLOCK, 0, stream>>>(pa, a.grid_x, nba, pb, b.grid_x, nbb, pc, c.grid_x);
+        } else {
+            using OpA = mk_mmvq<BLOCK, GGML_TYPE_Q6_K, T, false, false, 0, true>;
+            mmvq_triple<BLOCK, OpA, OpQ8, OpQ8><<<nba + nbb + nbc, BLOCK, 0, stream>>>(pa, a.grid_x, nba, pb, b.grid_x, nbb, pc, c.grid_x);
+        }
     };
-    switch (mmvq_triple_ncols(a, b, c)) {
+    switch (ncols < 0 ? -ncols : ncols) {
         case 1: launch(std::integral_constant<int, 1>{}); break;
         case 2: launch(std::integral_constant<int, 2>{}); break;
         case 3: launch(std::integral_constant<int, 3>{}); break;
@@ -3787,11 +3806,12 @@ void ggml_cuda_mmvq_launch_triple(const ggml_cuda_mmvq_capture & a, const ggml_c
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Path F: the attention q (IQ4_XS) projection and the k and v (Q8_0) projections read the same normed input;
+// Path F: the attention q (IQ4_XS or Q6_K) projection and the k and v (Q8_0) projections read the same normed input;
 // at q's node all three run as one launch, k and v into private buffers (they are written before their nodes).
 int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i) {
     ggml_tensor * q = cgraph->nodes[i];
-    if (!ggml_cuda_multi_op() || !g_verify_gdn_single_stream || q->op != GGML_OP_MUL_MAT || q->src[0]->type != GGML_TYPE_IQ4_XS || q->ne[1] > MMVQ_MAX_BATCH_SIZE ||
+    if (!ggml_cuda_multi_op() || !g_verify_gdn_single_stream || q->op != GGML_OP_MUL_MAT ||
+            (q->src[0]->type != GGML_TYPE_IQ4_XS && q->src[0]->type != GGML_TYPE_Q6_K) || q->ne[1] > MMVQ_MAX_BATCH_SIZE ||
             q->ne[2] != 1 || q->src[2] != nullptr) {
         return 0;
     }
@@ -3839,7 +3859,7 @@ int ggml_cuda_try_mmvq_triple(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
     return -1;
 }
 
-// GGML_CUDA_VERIFY_PAIR: at 2..8 tokens, runs two IQ4_XS matvecs on the same input as one launch, the second writing early into a private buffer.
+// GGML_CUDA_VERIFY_PAIR: at 2..8 tokens, runs two IQ4_XS or Q6_K matvecs on the same input as one launch, the second writing early into a private buffer.
 // a_out is the first matvec's destination (the node or a scratch copy). Returns false when nothing ran.
 static bool ggml_cuda_verify_pair() {
     // the fused gate/up/GLU of GGML_CUDA_VERIFY_GLU claims the FFN matvecs itself
@@ -3850,7 +3870,8 @@ static bool ggml_cuda_verify_pair() {
 
 bool ggml_cuda_mmvq_pair_t(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, const int i, ggml_tensor * a_out) {
     const ggml_tensor * a = cgraph->nodes[i];
-    if (!ggml_cuda_verify_pair() || !g_verify_gdn_single_stream || a->op != GGML_OP_MUL_MAT || a->src[0]->type != GGML_TYPE_IQ4_XS ||
+    if (!ggml_cuda_verify_pair() || !g_verify_gdn_single_stream || a->op != GGML_OP_MUL_MAT ||
+            (a->src[0]->type != GGML_TYPE_IQ4_XS && a->src[0]->type != GGML_TYPE_Q6_K) ||
             a->ne[1] < 2 || a->ne[1] > MMVQ_MAX_BATCH_SIZE || a->ne[2] != 1 || a->src[2] != nullptr) {
         return false;
     }
@@ -3864,7 +3885,7 @@ bool ggml_cuda_mmvq_pair_t(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph
     for (int k = i + 1; k < std::min(cgraph->n_nodes, i + 128); ++k) {
         ggml_tensor * n = cgraph->nodes[k];
         if (n->op == GGML_OP_MUL_MAT && n->src[1] == a->src[1] && (n->flags & GGML_TENSOR_FLAG_COMPUTE) &&
-                n->src[0]->type == GGML_TYPE_IQ4_XS && n->ne[1] == a->ne[1] && n->ne[2] == 1 && n->src[2] == nullptr &&
+                n->src[0]->type == a->src[0]->type && n->ne[1] == a->ne[1] && n->ne[2] == 1 && n->src[2] == nullptr &&
                 !(n->flags & GGML_TENSOR_FLAG_OUTPUT) && g_precomputed_nodes.count(n) == 0) {
             b = n;
             break;
