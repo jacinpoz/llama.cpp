@@ -40,11 +40,19 @@ static void llama_host_experts_mode_apply(llama_host_experts_mode host_experts_m
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_moe_cache_set_host_pool(ggml_backend_dev_get(i), true);
         }
-        LLAMA_LOG_INFO("%s: host_experts_mode=POOL: bounded pinned host pool enabled "
-                       "(MOE_HOST_POOL_MIB, default 25%% of the MoE host expert bytes)\n", func);
+        LLAMA_LOG_INFO("%s: host_experts_mode=POOL: NO pinned master; the host experts stay in the model "
+                       "mapping and every GPU read is served through a bounded pinned pool "
+                       "(MOE_HOST_POOL_MIB, default MOE_HOST_POOL_FRAC=80%% of the host expert bytes capped "
+                       "by MOE_HOST_POOL_RAM_PCT of MemAvailable, O_DIRECT fills unless MOE_HOST_POOL_DIO=0)\n",
+                       func);
     }
 }
 
+// wip/host-expert-master-drop (TODO #55): POOL mode drops the FULL PINNED host expert master.  The
+// tensors are placed in the read-only model mapping (page cache / GGUF on disk) instead, and every GPU
+// read of them goes through the bounded pinned pool, so the non-swappable part of the host expert set
+// becomes the pool budget rather than the whole set -- which is what lets a model whose expert set does
+// not fit in RAM run at all (the page cache is reclaimable; the pool is the only pinned tier).
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -950,8 +958,19 @@ llama_model_loader::llama_model_loader(
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+    // r212: tell the host pool how the model was loaded, so its fills mirror the operator's caching
+    // decision instead of guessing from MemAvailable.  `--load-mode` IS that decision: a mapped load reads
+    // through the page cache (so the pool must too -- the population is the only read that cannot be
+    // avoided), and `--load-mode direct-io` means O_DIRECT all the way down.  `MOE_HOST_POOL_DIO=0|1`
+    // still forces either arm; a consumer that never runs this call keeps the historical heuristic.
+    {
+        const int fill_direct = this->use_direct_io ? 1 : 0;
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_moe_cache_set_host_fill_mode(ggml_backend_dev_get(i), fill_direct);
+        }
+    }
 
-    // Host-resident expert weights are always pinned (`ROCm_Host`): the GPU reads the host master in
+    // Host-resident expert weights are pinned by default (`ROCm_Host`): the GPU reads the host master in
     // place, which a pageable `CPU_Mapped` master cannot do without XNACK (issue #116).  The pageable
     // `--host-experts mmap` mode and the legacy `LLAMA_MMAP_HOST_EXPERTS=0` were removed for RDNA.
     this->host_experts_mode = host_experts_mode == LLAMA_HOST_EXPERTS_MODE_MMAP ? LLAMA_HOST_EXPERTS_MODE_PINNED : host_experts_mode;

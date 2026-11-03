@@ -292,6 +292,14 @@ extern "C" {
         // on the previous call's routing.  check_only: report, change nothing.  Kept the last member, so the other
         // backends' positional initializers stay valid (NULL).
         bool (*moe_cache_remap)(ggml_backend_t backend, const struct ggml_tensor * weight, const struct ggml_tensor * weight_cpy, const struct ggml_tensor * ids, bool check_only);
+        // wip/host-pool-speed (#131): is this routed expert table served by the bounded pinned host POOL
+        // (`--host-experts pool`) rather than by a pinned master?  A pool-backed table's whole-table
+        // STAGING is the slow path at every width (its source is the pageable model mapping plus the pool
+        // alias), while the device gather resolves it from the two pinned tiers on the device, so the
+        // scheduler sends a pool-backed table to the gather unconditionally.  A pinned master keeps the
+        // staging path (the gather costs it ~47 % prefill at two devices, `wip/host-pool-speed` §18.2).
+        // Answers per (table, device); NULL = unknown/false.
+        bool (*moe_cache_pool_backed)(ggml_backend_t backend, const struct ggml_tensor * weight);
     };
 
     struct ggml_backend {
@@ -450,6 +458,15 @@ extern "C" {
         // table fits per slot.  Appended like the fields above.
         size_t (*slab_ring_slots)(ggml_backend_dev_t dev);
 
+        // (optional) wip/host-expert-master-drop (TODO #55): the host buffer type a POOL-BACKED host
+        // expert master should use (device-carrying but NOT pinned), or NULL when the backend keeps its
+        // pinned host master.  With `--host-experts pool` the loader then backs host expert tensors with
+        // the read-only model mapping and every GPU read is served through the bounded pinned pool.  It is
+        // APPENDED at the very end (not next to the other moe_cache fields) because several backends
+        // already initialize the fields above positionally -- inserting in the middle would alias their
+        // entries.  Zero-initialized for backends that do not set it.
+        ggml_backend_buffer_type_t (*moe_host_master_buft)(ggml_backend_dev_t dev);
+
         // (optional) TODO #59: the MoE expert cache's decode/verify band in tokens (the widest routed
         // `MUL_MAT_ID` batch the arena serves from VRAM), or 0 when the cache is disabled.  `common` clamps
         // the draftless (n-gram) speculators' draft length to `band - 1` so a speculative verify batch never
@@ -476,6 +493,18 @@ extern "C" {
         void    (*moe_cache_set_host_pool_budget)(ggml_backend_dev_t dev, size_t bytes);
         void    (*moe_heat_open)(ggml_backend_dev_t dev, const char * model_path);
         int64_t (*moe_heat_score)(ggml_backend_dev_t dev, int layer, const char * name, int n_experts, size_t host_bytes);
+
+        // (optional) r212: the HOST POOL's fill mode, as the loader resolved `--load-mode`.  `direct` = 1
+        // means the model was loaded with O_DIRECT, so the pool must fill the same way; 0 means a mapped
+        // (page-cache backed) load, so the pool fills through the page cache.  The pool's fill mode MIRRORS
+        // the operator's load mode -- `--load-mode` IS the caching decision, and a pool that silently
+        // bypassed the page cache contradicted it (measured on a 113 GB model at `-ncmoe 48 -lme 60`:
+        // O_DIRECT chosen from a MemAvailable heuristic read 95.20 GiB off the drive at 2 785 MiB/s during
+        // load/first-prefill, where the mmap the operator asked for would have read it at page-cache speed).
+        // `MOE_HOST_POOL_DIO=0|1` still forces either arm.  APPENDED at the very end for the
+        // positional-initializer reason above; zero-initialized for backends that do not set it (a backend
+        // that never answers leaves the pool on its own default).
+        void (*moe_cache_set_host_fill_mode)(ggml_backend_dev_t dev, int direct);
     };
 
     struct ggml_backend_device {
