@@ -1272,7 +1272,8 @@ static bool ggml_cuda_rope_set_rows_v_ok(const ggml_cgraph * cgraph, const int i
             v_view->ne[0] != row_len || v_view->ne[1] != n_tok || v_view->ne[2] != 1 || v_view->ne[3] != 1 ||
             v_sr->op != GGML_OP_SET_ROWS || v_sr->src[0] != v_view || v_sr->type != k_sr->type ||
             v_sr->ne[0] != row_len || v_sr->ne[2] != 1 || v_sr->ne[3] != 1 ||
-            ggml_node_get_use_count(cgraph, i + 5) != 1 || (v_view->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+            ggml_node_get_use_count(cgraph, i + 5) != 1 || (v_view->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 ||
+            g_precomputed_nodes.count(v_sr) != 0) {
         return false;
     }
     const ggml_tensor * idx = v_sr->src[1];
@@ -1340,7 +1341,10 @@ static int ggml_cuda_rms_norm_mul_rope_fwht_set_rows_count(const ggml_cgraph * c
     if (allow_v && i + 10 <= cgraph->n_nodes) {
         const ggml_tensor * v_view = cgraph->nodes[i + 8];
         const ggml_tensor * v_sr   = cgraph->nodes[i + 9];
-        with_v = is_row_write(v_view, v_sr) && v_sr->type == k_sr->type && single_use(i + 8);
+        // a V row the attention head prep already rotated and wrote (ggml_cuda_op_hadamard64_set_rows) left its
+        // MUL_MAT output unwritten, so it must not be written again from there
+        with_v = is_row_write(v_view, v_sr) && v_sr->type == k_sr->type && single_use(i + 8) &&
+                 g_precomputed_nodes.count(v_sr) == 0;
     }
 
     // the cache writes must not touch anything the fused kernel reads, nor each other
