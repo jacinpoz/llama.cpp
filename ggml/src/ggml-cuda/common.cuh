@@ -1759,9 +1759,13 @@ static inline size_t ggml_cuda_fattn_stage_max_bytes() {
 // this function and its call sites (grep ggml_cuda_grid_stall_pad) -- the kernels' row guards are harmless left in.
 static inline bool ggml_cuda_grid_stall_pad(const dim3 & grid, const dim3 & block) {
 #if defined(GGML_USE_HIP)
+    // the stall is a gfx1201 one; on RDNA3 the padding only costs (tg128 -1.7% on gfx1100), so it defaults to RDNA4
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_GRID_STALL_PAD");
-        return e == nullptr || atoi(e) != 0;
+        if (e != nullptr) {
+            return atoi(e) != 0;
+        }
+        return GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
     }();
     if (!on) {
         return false;

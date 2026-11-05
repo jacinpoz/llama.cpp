@@ -363,12 +363,28 @@ bool mk_hop_is_external(mk_hop kind) {
     return kind == MK_HOP_EMBED_ROWS || kind == MK_HOP_ATTN_PARTIAL;
 }
 
+// the last layer's output-row GET_ROWS keeps every row when every token is an output (decode and verify), and the
+// output ids are then 0..n-1 in order, so it copies its input unchanged
+static bool mk_is_identity_get_rows(const ggml_tensor * t) {
+    if (t->op != GGML_OP_GET_ROWS || t->type != t->src[0]->type || !ggml_are_same_shape(t, t->src[0]) ||
+            ggml_nelements(t->src[1]) != t->ne[1]) {
+        return false;
+    }
+    // a recurrent state gather of a one-row cache has the same shape, but reads the cache, not a computed tensor
+    const ggml_tensor * r = t->src[0];
+    while (r->view_src != nullptr || (r->op != GGML_OP_NONE && ggml_op_is_empty(r->op))) {
+        r = r->view_src != nullptr ? r->view_src : r->src[0];
+    }
+    return r->op != GGML_OP_NONE;
+}
+
 static bool mk_is_transparent(const ggml_tensor * t) {
-    return ggml_is_empty(t) || ggml_op_is_empty(t->op) || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0;
+    return ggml_is_empty(t) || ggml_op_is_empty(t->op) || (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+           mk_is_identity_get_rows(t);
 }
 
 static const ggml_tensor * mk_root(const ggml_tensor * t) {
-    while (t != nullptr && t->op != GGML_OP_NONE && ggml_op_is_empty(t->op)) {
+    while (t != nullptr && t->op != GGML_OP_NONE && (ggml_op_is_empty(t->op) || mk_is_identity_get_rows(t))) {
         t = t->src[0];
     }
     return t;
@@ -515,7 +531,8 @@ static bool mk_match_mmvq_add(mk_walker & w, const ggml_tensor * x, bool x_is_q8
     if (!mk_check_weight(w, mm)) {
         return false;
     }
-    MK_CHECK((mk_root(add->src[0]) == mm && add->src[1] == residual) || (mk_root(add->src[1]) == mm && add->src[0] == residual),
+    MK_CHECK((mk_root(add->src[0]) == mm && mk_root(add->src[1]) == mk_root(residual)) ||
+             (mk_root(add->src[1]) == mm && mk_root(add->src[0]) == mk_root(residual)),
         "residual ADD wiring");
     if (!mk_check_rows(w, add, "residual add")) {
         return false;
@@ -780,9 +797,13 @@ static bool mk_match_head(mk_walker & w, const ggml_tensor * x) {
     if (!mk_match_norm(w, x, MK_HOP_RMSNORM_F32, &xn)) {
         return false;
     }
-    MK_TAKE(gr, GGML_OP_GET_ROWS, "out_ids gather");
-    MK_CHECK(gr->src[0] == xn && gr->src[1]->type == GGML_TYPE_I32 && gr->ne[1] == w.m.n_tokens, "out_ids gather must keep all T rows");
-    w.push(MK_HOP_OUT_ROWS, { gr, xn, gr->src[1] });
+    ggml_tensor * gr = xn;
+    if (w.peek() != nullptr && w.peek()->op == GGML_OP_GET_ROWS) {
+        MK_TAKE(g, GGML_OP_GET_ROWS, "out_ids gather");
+        MK_CHECK(g->src[0] == xn && g->src[1]->type == GGML_TYPE_I32 && g->ne[1] == w.m.n_tokens, "out_ids gather must keep all T rows");
+        w.push(MK_HOP_OUT_ROWS, { g, xn, g->src[1] });
+        gr = g;
+    }
     w.push(MK_HOP_QUANTIZE_Q8_1, { gr });
 
     MK_TAKE(lo, GGML_OP_MUL_MAT, "lm head");
@@ -865,6 +886,11 @@ static bool mk_match_graph_impl(mk_walker & w) {
         const ggml_tensor * n2 = w.peek(2);
         MK_CHECK(n2 != nullptr, "graph ends inside a layer");
         if (n2->op == GGML_OP_GET_ROWS && mk_root(n2->src[0]) == w.peek(1)) {
+            break;
+        }
+        // r217 gathers the output rows inside the last layer, so the head starts at its norm: norm, weight, lm head
+        if ((m.mtp && il == 1) || (n2->op == GGML_OP_MUL_MAT && (n2->flags & GGML_TENSOR_FLAG_OUTPUT) && w.peek(3) == nullptr &&
+                w.peek(0)->op == GGML_OP_RMS_NORM && mk_root(n2->src[1]) == w.peek(1))) {
             break;
         }
         ggml_tensor * y = nullptr;

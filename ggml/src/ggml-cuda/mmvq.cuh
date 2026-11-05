@@ -79,6 +79,8 @@ extern thread_local std::unordered_set<const ggml_tensor *>                     
 
 // GGML_CUDA_GDN_CONV_FUSED=1: match the GDN conv layers of this graph (once per graph uid) before its nodes run.
 void ggml_cuda_gdn_conv_prepare(ggml_cgraph * cgraph, bool single_stream);
+// the fused GDN decode conv owns the layer of this qkv matmul, so r217's direct conv must leave it alone
+bool ggml_cuda_gdn_conv_owned(const ggml_tensor * qkv);
 
 // The current graph evaluation runs on one stream (the multi-op and verify-GDN rewrites move work across nodes).
 extern thread_local bool g_verify_gdn_single_stream;

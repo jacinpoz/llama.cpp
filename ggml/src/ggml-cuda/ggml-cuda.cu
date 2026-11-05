@@ -7364,7 +7364,7 @@ static bool ggml_cuda_try_elide_conv_state_gather(const ggml_cgraph * cgraph, co
     static const bool disabled = getenv("GGML_CUDA_DISABLE_CONV_STATE_INPLACE") != nullptr && atoi(getenv("GGML_CUDA_DISABLE_CONV_STATE_INPLACE")) != 0;
     const ggml_tensor * gr = cgraph->nodes[i];
     if (disabled || gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
-            gr->ne[1] != 1 || gr->ne[2] != 1 || gr->ne[3] != 1 || ggml_node_get_use_count(cgraph, i) != 1) {
+            gr->ne[1] != 1 || gr->ne[2] != 1 || gr->ne[3] != 1) {
         return false;
     }
     const ggml_tensor * src = gr->src[0];
@@ -7373,11 +7373,30 @@ static bool ggml_cuda_try_elide_conv_state_gather(const ggml_cgraph * cgraph, co
             ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1) {
         return false;
     }
+    // one live reader, a RESHAPE or VIEW (r217's build_rs slices the main states out of one gather; its extra-states view is
+    // empty for one sequence)
     const int end = std::min(cgraph->n_nodes, i + 16);
+    int n_live = 0;
+    int n_read = 0;
     for (int r = i + 1; r < end; ++r) {
-        if (cgraph->nodes[r]->src[0] == gr && (cgraph->nodes[r]->op != GGML_OP_RESHAPE || ggml_node_get_use_count(cgraph, r) != 1)) {
+        const ggml_tensor * t = cgraph->nodes[r];
+        bool reads = false;
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            reads = reads || t->src[k] == gr;
+        }
+        if (!reads) {
+            continue;
+        }
+        n_read++;
+        if (ggml_is_empty(t)) {
+            continue;
+        }
+        if ((t->op != GGML_OP_RESHAPE && t->op != GGML_OP_VIEW) || t->src[0] != gr || ggml_node_get_use_count(cgraph, r) != 1 || ++n_live > 1) {
             return false;
         }
+    }
+    if (n_live != 1 || n_read != ggml_node_get_use_count(cgraph, i)) {
+        return false;
     }
     for (int m = i + 1; m < end; ++m) {
         int j = -1;

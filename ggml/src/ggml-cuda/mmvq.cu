@@ -2620,6 +2620,10 @@ static bool ggml_cuda_gdn_conv_fused_layer(const ggml_tensor * qkv) {
     return !g_gdn_conv_ops.empty() && g_gdn_conv_ops.count(qkv) != 0;
 }
 
+bool ggml_cuda_gdn_conv_owned(const ggml_tensor * qkv) {
+    return ggml_cuda_gdn_conv_fused_layer(qkv);
+}
+
 struct ggml_cuda_gdn_conv_plan {
     mk_gdn_conv_params  p;
     const ggml_tensor * skip[6];

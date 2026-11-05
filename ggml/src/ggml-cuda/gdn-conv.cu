@@ -396,6 +396,10 @@ static int gdn_conv_norm_match(const ggml_cgraph * cgraph, const ggml_cuda_gdn_c
 // take the conv.  Uses data pointers: compute time only.  Every compute-time caller (CONCAT, SSM_CONV, the ssm_conv_in
 // stand-down, the snapshot and gather folds) goes through the two matchers above, so they all decide the same way.
 static bool gdn_conv_decode_ok(const ggml_cgraph * cgraph, const ggml_cuda_gdn_conv_match & m) {
+    // a layer the fused GDN decode conv (GGML_CUDA_GDN_CONV_FUSED) matched is its alone, for every caller of the matchers
+    if (ggml_cuda_gdn_conv_owned(m.x)) {
+        return false;
+    }
     if (m.T > 1) {
         return true;
     }
