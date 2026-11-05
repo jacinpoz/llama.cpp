@@ -651,7 +651,8 @@ struct server_task_result_apply_lora : server_task_result {
 struct server_prompt {
     server_tokens tokens;
 
-    std::list<common_prompt_checkpoint> checkpoints;
+    // a checkpoint does not change after it is created, so the prompt cache shares it with the slot instead of a copy
+    std::list<std::shared_ptr<const common_prompt_checkpoint>> checkpoints;
 
     void clear() {
         tokens.clear();
@@ -671,8 +672,8 @@ struct server_prompt {
 };
 
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    common_state_data main;
+    common_state_data drft;
 
     size_t size() const {
         return main.size() + drft.size();
@@ -687,7 +688,7 @@ struct server_prompt_cache_state {
         size_t res = data.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
-            res += ckpt.size();
+            res += ckpt->size();
         }
 
         return res;
@@ -710,15 +711,15 @@ struct server_prompt_cache {
 
     // buffers of states that were restored or evicted, kept for the next save: a large state buffer costs about as much to
     // zero-fill and fault in as to copy from the device, and as much again to free (LLAMA_SERVER_CACHE_REUSE=0: off)
-    std::vector<std::vector<uint8_t>> spare;
+    std::vector<common_state_data> spare;
 
     size_t size() const;
 
     size_t n_tokens() const;
 
     // a buffer of n bytes (a spare one if one is large enough), and the way back for a buffer that is no longer needed
-    std::vector<uint8_t> take(size_t n);
-    void recycle(std::vector<uint8_t> && buf);
+    common_state_data take(size_t n);
+    void recycle(common_state_data && buf);
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
