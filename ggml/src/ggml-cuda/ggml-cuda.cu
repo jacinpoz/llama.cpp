@@ -7216,12 +7216,6 @@ static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, g
 #endif // USE_CUDA_GRAPH
 
 
-static const ggml_tensor * ggml_cuda_view_root(const ggml_tensor * t) {
-    while (t != nullptr && t->view_src != nullptr) {
-        t = t->view_src;
-    }
-    return t;
-}
 
 
 // The verify-GDN rewrites move reads and writes across nodes, so they stay off while the graph runs on several streams.
