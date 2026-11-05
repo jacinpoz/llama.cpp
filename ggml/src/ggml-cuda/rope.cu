@@ -1385,30 +1385,6 @@ void ggml_cuda_op_rms_norm_mul_rope_qk_pair(ggml_backend_cuda_context & ctx,
         launch(k);
     }
 }
-// Attention head prep for one (head, token) row of 256 (the Qwen3.5/3.8 Q and K paths at decode/verify widths):
-// RMS_NORM * weight -> ROPE (mrope) -> 256-point Hadamard, then either written out (Q) or quantized to q5_0 into the
-// cache row idx[token] (K: the SET_ROWS). Each stage is the code of the kernel it replaces (rms_norm_f32<256>'s
-// reduction, rope_multi_cos_sin, fwht_cuda<256>'s layout and stage order, quantize_f32_q5_0_block), so the result is
-// bit-identical.
-struct attn_head_prep_params {
-    const float *   x;            // [256] rows, head stride sx1, token stride sx2 (floats)
-    int64_t         sx1, sx2;
-    const float *   w;            // norm weight [256]
-    float           eps;
-    int             n_dims, n_offs;
-    const int32_t * pos;
-    int             n_tok;        // rope ne02 (pos is [n_tok * 4] for mrope)
-    mrope_sections  sections;
-    bool            is_imrope;
-    float           theta_scale, freq_scale, ext_factor, attn_factor;
-    rope_corr_dims  corr_dims;
-    const float *   freq_factors;
-    float *         out;          // [256, n_head, n_tok] contiguous, or nullptr
-    char *          cache;        // q5_0 cache view data, or nullptr
-    int64_t         cache_nb1;
-    const void *    idx;          // set_rows row index per token
-    bool            idx_i64;
-};
 
 template <bool has_ff>
 static __global__ void __launch_bounds__(256, 1) k_attn_head_prep(const mk_attn_prep_params p) {
