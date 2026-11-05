@@ -450,6 +450,12 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
 
+#if defined(GGML_USE_HIP)
+    if (ncols > 1024 && top_k_small_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream)) {
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
+
     if (nrows > GGML_CUDA_TOP_K_NROWS_THRESHOLD) {
         top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
         return;
