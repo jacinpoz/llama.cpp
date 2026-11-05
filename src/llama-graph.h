@@ -307,6 +307,15 @@ public:
     // fill s_copy_extra
     void set_extra_input(const llama_memory_recurrent_context * mctx_r);
 
+    // GDN lazy commit (llama_memory_recurrent::gdn_lazy), nullptr otherwise
+    ggml_tensor * s_copy_s = nullptr; // I32 [n_rs]          S rows, which have no rollback plane
+    ggml_tensor * gdn_mask = nullptr; // F32 [1, n_rs_batch] 1 for the recorded tokens that are replayed
+    ggml_tensor * gdn_rd   = nullptr; // I32 [n_rs_batch]    record rows that are replayed
+    ggml_tensor * gdn_wr   = nullptr; // I64 [n_seq_tokens]  record rows this batch writes (nullptr: not recorded)
+
+    void set_gdn_input(const llama_memory_recurrent_context * mctx_r);
+    bool can_reuse_gdn(const llama_memory_recurrent_context * mctx_r, const llama_ubatch & ubatch) const;
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse

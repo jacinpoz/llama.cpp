@@ -635,3 +635,76 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     return output;
 }
+
+ggml_tensor * llm_build_delta_net_base::build_recurrent_attn_lazy(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        ssm_states_all,
+        ggml_tensor *        q,
+        ggml_tensor *        k,
+        ggml_tensor *        v,
+        ggml_tensor *        g,
+        ggml_tensor *        b,
+        ggml_tensor *        s,
+        ggml_tensor *        k_rec,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+    const auto   kv_head  = mctx_cur->get_head();
+
+    const int64_t S_v          = s->ne[0];
+    const int64_t H_v          = s->ne[2];
+    const int64_t n_seqs       = s->ne[3];
+    const int64_t n_seq_tokens = q->ne[2];
+    const int64_t S_k          = k_rec->ne[0];
+    const int64_t H_k          = k_rec->ne[1];
+    const int64_t nb           = mctx_cur->get_n_rs_batch();
+
+    GGML_ASSERT(n_seqs == 1);
+
+    // the conv and norm chain first, in the order of the eager graph: fusions match it by node distance
+    ggml_build_forward_expand(gf, q);
+    ggml_build_forward_expand(gf, k);
+    ggml_build_forward_expand(gf, v);
+    ggml_build_forward_expand(gf, g);
+    ggml_build_forward_expand(gf, b);
+
+    ggml_tensor * rec_k = mctx_cur->get_gk_l(il);
+    ggml_tensor * rec_v = mctx_cur->get_gv_l(il);
+    ggml_tensor * rec_g = mctx_cur->get_gg_l(il);
+    ggml_tensor * rec_b = mctx_cur->get_gb_l(il);
+
+    // the pending tokens of the last recorded batch; a masked token (gate 0, beta 0) leaves the state unchanged
+    ggml_tensor * rk = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, rec_k, inp->gdn_rd), S_k, H_k, nb, 1);
+    ggml_tensor * rv = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, rec_v, inp->gdn_rd), S_v, H_v, nb, 1);
+    ggml_tensor * rg = ggml_reshape_4d(ctx0, ggml_mul(ctx0, ggml_get_rows(ctx0, rec_g, inp->gdn_rd), inp->gdn_mask), 1, H_v, nb, 1);
+    ggml_tensor * rb = ggml_reshape_4d(ctx0, ggml_mul(ctx0, ggml_get_rows(ctx0, rec_b, inp->gdn_rd), inp->gdn_mask), 1, H_v, nb, 1);
+    if (H_k != H_v && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+        rk = ggml_repeat_4d(ctx0, rk, S_k, H_v, nb, 1);
+    }
+    ggml_tensor * base = build_delta_net(rk, rk, rv, rg, rb, s, il).second;
+    cb(base, "gdn_commit_state", il);
+
+    auto attn_out = build_delta_net(q, k, v, g, b, base, il);
+    ggml_tensor * output = attn_out.first;
+    cb(output, "attn_output", il);
+
+    const int64_t D = S_v * S_v * H_v;
+    ggml_tensor * dst = ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, ssm_states_all->nb[1],
+            kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
+
+    if (inp->gdn_wr == nullptr) {
+        // too long to roll back into: the batch's own final state is committed now
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, attn_out.second, dst));
+        return output;
+    }
+
+    // S keeps the state at the start of this batch, and the records let the next graph finish it
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_2d(ctx0, base, D, n_seqs), dst));
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, rec_k,
+            ggml_view_2d(ctx0, k_rec, S_k*H_k, n_seq_tokens, k_rec->nb[2], 0), inp->gdn_wr));
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, rec_v,
+            ggml_view_2d(ctx0, v, S_v*H_v, n_seq_tokens, v->nb[2], 0), inp->gdn_wr));
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, rec_g, ggml_reshape_2d(ctx0, g, H_v, n_seq_tokens), inp->gdn_wr));
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, rec_b, ggml_reshape_2d(ctx0, b, H_v, n_seq_tokens), inp->gdn_wr));
+
+    return output;
+}

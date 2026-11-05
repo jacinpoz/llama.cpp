@@ -396,7 +396,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    const bool gdn_lazy = mctx_cur->gdn_lazy();
+    ggml_tensor * state = gdn_lazy ?
+        build_rs(ssm_states_all, inp->s_copy_s, ggml_view_1d(ctx0, inp->s_copy_s, n_seqs, 0), hparams.n_embd_s(), n_seqs,
+                 mctx_cur->get_n_rs(), mctx_cur->get_head(), mctx_cur->get_size(), mctx_cur->get_rs_z(), {}) :
+        build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
@@ -441,6 +445,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
     k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
 
+    ggml_tensor * k_rec = k_conv;
+
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
@@ -457,7 +463,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * output = gdn_lazy ?
+        build_recurrent_attn_lazy(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, k_rec, il) :
+        build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

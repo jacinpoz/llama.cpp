@@ -97,6 +97,18 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // LLAMA_GDN_LAZY_COMMIT=1 (qwen35, one sequence, rollback on): S keeps a single plane holding the state at the
+    // start of the last batch that fits n_rs_batch, plus that batch's GDN inputs (post-norm k, v, gate, beta).  The
+    // next graph replays the gdn_pending tokens that survived rollback before it decodes, so S needs no per-token
+    // snapshot planes.  The records alternate between two halves of n_rs_batch rows, gdn_parity being the readable one.
+    bool     gdn_lazy     = false;
+    uint32_t gdn_pending  = 0;
+    uint32_t gdn_parity   = 0;
+    // values the current ubatch's graph reads, latched by apply()
+    uint32_t gdn_commit_n = 0;
+    uint32_t gdn_rd       = 0;
+    bool     gdn_record   = false;
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -132,6 +144,11 @@ public:
     std::vector<ggml_tensor *> s_l;
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
+    // GDN lazy-commit records, [row, 2*n_rs_batch] each
+    std::vector<ggml_tensor *> gk_l;
+    std::vector<ggml_tensor *> gv_l;
+    std::vector<ggml_tensor *> gg_l;
+    std::vector<ggml_tensor *> gb_l;
 
 private:
     //const llama_model & model;
@@ -152,7 +169,8 @@ private:
     size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+                          const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges_s) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -204,6 +222,17 @@ public:
     // rollback snapshots per cell, and the source cell of cell head + i without its rollback (plane 0)
     uint32_t get_n_rs_seq() const;
     int32_t  s_src(int i) const;
+
+    // GDN lazy commit (see llama_memory_recurrent::gdn_lazy)
+    bool     gdn_lazy() const;
+    bool     gdn_record() const;
+    uint32_t gdn_commit_n() const;
+    uint32_t gdn_rd() const;
+    uint32_t get_n_rs_batch() const;
+    ggml_tensor * get_gk_l(int32_t il) const;
+    ggml_tensor * get_gv_l(int32_t il) const;
+    ggml_tensor * get_gg_l(int32_t il) const;
+    ggml_tensor * get_gb_l(int32_t il) const;
 
 private:
     const llama_memory_status status;

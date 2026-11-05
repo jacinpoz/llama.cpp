@@ -501,12 +501,51 @@ void llm_graph_input_rs::set_extra_input(const llama_memory_recurrent_context * 
     }
 }
 
+void llm_graph_input_rs::set_gdn_input(const llama_memory_recurrent_context * mctx_r) {
+    if (s_copy_s == nullptr) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_s->buffer));
+    for (int64_t i = 0; i < s_copy_s->ne[0]; ++i) {
+        ((int32_t *) s_copy_s->data)[i] = mctx_r->s_src((int) i);
+    }
+
+    const int64_t  nb = mctx_r->get_n_rs_batch();
+    const uint32_t rd = mctx_r->gdn_rd();
+    const uint32_t n  = mctx_r->gdn_commit_n();
+    GGML_ASSERT(ggml_backend_buffer_is_host(gdn_mask->buffer) && ggml_backend_buffer_is_host(gdn_rd->buffer));
+    for (int64_t t = 0; t < nb; ++t) {
+        ((float *)   gdn_mask->data)[t] = t < n ? 1.0f : 0.0f;
+        ((int32_t *) gdn_rd->data)[t]   = (int32_t) (rd*nb + t);
+    }
+    if (gdn_wr != nullptr) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(gdn_wr->buffer));
+        for (int64_t t = 0; t < gdn_wr->ne[0]; ++t) {
+            ((int64_t *) gdn_wr->data)[t] = (rd ^ 1)*nb + t;
+        }
+    }
+}
+
+bool llm_graph_input_rs::can_reuse_gdn(const llama_memory_recurrent_context * mctx_r, const llama_ubatch & ubatch) const {
+    if ((s_copy_s != nullptr) != mctx_r->gdn_lazy()) {
+        return false;
+    }
+    if (s_copy_s == nullptr) {
+        return true;
+    }
+    if (s_copy_s->ne[0] != mctx_r->get_n_rs() || (gdn_wr != nullptr) != mctx_r->gdn_record()) {
+        return false;
+    }
+    return gdn_wr == nullptr || gdn_wr->ne[0] == ubatch.n_seq_tokens;
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
     const int64_t n_rs = mctx->get_n_rs();
 
     set_extra_input(mctx);
+    set_gdn_input(mctx);
 
     if (s_copy) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
@@ -532,6 +571,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx_l->get_head();
     res &= rs_z == mctx_l->get_rs_z();
+    res &= can_reuse_gdn(mctx_l, params.ubatch);
 
     return res;
 }
@@ -1303,6 +1343,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     inp_rs->set_extra_input(mctx->get_recr());
+    inp_rs->set_gdn_input(mctx->get_recr());
 
     if (inp_rs->s_copy) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
@@ -1333,6 +1374,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx_l->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx_l->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_gdn(mctx_l->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1352,6 +1394,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     inp_rs->set_extra_input(mctx->get_recr());
+    inp_rs->set_gdn_input(mctx->get_recr());
 
     if (inp_rs->s_copy) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
@@ -1381,6 +1424,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx_l->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx_l->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_gdn(mctx_l->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1427,6 +1471,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     inp_rs->set_extra_input(mctx->get_recr());
+    inp_rs->set_gdn_input(mctx->get_recr());
 
     if (inp_rs->s_copy) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
@@ -1470,6 +1515,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx_l->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx_l->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_gdn(mctx_l->get_recr(), params.ubatch);
 
     return res;
 }
@@ -4175,6 +4221,25 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         inp->s_copy_extra = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, mctx_cur->get_n_rs_seq() * (n_rs - n_seqs));
         ggml_set_input(inp->s_copy_extra);
         ggml_set_name(inp->s_copy_extra, "rs_s_copy_extra");
+    }
+
+    if (mctx_cur->gdn_lazy()) {
+        const int64_t nb = mctx_cur->get_n_rs_batch();
+        inp->s_copy_s = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
+        ggml_set_input(inp->s_copy_s);
+        ggml_set_output(inp->s_copy_s);
+        ggml_set_name(inp->s_copy_s, "rs_s_copy_s");
+        inp->gdn_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, nb);
+        ggml_set_input(inp->gdn_mask);
+        ggml_set_name(inp->gdn_mask, "gdn_commit_mask");
+        inp->gdn_rd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, nb);
+        ggml_set_input(inp->gdn_rd);
+        ggml_set_name(inp->gdn_rd, "gdn_commit_rd");
+        if (mctx_cur->gdn_record() && ubatch.n_seq_tokens <= nb) {
+            inp->gdn_wr = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, ubatch.n_seq_tokens);
+            ggml_set_input(inp->gdn_wr);
+            ggml_set_name(inp->gdn_wr, "gdn_commit_wr");
+        }
     }
 
     inp->head = mctx_cur->get_head();

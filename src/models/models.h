@@ -101,6 +101,20 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        b,
             ggml_tensor *        s,
             int                  il);
+
+    // build_recurrent_attn for the GDN lazy commit (llama_memory_recurrent::gdn_lazy): replays the pending tokens of
+    // the last recorded batch onto s first, and k_rec is k before any head repeat (the form the records keep)
+    ggml_tensor * build_recurrent_attn_lazy(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        ssm_states_all,
+            ggml_tensor *        q,
+            ggml_tensor *        k,
+            ggml_tensor *        v,
+            ggml_tensor *        g,
+            ggml_tensor *        b,
+            ggml_tensor *        s,
+            ggml_tensor *        k_rec,
+            int                  il);
 };
 
 struct llm_build_lfm_base : public llm_graph_context {
