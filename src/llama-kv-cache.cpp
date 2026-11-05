@@ -1100,19 +1100,6 @@ llama_kv_cache::llama_kv_cache(
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
 
-llama_kv_cache::~llama_kv_cache() {
-    for (size_t i = 0; i < N_KQ_STAGING; ++i) {
-        if (kq_staging[i].event) {
-            if (kq_staging[i].recorded) {
-                ggml_backend_event_synchronize(kq_staging[i].event);
-            }
-            ggml_backend_event_free(kq_staging[i].event);
-            kq_staging[i].event = nullptr;
-            kq_staging[i].recorded = false;
-        }
-    }
-}
-
 void llama_kv_cache::set_upload_backend(ggml_backend_t backend) {
     if (upload_backend != backend) {
         for (size_t i = 0; i < N_KQ_STAGING; ++i) {
@@ -2384,6 +2371,17 @@ bool llama_kv_cache_context::is_streaming(uint32_t n_kv) const {
 }
 
 llama_kv_cache::~llama_kv_cache() {
+    for (size_t i = 0; i < N_KQ_STAGING; ++i) {
+        if (kq_staging[i].event) {
+            if (kq_staging[i].recorded) {
+                ggml_backend_event_synchronize(kq_staging[i].event);
+            }
+            ggml_backend_event_free(kq_staging[i].event);
+            kq_staging[i].event = nullptr;
+            kq_staging[i].recorded = false;
+        }
+    }
+
     // wip/kv-residency (TODO #118) B-A: the pool's own accounting -- hit rate per id, fills per resolve,
     // evictions.  `LLAMA_KV_POOL_STATS=1` makes it one line at teardown (never default-on: reading the
     // counters back synchronises the device).
