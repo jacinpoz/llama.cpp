@@ -33,6 +33,47 @@
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
+// A draft context's KV cache has to stay contiguous with the rows a process() call ingests into it: the batch
+// check requires the first ingested position to be the cache's seq_pos_max + 1.  It does not stay contiguous on
+// its own, because a prompt is routinely only partially reused - the slot keeps a prefix from an earlier task, so
+// the draft's rows end below the first row the new task ingests.  Two causes, one shape:
+//   - the ingest tail (LLAMA_DFLASH_INGEST_TAIL / LLAMA_MTP_INGEST_TAIL): the draft ingests only the last n_swa rows
+//     of the prompt, so a prefix kept from a shorter earlier prompt is entirely below the new prompt's window;
+//   - a restored context checkpoint, which can skip the task (and only the task) forward.
+// The stale prefix carries nothing - every row is older than the window of the prompt's end, so no later row can
+// attend to it - and dropping it makes the draft start a fresh run at the first ingested row, exactly as it does
+// for a first-ever prompt.  Only a strict (non-M-RoPE) draft needs that: the batch check lets an M-RoPE draft jump
+// forward, and those rows are attended while they are still inside the window, so nothing changes there.
+// The other direction (the draft ahead of the target, e.g. after a restore) is rejected by both rules, so the
+// overlapping tail is always trimmed - this call re-ingests those positions.
+static void spec_draft_align_cache(llama_context * ctx_dft, llama_seq_id seq_id, llama_pos pos_first, bool strict_pos) {
+    auto * mem = llama_get_memory(ctx_dft);
+    if (mem == nullptr || pos_first < 0) {
+        return;
+    }
+
+    const llama_pos pos_max = llama_memory_seq_pos_max(mem, seq_id);
+
+    if (pos_max < 0 || pos_max + 1 == pos_first) {
+        return;
+    }
+
+    if (pos_max + 1 > pos_first) {
+        const bool ok = llama_memory_seq_rm(mem, seq_id, pos_first, -1);
+        COM_DBG("%s: draft cache of sequence %d trimmed to %d (the batch starts at %d) - %s\n",
+                __func__, (int) seq_id, (int) pos_first, (int) pos_first, ok ? "ok" : "failed");
+        return;
+    }
+
+    if (!strict_pos) {
+        return;
+    }
+
+    const bool ok = llama_memory_seq_rm(mem, seq_id, -1, -1);
+    COM_DBG("%s: draft cache of sequence %d dropped its stale prefix (pos_max = %d, the batch starts at %d) - %s\n",
+            __func__, (int) seq_id, (int) pos_max, (int) pos_first, ok ? "ok" : "failed");
+}
+
 // Rebuild seq_id's draft sampler at the target's temperature: rejection weighs q against p, so
 // both have to sample alike. Only temp and seed carry over; the draft keeps its own top_k.
 static void spec_retune(
@@ -1079,6 +1120,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     bool    is_dflash2     = false;
     bool    is_mrope       = false;
+    bool    strict_pos     = true;  // the draft's batch check requires consecutive positions (no M-RoPE jump)
     int32_t selector_top_k = 0;
 
     // DFlash2 probabilistic drafting: one generator per sequence and the seed it was last seeded with (-1: reseed)
@@ -1201,6 +1243,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         // embd batches on an M-RoPE draft carry 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
+        // an M-RoPE draft is the one context the batch check lets jump forward (see spec_draft_align_cache())
+        {
+            const llama_rope_type rope_type = llama_model_rope_type(model_dft);
+            strict_pos = rope_type != LLAMA_ROPE_TYPE_MROPE && rope_type != LLAMA_ROPE_TYPE_IMROPE;
+        }
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1356,6 +1403,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             if (!any) {
                 return true;
+            }
+        }
+
+        // The draft's cache must stay contiguous with the rows this call ingests: the batch check requires the first
+        // injected position to be the cache's seq_pos_max + 1.  It does NOT stay contiguous on its own, because a
+        // prompt is routinely only partially reused (see spec_draft_align_cache()).  Only the token path: an embedding
+        // batch may legitimately pin all of its rows to one position (an M-RoPE image).
+        if (has_tokens) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] >= 0) {
+                    spec_draft_align_cache(this->params.ctx_dft, seq_id,
+                            batch_in.tokens[i_batch_beg[seq_id]].pos[0], strict_pos);
+                }
             }
         }
 
@@ -1702,6 +1762,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_mtp_layers  = 1;
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
+    bool    strict_pos    = true;    // the draft's batch check requires consecutive positions (no M-RoPE jump)
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
@@ -1808,6 +1869,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+        // the target's own rope decides whether a forward position jump is legal for the draft batch (a shared
+        // cache is the target's, so it is never realigned either - see spec_draft_align_cache())
+        {
+            const llama_rope_type rope_type = llama_model_rope_type(llama_get_model(ctx_dft));
+            strict_pos = rope_type != LLAMA_ROPE_TYPE_MROPE && rope_type != LLAMA_ROPE_TYPE_IMROPE;
+        }
 
         // remember the user n_max: chain_heads caps it at the model MTP layer
         // count, and the adaptive range abort below must explain the cap
@@ -1998,6 +2065,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
 
+            // the first position of each sequence that this call actually ingests (a row below the tail is skipped)
+            std::vector<llama_pos> ingest_first(n_seq, -1);
+
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
 
@@ -2027,6 +2097,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
+
+            // a partially reused prompt leaves the cache ending below the first row ingested here (see
+            // spec_draft_align_cache()); a shared cache is the target's, so it is never touched
+            if (!is_mem_shared) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    spec_draft_align_cache(ctx_dft, seq_id, ingest_first[seq_id], strict_pos);
+                }
+            }
 
             bool ok = true;
             for (int head = 0; head < n_mtp_layers && batch.size() > 0; ++head) {
