@@ -74,6 +74,16 @@ static void spec_draft_align_cache(llama_context * ctx_dft, llama_seq_id seq_id,
             __func__, (int) seq_id, (int) pos_max, (int) pos_first, ok ? "ok" : "failed");
 }
 
+// LLAMA_SPEC_LOG_FILE=<path>: one line per MTP verification round, `pos depth n_accepted n_drafted p_0 .. p_{n-1}`,
+// where p_i is the draft's top-1 probability at position i (calibration data for the draft-length policy).
+static FILE * spec_log_file() {
+    static FILE * f = [] {
+        const char * path = getenv("LLAMA_SPEC_LOG_FILE");
+        return path != nullptr && *path ? fopen(path, "a") : nullptr;
+    }();
+    return f;
+}
+
 // Rebuild seq_id's draft sampler at the target's temperature: rejection weighs q against p, so
 // both have to sample alike. Only temp and seed carry over; the draft keeps its own top_k.
 static void spec_retune(
@@ -1784,6 +1794,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool adaptive = false;
     std::vector<int> n_cap;   // [n_seq] effective draft cap for the current draft() call
     std::vector<int> n_last;  // [n_seq] drafts attempted in the most recent draft() call; reset once fed back
+    std::vector<std::vector<float>> log_p;  // [n_seq] top-1 draft probability per position of the last draft (LLAMA_SPEC_LOG_FILE)
+    std::vector<llama_pos>          log_pos; // [n_seq] position of the last draft's first token
     std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq] per-seq adaptive depth controller
 
     // issue #234: align the drafting sequences' caps so one verify ubatch covers them all, and the
@@ -2190,6 +2202,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             n_drafting++;
             drafting[seq_id] = true;
+            if (spec_log_file() != nullptr) {
+                log_p.resize(n_seq);
+                log_pos.resize(n_seq);
+                log_p[seq_id].clear();
+                log_pos[seq_id] = dp.pos0;
+            }
 
             // effective draft cap for this step: adaptive depth (or the user n_max),
             // then clamped by the per-call context bound from the server
@@ -2281,6 +2299,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // add drafted token for each sequence
                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
+                if (spec_log_file() != nullptr && cur_p->size > 0) {
+                    log_p[seq_id].push_back(cur_p->data[0].p);
+                }
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -2448,6 +2469,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // and is skipped here
         if (!is_other) {
             adaptive_feedback(seq_id, n_accepted);
+        }
+
+        if (FILE * f = spec_log_file(); f != nullptr && !is_other && seq_id < (llama_seq_id) log_p.size() && !log_p[seq_id].empty()) {
+            fprintf(f, "%d %d %d %zu", (int) log_pos[seq_id], adaptive ? adaptive_ctrl[seq_id].n_cur : params.n_max, (int) n_accepted, log_p[seq_id].size());
+            for (float pv : log_p[seq_id]) {
+                fprintf(f, " %.4f", pv);
+            }
+            fputc('\n', f);
+            fflush(f);
+            log_p[seq_id].clear();
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
