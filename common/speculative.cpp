@@ -3145,6 +3145,14 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     if (params_spec.n_ubatch > 0) {
         result.n_ubatch = params_spec.n_ubatch;
+    } else if (!has_draft) {
+        // LLAMA_SPEC_DRAFT_UBATCH: the earlier env form of --spec-draft-n-ubatch for the MTP draft context (lowers only)
+        if (const char * e = getenv("LLAMA_SPEC_DRAFT_UBATCH")) {
+            const int ub = atoi(e);
+            if (ub > 0 && ub < (int) result.n_ubatch) {
+                result.n_ubatch = ub;
+            }
+        }
     }
 
     // the MoE cache is only used by the target context
