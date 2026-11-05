@@ -1021,7 +1021,7 @@ bool ggml_cuda_op_add_rms_norm_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor
         void * q8_1 = ctx.q8_1_cache_get(dst, ctx.curr_stream_no, q8_1_size,
                                           ncols, dst->ne[1], dst->ne[2], dst->ne[3],
                                           dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float), dst->nb[3]/sizeof(float), found);
-        y = y;
+        y = found ? nullptr : (block_q8_1 *) q8_1;
     }
     const dim3 blocks_num(dst->ne[1], 1, 1);
     const auto launch = [&](auto bs_c) {
