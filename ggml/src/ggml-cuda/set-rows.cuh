@@ -137,3 +137,8 @@ static __device__ __forceinline__ void ggml_cuda_quantize_iq4_nl_group(const flo
 }
 
 void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// Consecutive F32 SET_ROWS nodes (views between them allowed) that write disjoint bytes and read none of each other's
+// outputs, as one launch.  Returns the node count past i it consumed, 0 when it did not fuse.
+// GGML_CUDA_SET_ROWS_MULTI=0 turns it off.
+int ggml_cuda_try_fuse_set_rows_multi(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);

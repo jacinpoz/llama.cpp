@@ -1,4 +1,5 @@
 #include "set-rows.cuh"
+#include "ggml-cuda-try-fuse.cuh"
 #include "cpy-utils.cuh"
 
 #include <type_traits>
@@ -462,4 +463,110 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(src0->type));
     }
+}
+
+#define SET_ROWS_MULTI_MAX 4
+
+struct set_rows_multi_job {
+    const float   * src;
+    const int64_t * idx;
+    float         * dst;
+    int64_t ne00;
+    int64_t ne01;
+    int64_t s01;
+    int64_t s10;
+    int64_t s1;
+};
+
+struct set_rows_multi_args {
+    set_rows_multi_job job[SET_ROWS_MULTI_MAX];
+};
+
+static __global__ void k_set_rows_multi(const set_rows_multi_args args) {
+    const set_rows_multi_job & j = args.job[blockIdx.y];
+    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+    if (i >= j.ne00*j.ne01) {
+        return;
+    }
+    const int64_t i01 = i / j.ne00;
+    const int64_t i00 = i - i01*j.ne00;
+    j.dst[j.idx[i01*j.s10]*j.s1 + i00] = j.src[i01*j.s01 + i00];
+}
+
+static bool set_rows_multi_ok(const ggml_tensor * n) {
+    const ggml_tensor * src = n->src[0];
+    const ggml_tensor * idx = n->src[1];
+    return n->op == GGML_OP_SET_ROWS && g_precomputed_nodes.count(n) == 0 && n->type == GGML_TYPE_F32 && src->type == GGML_TYPE_F32 && idx->type == GGML_TYPE_I64 &&
+           src->ne[2] == 1 && src->ne[3] == 1 && idx->ne[1] == 1 && idx->ne[2] == 1 && src->nb[0] == sizeof(float) &&
+           n->nb[0] == sizeof(float) && src->ne[1] == idx->ne[0] && src->ne[0]*src->ne[1] < INT32_MAX;
+}
+
+// Column bytes [lo, hi) of a row a SET_ROWS writes, within its destination root.
+static void set_rows_multi_cols(const ggml_tensor * n, size_t & lo, size_t & hi) {
+    const ggml_tensor * root = ggml_cuda_view_root(n);
+    const size_t off = (const char *) n->data - (const char *) root->data;
+    lo = off % n->nb[1];
+    hi = lo + n->ne[0]*sizeof(float);
+}
+
+static bool set_rows_multi_disjoint(const ggml_tensor * a, const ggml_tensor * b) {
+    const ggml_tensor * ra = ggml_cuda_view_root(a);
+    const ggml_tensor * rb = ggml_cuda_view_root(b);
+    if (ra != rb) {
+        return ra->data != rb->data;
+    }
+    if (a->nb[1] != b->nb[1]) {
+        return false;
+    }
+    size_t alo, ahi, blo, bhi;
+    set_rows_multi_cols(a, alo, ahi);
+    set_rows_multi_cols(b, blo, bhi);
+    return ahi <= blo || bhi <= alo;
+}
+
+int ggml_cuda_try_fuse_set_rows_multi(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_SET_ROWS_MULTI"); return e == nullptr || atoi(e) != 0; }();
+    if (!enabled || !set_rows_multi_ok(cgraph->nodes[i])) {
+        return 0;
+    }
+    const ggml_tensor * jobs[SET_ROWS_MULTI_MAX] = { cgraph->nodes[i] };
+    int n_jobs = 1;
+    int last   = i;
+    for (int k = i + 1; k < cgraph->n_nodes && n_jobs < SET_ROWS_MULTI_MAX; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (!set_rows_multi_ok(n)) {
+            break;
+        }
+        bool ok = true;
+        for (int j = 0; j < n_jobs && ok; ++j) {
+            const ggml_tensor * src_root = ggml_cuda_view_root(n->src[0]);
+            ok = set_rows_multi_disjoint(jobs[j], n) && src_root != ggml_cuda_view_root(jobs[j]) &&
+                 ggml_cuda_view_root(jobs[j]->src[0]) != ggml_cuda_view_root(n) &&
+                 ggml_cuda_view_root(n->src[1]) != ggml_cuda_view_root(jobs[j]);
+        }
+        if (!ok) {
+            break;
+        }
+        jobs[n_jobs++] = n;
+        last = k;
+    }
+    if (n_jobs < 2) {
+        return 0;
+    }
+    set_rows_multi_args args = {};
+    int64_t max_ne = 0;
+    for (int j = 0; j < n_jobs; ++j) {
+        const ggml_tensor * n = jobs[j];
+        args.job[j] = { (const float *) n->src[0]->data, (const int64_t *) n->src[1]->data, (float *) n->data,
+                        n->src[0]->ne[0], n->src[0]->ne[1], (int64_t) (n->src[0]->nb[1]/sizeof(float)),
+                        (int64_t) (n->src[1]->nb[0]/sizeof(int64_t)), (int64_t) (n->nb[1]/sizeof(float)) };
+        max_ne = std::max(max_ne, n->src[0]->ne[0]*n->src[0]->ne[1]);
+    }
+    const dim3 grid((unsigned) ((max_ne + CUDA_SET_ROWS_BLOCK_SIZE - 1)/CUDA_SET_ROWS_BLOCK_SIZE), (unsigned) n_jobs);
+    k_set_rows_multi<<<grid, CUDA_SET_ROWS_BLOCK_SIZE, 0, ctx.stream()>>>(args);
+    CUDA_CHECK(cudaGetLastError());
+    return last - i;
 }

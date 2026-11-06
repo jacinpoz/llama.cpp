@@ -2484,6 +2484,13 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
         }
     }
 
+    if (node->op == GGML_OP_SET_ROWS) {
+        const int sk = ggml_cuda_try_fuse_set_rows_multi(*cuda_ctx, cgraph, i);
+        if (sk != 0) {
+            return sk;
+        }
+    }
+
     if (node->op == GGML_OP_RMS_NORM) {
         const int sk = ggml_cuda_try_fuse_gdn_out_gate(*cuda_ctx, cgraph, i);
         if (sk != 0) {
