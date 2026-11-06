@@ -12,10 +12,12 @@ namespace {
 // The partial buffer always holds kMaxQ*mk_attn_max_chunks (token, chunk) pairs, so the pool returns the same buffer every call.
 constexpr int kMaxQ = 4;
 
-template <int G, ggml_type T>
+// by_chunk: tokens of one chunk run adjacently and share K/V cache lines.
+template <int G, ggml_type T, bool by_chunk>
 __launch_bounds__(WARP_SIZE, 1) __global__ void gqa_dec_partial(const mk_attn_partial_params p) {
     __shared__ __attribute__((aligned(16))) char lds[mk_attn_partial_lds_bytes(G)];
-    const int tile = (blockIdx.z*gridDim.y + blockIdx.y)*gridDim.x + blockIdx.x;
+    const int tile = by_chunk ? (blockIdx.x*gridDim.z + blockIdx.z)*gridDim.y + blockIdx.y
+                              : (blockIdx.z*gridDim.y + blockIdx.y)*gridDim.x + blockIdx.x;
     mk_attn_partial<WARP_SIZE>::run(p, mk_attn_partial_variant(G, T), tile, true, lds);
 }
 
@@ -71,12 +73,18 @@ void gqa_dec_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const gq
     cp.n_head    = n_head;
     cp.ep        = ep;
 
+    static const bool by_chunk = [] { const char * e = getenv("GGML_CUDA_GQA_DEC_BY_CHUNK"); return e == nullptr || atoi(e) != 0; }();
+
     const int q_per_pass = std::max(1, kMaxQ*mk_attn_max_chunks/n_chunks);
     for (int q0 = 0; q0 < n_q; q0 += q_per_pass) {
         const int nq = std::min(q_per_pass, n_q - q0);
         pp.q0 = cp.q0 = q0;
         pp.nq = cp.nq = nq;
-        gqa_dec_partial<G, T><<<dim3(n_chunks, n_head_kv, nq), WARP_SIZE, 0, stream>>>(pp);
+        if (by_chunk) {
+            gqa_dec_partial<G, T, true><<<dim3(nq, n_chunks, n_head_kv), WARP_SIZE, 0, stream>>>(pp);
+        } else {
+            gqa_dec_partial<G, T, false><<<dim3(n_chunks, n_head_kv, nq), WARP_SIZE, 0, stream>>>(pp);
+        }
         CUDA_CHECK(cudaGetLastError());
         gqa_dec_combine<G><<<dim3(n_head, nq), mk_attn_combine_waves*WARP_SIZE, 0, stream>>>(cp);
         CUDA_CHECK(cudaGetLastError());
