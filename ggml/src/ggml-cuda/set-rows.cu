@@ -501,7 +501,6 @@ static bool set_rows_multi_ok(const ggml_tensor * n) {
            n->nb[0] == sizeof(float) && src->ne[1] == idx->ne[0] && src->ne[0]*src->ne[1] < INT32_MAX;
 }
 
-// Column bytes [lo, hi) of a row a SET_ROWS writes, within its destination root.
 static void set_rows_multi_cols(const ggml_tensor * n, size_t & lo, size_t & hi) {
     const ggml_tensor * root = ggml_cuda_view_root(n);
     const size_t off = (const char *) n->data - (const char *) root->data;
@@ -545,6 +544,7 @@ int ggml_cuda_try_fuse_set_rows_multi(ggml_backend_cuda_context & ctx, const ggm
             const ggml_tensor * src_root = ggml_cuda_view_root(n->src[0]);
             ok = set_rows_multi_disjoint(jobs[j], n) && src_root != ggml_cuda_view_root(jobs[j]) &&
                  ggml_cuda_view_root(jobs[j]->src[0]) != ggml_cuda_view_root(n) &&
+                 ggml_cuda_view_root(jobs[j]->src[1]) != ggml_cuda_view_root(n) &&
                  ggml_cuda_view_root(n->src[1]) != ggml_cuda_view_root(jobs[j]);
         }
         if (!ok) {

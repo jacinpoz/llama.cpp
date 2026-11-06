@@ -312,9 +312,6 @@ struct mk_gdn_qk_norm {
     }
 };
 
-// MK_OP_GDN_STEP: the sequential gated delta rule (gated_delta_net_cuda) with the state read in place.
-// One warp per state column, 4 columns per tile. tile = (sequence*n_col_groups + col_group)*H + head.
-// variant bit 0: keep the last K per-token states (keep_rs_t).
 // Tokens folded into the state before the batch (the GDN lazy commit's replay): state update only, no attention.
 // Token t's k and v are row idx_kv[t] of kv ([k | v] rows), its gate and beta rows idx_gb[t] and idx_gb[n + t] of gb.
 struct mk_gdn_prefix {
@@ -331,6 +328,9 @@ struct mk_gdn_prefix {
     float         * out;      // nullptr: none. Receives the state after the prefix tokens.
 };
 
+// MK_OP_GDN_STEP: the sequential gated delta rule (gated_delta_net_cuda) with the state read in place.
+// One warp per state column, 4 columns per tile. tile = (sequence*n_col_groups + col_group)*H + head.
+// variant bit 0: keep the last K per-token states (keep_rs_t).
 struct mk_gdn_step_params {
     const float   * q;
     const float   * k;
@@ -421,8 +421,7 @@ static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params
         }
     }
 
-    // the prefix tokens (a folded replay) run through the same body, so their state updates are the replay kernel's
-    // own arithmetic; they write no attention and no snapshot
+    // the prefix tokens (a folded replay) must stay on this body to match the unfused replay bit for bit
     const int n_prefix = p.prefix.n;
     for (int tt = 0; tt < n_prefix + n_tokens; tt++) {
         const bool pre = tt < n_prefix;

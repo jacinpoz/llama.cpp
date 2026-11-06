@@ -10,7 +10,6 @@
 
 static thread_local std::unordered_map<const ggml_tensor *, ggml_cuda_gdn_state_src> gdn_state_srcs;
 
-// GDN lazy commit: a replay GDN folded into the next GDN as its prefix (ggml_cuda_gdn_prefix_try_fuse)
 struct gdn_prefix_src {
     const ggml_tensor * replay;
     float *             out;
@@ -626,12 +625,10 @@ int ggml_cuda_gdn_cache_cpy_try_fuse(ggml_backend_cuda_context & ctx, const ggml
     return 0;
 }
 
-// GDN lazy commit: a replay GDN A (state update only; its attention is never read) followed by the batch's GDN B, whose
-// input state is A's output state, runs as one launch: B's kernel folds A's tokens into the state first, reading them
-// straight from the record tensors through the GET_ROWS indices (the gathered copies are skipped; their bytes may be
-// B's output), and writes the state after them where A's state copy to the cache would have.  Saves A's launch, its
-// state read and write, the copy and the two record gathers.  Both K == 1, single sequence, at most 16 tokens (the
-// sequential kernel).  GGML_CUDA_GDN_PREFIX=0 turns it off.
+// GDN lazy commit: a replay GDN A (state update only) followed by the batch's GDN B, whose input state is A's output
+// state, runs as one launch.  B's kernel folds A's tokens in first, reading the records through the GET_ROWS indices,
+// and writes the state after them where A's copy to the cache would have.  The gathers do not run and their bytes may
+// hold B's output.  K == 1, one sequence, at most 16 tokens (the sequential kernel).  GGML_CUDA_GDN_PREFIX=0 turns it off.
 struct gdn_prefix_plan {
     const ggml_tensor * b;
     const ggml_tensor * cpy;
@@ -639,7 +636,7 @@ struct gdn_prefix_plan {
     const ggml_tensor * gb;
 };
 
-// a view of an F32 GET_ROWS of a cache tensor (I32 indices), read by nothing but views and `gdn`
+// Returns the F32 GET_ROWS (I32 indices) of a cache tensor behind view, when nothing but views and node ia reads it; nullptr otherwise.
 static const ggml_tensor * gdn_prefix_gather(const ggml_cgraph * cgraph, int ia, const ggml_tensor * view) {
     const ggml_tensor * gr = view->view_src;
     if (view->op != GGML_OP_VIEW || gr == nullptr || gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 ||
@@ -705,7 +702,6 @@ static bool gdn_prefix_match(ggml_backend_cuda_context & ctx, const ggml_cgraph 
             return false;
         }
     }
-    // A's state region: what B reads, and what the copy to the cache reads
     const int64_t S_v = a->src[2]->ne[0], H = a->src[2]->ne[1];
     const char *  state = (const char *) a->data + S_v*H*n*sizeof(float);
     const size_t  D     = (size_t) S_v*S_v*H*sizeof(float);
