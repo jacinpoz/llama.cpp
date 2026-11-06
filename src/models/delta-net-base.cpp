@@ -667,16 +667,17 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn_lazy(
     ggml_build_forward_expand(gf, g);
     ggml_build_forward_expand(gf, b);
 
-    ggml_tensor * rec_k = mctx_cur->get_gk_l(il);
-    ggml_tensor * rec_v = mctx_cur->get_gv_l(il);
-    ggml_tensor * rec_g = mctx_cur->get_gg_l(il);
-    ggml_tensor * rec_b = mctx_cur->get_gb_l(il);
+    ggml_tensor * rec_kv = mctx_cur->get_gkv_l(il);
+    ggml_tensor * rec_gb = mctx_cur->get_ggb_l(il);
+    const size_t  d_k    = (size_t) S_k*H_k*sizeof(float);
 
-    // the pending tokens of the last recorded batch; a masked token (gate 0, beta 0) leaves the state unchanged
-    ggml_tensor * rk = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, rec_k, inp->gdn_rd), S_k, H_k, nb, 1);
-    ggml_tensor * rv = ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, rec_v, inp->gdn_rd), S_v, H_v, nb, 1);
-    ggml_tensor * rg = ggml_reshape_4d(ctx0, ggml_mul(ctx0, ggml_get_rows(ctx0, rec_g, inp->gdn_rd), inp->gdn_mask), 1, H_v, nb, 1);
-    ggml_tensor * rb = ggml_reshape_4d(ctx0, ggml_mul(ctx0, ggml_get_rows(ctx0, rec_b, inp->gdn_rd), inp->gdn_mask), 1, H_v, nb, 1);
+    // the pending tokens of the last recorded batch; the rest read the zero rows (gate 0, beta 0: no state change)
+    ggml_tensor * kv = ggml_get_rows(ctx0, rec_kv, inp->gdn_rd);
+    ggml_tensor * gb = ggml_get_rows(ctx0, rec_gb, inp->gdn_rd_gb);
+    ggml_tensor * rk = ggml_view_4d(ctx0, kv, S_k, H_k, nb, 1, S_k*sizeof(float), kv->nb[1], kv->nb[1]*nb, 0);
+    ggml_tensor * rv = ggml_view_4d(ctx0, kv, S_v, H_v, nb, 1, S_v*sizeof(float), kv->nb[1], kv->nb[1]*nb, d_k);
+    ggml_tensor * rg = ggml_view_4d(ctx0, gb, 1, H_v, nb, 1, sizeof(float), gb->nb[1], gb->nb[1]*nb, 0);
+    ggml_tensor * rb = ggml_view_4d(ctx0, gb, 1, H_v, nb, 1, sizeof(float), gb->nb[1], gb->nb[1]*nb, gb->nb[1]*nb);
     if (H_k != H_v && (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
         rk = ggml_repeat_4d(ctx0, rk, S_k, H_v, nb, 1);
     }
@@ -699,12 +700,14 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn_lazy(
 
     // S keeps the state at the start of this batch, and the records let the next graph finish it
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_reshape_2d(ctx0, base, D, n_seqs), dst));
+    ggml_tensor * rec_k = ggml_view_2d(ctx0, rec_kv, S_k*H_k, rec_kv->ne[1], rec_kv->nb[1], 0);
+    ggml_tensor * rec_v = ggml_view_2d(ctx0, rec_kv, S_v*H_v, rec_kv->ne[1], rec_kv->nb[1], d_k);
     ggml_build_forward_expand(gf, ggml_set_rows(ctx0, rec_k,
             ggml_view_2d(ctx0, k_rec, S_k*H_k, n_seq_tokens, k_rec->nb[2], 0), inp->gdn_wr));
     ggml_build_forward_expand(gf, ggml_set_rows(ctx0, rec_v,
             ggml_view_2d(ctx0, v, S_v*H_v, n_seq_tokens, v->nb[2], 0), inp->gdn_wr));
-    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, rec_g, ggml_reshape_2d(ctx0, g, H_v, n_seq_tokens), inp->gdn_wr));
-    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, rec_b, ggml_reshape_2d(ctx0, b, H_v, n_seq_tokens), inp->gdn_wr));
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, rec_gb, ggml_reshape_2d(ctx0, g, H_v, n_seq_tokens), inp->gdn_wr));
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, rec_gb, ggml_reshape_2d(ctx0, b, H_v, n_seq_tokens), inp->gdn_wr_b));
 
     return output;
 }

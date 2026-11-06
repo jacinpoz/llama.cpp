@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-memory.h"
 
+#include <array>
 #include <map>
 #include <set>
 #include <vector>
@@ -144,11 +145,11 @@ public:
     std::vector<ggml_tensor *> s_l;
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
-    // GDN lazy-commit records, [row, 2*n_rs_batch] each
-    std::vector<ggml_tensor *> gk_l;
-    std::vector<ggml_tensor *> gv_l;
-    std::vector<ggml_tensor *> gg_l;
-    std::vector<ggml_tensor *> gb_l;
+    // GDN lazy-commit records, two halves of n_rs_batch slots each.  gkv: [k | v] rows 0..2*n_rs_batch-1;
+    // ggb: gate rows 0..2*n_rs_batch-1, then beta rows.  The last row of each is never written and stays zero, so a
+    // token gathered from it (gate 0, beta 0) leaves the state unchanged.
+    std::vector<ggml_tensor *> gkv_l;
+    std::vector<ggml_tensor *> ggb_l;
 
 private:
     //const llama_model & model;
@@ -169,6 +170,9 @@ private:
     size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
+    // the readable half of each record of layer il: (tensor, byte offset), n_rs_batch rows each
+    std::array<std::pair<ggml_tensor *, size_t>, 3> gdn_record_halves(uint32_t il) const;
+
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
                           const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges_s) const;
 
@@ -229,10 +233,8 @@ public:
     uint32_t gdn_commit_n() const;
     uint32_t gdn_rd() const;
     uint32_t get_n_rs_batch() const;
-    ggml_tensor * get_gk_l(int32_t il) const;
-    ggml_tensor * get_gv_l(int32_t il) const;
-    ggml_tensor * get_gg_l(int32_t il) const;
-    ggml_tensor * get_gb_l(int32_t il) const;
+    ggml_tensor * get_gkv_l(int32_t il) const;
+    ggml_tensor * get_ggb_l(int32_t il) const;
 
 private:
     const llama_memory_status status;

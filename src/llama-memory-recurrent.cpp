@@ -66,7 +66,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         if (it == ctx_map.end()) {
             ggml_init_params params = {
                 // r and s per layer, plus the separate PLE conv row where the model has one
-                /*.mem_size   =*/ size_t(((hparams.ple_conv_state() > 0 ? 3u : 2u) + (gdn_lazy ? 4u : 0u))*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(((hparams.ple_conv_state() > 0 ? 3u : 2u) + (gdn_lazy ? 2u : 0u))*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -87,10 +87,8 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
     p_l.resize(n_layer);
-    gk_l.resize(n_layer);
-    gv_l.resize(n_layer);
-    gg_l.resize(n_layer);
-    gb_l.resize(n_layer);
+    gkv_l.resize(n_layer);
+    ggb_l.resize(n_layer);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -126,14 +124,11 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         if (gdn_lazy) {
             const int64_t n_rec = 2*(int64_t) this->n_rs_batch;
-            gk_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t) hparams.ssm_d_state*hparams.ssm_n_group, n_rec);
-            gv_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hparams.ssm_d_inner, n_rec);
-            gg_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hparams.ssm_dt_rank, n_rec);
-            gb_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hparams.ssm_dt_rank, n_rec);
-            ggml_format_name(gk_l[i], "cache_gdn_k_l%d", i);
-            ggml_format_name(gv_l[i], "cache_gdn_v_l%d", i);
-            ggml_format_name(gg_l[i], "cache_gdn_g_l%d", i);
-            ggml_format_name(gb_l[i], "cache_gdn_b_l%d", i);
+            const int64_t d_k   = (int64_t) hparams.ssm_d_state*hparams.ssm_n_group;
+            gkv_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_k + hparams.ssm_d_inner, n_rec + 1);
+            ggb_l[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hparams.ssm_dt_rank, 2*n_rec + 1);
+            ggml_format_name(gkv_l[i], "cache_gdn_kv_l%d", i);
+            ggml_format_name(ggb_l[i], "cache_gdn_gb_l%d", i);
         }
 
         // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
@@ -1191,15 +1186,23 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
         // the state above is the start of the last recorded batch; these finish it
         io.write(&gdn_pending, sizeof(gdn_pending));
         for (uint32_t il = 0; il < n_layer; ++il) {
-            for (ggml_tensor * t : { gk_l[il], gv_l[il], gg_l[il], gb_l[il] }) {
-                if (t == nullptr) {
-                    continue;
-                }
-                const size_t half = (size_t) n_rs_batch*t->nb[1];
-                io.write_tensor(t, gdn_parity*half, half);
+            if (gkv_l[il] == nullptr) {
+                continue;
+            }
+            for (const auto & [t, base] : gdn_record_halves(il)) {
+                io.write_tensor(t, base, (size_t) n_rs_batch*t->nb[1]);
             }
         }
     }
+}
+
+std::array<std::pair<ggml_tensor *, size_t>, 3> llama_memory_recurrent::gdn_record_halves(uint32_t il) const {
+    const size_t nb = n_rs_batch;
+    return {{
+        { gkv_l[il], gdn_parity*nb*gkv_l[il]->nb[1] },
+        { ggb_l[il], gdn_parity*nb*ggb_l[il]->nb[1] },
+        { ggb_l[il], (2*nb + gdn_parity*nb)*ggb_l[il]->nb[1] },
+    }};
 }
 
 bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id) {
@@ -1446,12 +1449,11 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             return false;
         }
         for (uint32_t il = 0; il < n_layer; ++il) {
-            for (ggml_tensor * t : { gk_l[il], gv_l[il], gg_l[il], gb_l[il] }) {
-                if (t == nullptr) {
-                    continue;
-                }
-                const size_t half = (size_t) n_rs_batch*t->nb[1];
-                io.read_tensor(t, gdn_parity*half, half);
+            if (gkv_l[il] == nullptr) {
+                continue;
+            }
+            for (const auto & [t, base] : gdn_record_halves(il)) {
+                io.read_tensor(t, base, (size_t) n_rs_batch*t->nb[1]);
             }
         }
         gdn_pending = cell_count > 0 ? pending : 0;
@@ -1612,20 +1614,12 @@ uint32_t llama_memory_recurrent_context::get_n_rs_batch() const {
     return mem->n_rs_batch;
 }
 
-ggml_tensor * llama_memory_recurrent_context::get_gk_l(int32_t il) const {
-    return mem->gk_l[il];
+ggml_tensor * llama_memory_recurrent_context::get_gkv_l(int32_t il) const {
+    return mem->gkv_l[il];
 }
 
-ggml_tensor * llama_memory_recurrent_context::get_gv_l(int32_t il) const {
-    return mem->gv_l[il];
-}
-
-ggml_tensor * llama_memory_recurrent_context::get_gg_l(int32_t il) const {
-    return mem->gg_l[il];
-}
-
-ggml_tensor * llama_memory_recurrent_context::get_gb_l(int32_t il) const {
-    return mem->gb_l[il];
+ggml_tensor * llama_memory_recurrent_context::get_ggb_l(int32_t il) const {
+    return mem->ggb_l[il];
 }
 
 int32_t llama_memory_recurrent_context::s_src(int i) const {

@@ -513,15 +513,18 @@ void llm_graph_input_rs::set_gdn_input(const llama_memory_recurrent_context * mc
     const int64_t  nb = mctx_r->get_n_rs_batch();
     const uint32_t rd = mctx_r->gdn_rd();
     const uint32_t n  = mctx_r->gdn_commit_n();
-    GGML_ASSERT(ggml_backend_buffer_is_host(gdn_mask->buffer) && ggml_backend_buffer_is_host(gdn_rd->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(gdn_rd->buffer) && ggml_backend_buffer_is_host(gdn_rd_gb->buffer));
     for (int64_t t = 0; t < nb; ++t) {
-        ((float *)   gdn_mask->data)[t] = t < n ? 1.0f : 0.0f;
-        ((int32_t *) gdn_rd->data)[t]   = (int32_t) (rd*nb + t);
+        const bool live = t < n;
+        ((int32_t *) gdn_rd->data)[t]         = (int32_t) (live ? rd*nb + t : 2*nb);
+        ((int32_t *) gdn_rd_gb->data)[t]      = (int32_t) (live ? rd*nb + t : 4*nb);
+        ((int32_t *) gdn_rd_gb->data)[nb + t] = (int32_t) (live ? 2*nb + rd*nb + t : 4*nb);
     }
     if (gdn_wr != nullptr) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(gdn_wr->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(gdn_wr->buffer) && ggml_backend_buffer_is_host(gdn_wr_b->buffer));
         for (int64_t t = 0; t < gdn_wr->ne[0]; ++t) {
-            ((int64_t *) gdn_wr->data)[t] = (rd ^ 1)*nb + t;
+            ((int64_t *) gdn_wr->data)[t]   = (rd ^ 1)*nb + t;
+            ((int64_t *) gdn_wr_b->data)[t] = 2*nb + (rd ^ 1)*nb + t;
         }
     }
 }
@@ -4229,16 +4232,19 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         ggml_set_input(inp->s_copy_s);
         ggml_set_output(inp->s_copy_s);
         ggml_set_name(inp->s_copy_s, "rs_s_copy_s");
-        inp->gdn_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, nb);
-        ggml_set_input(inp->gdn_mask);
-        ggml_set_name(inp->gdn_mask, "gdn_commit_mask");
         inp->gdn_rd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, nb);
         ggml_set_input(inp->gdn_rd);
         ggml_set_name(inp->gdn_rd, "gdn_commit_rd");
+        inp->gdn_rd_gb = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 2*nb);
+        ggml_set_input(inp->gdn_rd_gb);
+        ggml_set_name(inp->gdn_rd_gb, "gdn_commit_rd_gb");
         if (mctx_cur->gdn_record() && ubatch.n_seq_tokens <= nb) {
             inp->gdn_wr = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, ubatch.n_seq_tokens);
             ggml_set_input(inp->gdn_wr);
             ggml_set_name(inp->gdn_wr, "gdn_commit_wr");
+            inp->gdn_wr_b = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, ubatch.n_seq_tokens);
+            ggml_set_input(inp->gdn_wr_b);
+            ggml_set_name(inp->gdn_wr_b, "gdn_commit_wr_b");
         }
     }
 

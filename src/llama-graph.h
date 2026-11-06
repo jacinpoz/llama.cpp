@@ -309,9 +309,10 @@ public:
 
     // GDN lazy commit (llama_memory_recurrent::gdn_lazy), nullptr otherwise
     ggml_tensor * s_copy_s = nullptr; // I32 [n_rs]          S rows, which have no rollback plane
-    ggml_tensor * gdn_mask = nullptr; // F32 [1, n_rs_batch] 1 for the recorded tokens that are replayed
-    ggml_tensor * gdn_rd   = nullptr; // I32 [n_rs_batch]    record rows that are replayed
-    ggml_tensor * gdn_wr   = nullptr; // I64 [n_seq_tokens]  record rows this batch writes (nullptr: not recorded)
+    ggml_tensor * gdn_rd    = nullptr; // I32 [n_rs_batch]     kv record rows replayed (the zero row past the pending ones)
+    ggml_tensor * gdn_rd_gb = nullptr; // I32 [2*n_rs_batch]   gate then beta record rows replayed, likewise
+    ggml_tensor * gdn_wr    = nullptr; // I64 [n_seq_tokens]   kv and gate record rows this batch writes (nullptr: not recorded)
+    ggml_tensor * gdn_wr_b  = nullptr; // I64 [n_seq_tokens]   beta record rows this batch writes
 
     void set_gdn_input(const llama_memory_recurrent_context * mctx_r);
     bool can_reuse_gdn(const llama_memory_recurrent_context * mctx_r, const llama_ubatch & ubatch) const;
