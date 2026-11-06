@@ -2639,6 +2639,9 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
     if (const int n_gdn_beta_sig = ggml_cuda_gdn_beta_sigmoid_try_fuse(*cuda_ctx, cgraph, i)) {
         return n_gdn_beta_sig;
     }
+    if (const int n_gdn_prefix = ggml_cuda_gdn_prefix_try_fuse(*cuda_ctx, cgraph, i)) {
+        return n_gdn_prefix;
+    }
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache (gdn surface)
     if (const int n_gdn_cpy = ggml_cuda_gdn_cache_cpy_try_fuse(*cuda_ctx, cgraph, i)) {
         return n_gdn_cpy;

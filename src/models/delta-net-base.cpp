@@ -687,6 +687,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn_lazy(
     auto attn_out = build_delta_net(q, k, v, g, b, base, il);
     ggml_tensor * output = attn_out.first;
     cb(output, "attn_output", il);
+    // the batch's GDN right after the replay, before anything reads the replay's state: the backend can fold the two
+    ggml_build_forward_expand(gf, output);
 
     const int64_t D = S_v * S_v * H_v;
     ggml_tensor * dst = ggml_view_2d(ctx0, ssm_states_all, D, n_seqs, ssm_states_all->nb[1],

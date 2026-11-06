@@ -30,5 +30,8 @@ struct ggml_cuda_gdn_state_src {
 };
 
 void ggml_cuda_gdn_clear_state_srcs();
+
+// GDN lazy commit: fold a replay GDN into the GDN after it (see gated_delta_net.cu); -1 when node i was folded.
+int ggml_cuda_gdn_prefix_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 void ggml_cuda_gdn_set_state_src(const ggml_tensor * gdn, const ggml_cuda_gdn_state_src & src);
 bool ggml_cuda_gdn_get_state_src(const ggml_tensor * gdn, ggml_cuda_gdn_state_src & src);

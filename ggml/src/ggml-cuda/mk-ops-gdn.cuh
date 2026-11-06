@@ -315,6 +315,22 @@ struct mk_gdn_qk_norm {
 // MK_OP_GDN_STEP: the sequential gated delta rule (gated_delta_net_cuda) with the state read in place.
 // One warp per state column, 4 columns per tile. tile = (sequence*n_col_groups + col_group)*H + head.
 // variant bit 0: keep the last K per-token states (keep_rs_t).
+// Tokens folded into the state before the batch (the GDN lazy commit's replay): state update only, no attention.
+// Token t's k and v are row idx_kv[t] of kv ([k | v] rows), its gate and beta rows idx_gb[t] and idx_gb[n + t] of gb.
+struct mk_gdn_prefix {
+    const float   * kv;
+    const float   * gb;
+    const int32_t * idx_kv;
+    const int32_t * idx_gb;
+    int64_t         kv_row;   // floats
+    int64_t         gb_row;
+    int64_t         sk1;      // k head stride in a kv row
+    int64_t         v_off;    // v within a kv row
+    int64_t         sv1;
+    int             n;
+    float         * out;      // nullptr: none. Receives the state after the prefix tokens.
+};
+
 struct mk_gdn_step_params {
     const float   * q;
     const float   * k;
@@ -341,6 +357,7 @@ struct mk_gdn_step_params {
     float         * state_pre;         // nullptr: none. Receives the input state (the pre-batch rollback slot).
     const mk_launch_params * launch;
     int             beta_sigmoid;      // beta holds the pre-sigmoid value (the UNARY(sigmoid) node was fused in)
+    mk_gdn_prefix   prefix;
 };
 
 static constexpr int mk_gdn_step_warps = 4;
@@ -404,17 +421,23 @@ static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params
         }
     }
 
-    for (int t = 0; t < n_tokens; t++) {
-        const float * q_t = p.q + iq3 * p.sq3 + t * p.sq2 + iq1 * p.sq1;
-        const float * k_t = p.k + iq3 * p.sq3 + t * p.sq2 + iq1 * p.sq1;
-        const float * v_t = p.v + sequence * p.sv3 + t * p.sv2 + h_idx * p.sv1;
+    // the prefix tokens (a folded replay) run through the same body, so their state updates are the replay kernel's
+    // own arithmetic; they write no attention and no snapshot
+    const int n_prefix = p.prefix.n;
+    for (int tt = 0; tt < n_prefix + n_tokens; tt++) {
+        const bool pre = tt < n_prefix;
+        const int  t   = tt - n_prefix;
+        const float * rec = pre ? p.prefix.kv + p.prefix.idx_kv[tt] * p.prefix.kv_row : nullptr;
+        const float * q_t = pre ? rec + iq1 * p.prefix.sk1 : p.q + iq3 * p.sq3 + t * p.sq2 + iq1 * p.sq1;
+        const float * k_t = pre ? q_t : p.k + iq3 * p.sq3 + t * p.sq2 + iq1 * p.sq1;
+        const float * v_t = pre ? rec + p.prefix.v_off + h_idx * p.prefix.sv1 : p.v + sequence * p.sv3 + t * p.sv2 + h_idx * p.sv1;
 
         const int64_t gb_offset = sequence * p.sb3 + t * p.sb2 + h_idx * p.sb1;
-        const float * beta_t = p.beta + gb_offset;
-        const float * g_t    = p.g    + gb_offset * (KDA ? S_v : 1);
+        const float * beta_t = pre ? p.prefix.gb + p.prefix.idx_gb[n_prefix + tt] * p.prefix.gb_row + h_idx : p.beta + gb_offset;
+        const float * g_t    = pre ? p.prefix.gb + p.prefix.idx_gb[tt] * p.prefix.gb_row + h_idx : p.g + gb_offset * (KDA ? S_v : 1);
 
         // same expression as unary.cu op_sigmoid
-        const float beta_val = p.beta_sigmoid ? 1.0f / (1.0f + expf(-*beta_t)) : *beta_t;
+        const float beta_val = !pre && p.beta_sigmoid ? 1.0f / (1.0f + expf(-*beta_t)) : *beta_t;
 
         float k_reg[rows_per_lane];
         float q_reg[rows_per_lane];
@@ -463,7 +486,7 @@ static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params
 
                 float attn_col = warp_reduce_sum<warp_size>(attn_partial);
 
-                if (lane == 0) {
+                if (lane == 0 && !pre) {
                     attn_data[col] = attn_col * p.scale;
                 }
             } else {
@@ -490,12 +513,25 @@ static __device__ __forceinline__ void mk_gdn_step_tile(const mk_gdn_step_params
 
                 float attn_col = warp_reduce_sum<warp_size>(attn_partial);
 
-                if (lane == 0) {
+                if (lane == 0 && !pre) {
                     attn_data[col] = attn_col * p.scale;
                 }
             }
         }
 
+        if (pre) {
+            if (tt == n_prefix - 1 && p.prefix.out != nullptr) {
+                float * out = p.prefix.out + state_out_offset + col0 * S_v;
+#pragma unroll
+                for (int c = 0; c < ncols; c++) {
+#pragma unroll
+                    for (int r = 0; r < rows_per_lane; r++) {
+                        out[c * S_v + r * warp_size + lane] = s_shard[c][r];
+                    }
+                }
+            }
+            continue;
+        }
         attn_data += S_v * H;
 
         if constexpr (keep_rs_t) {

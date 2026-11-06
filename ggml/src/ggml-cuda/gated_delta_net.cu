@@ -3,14 +3,23 @@
 #include "gated_delta_net_chunked.cuh"
 #include "ggml-cuda/common.cuh"
 #include "mk-ops-gdn.cuh"
+#include "ggml-cuda-try-fuse.cuh"
 
 #include <cstdint>
 #include <unordered_map>
 
 static thread_local std::unordered_map<const ggml_tensor *, ggml_cuda_gdn_state_src> gdn_state_srcs;
 
+// GDN lazy commit: a replay GDN folded into the next GDN as its prefix (ggml_cuda_gdn_prefix_try_fuse)
+struct gdn_prefix_src {
+    const ggml_tensor * replay;
+    float *             out;
+};
+static thread_local std::unordered_map<const ggml_tensor *, gdn_prefix_src> gdn_prefix_srcs;
+
 void ggml_cuda_gdn_clear_state_srcs() {
     gdn_state_srcs.clear();
+    gdn_prefix_srcs.clear();
 }
 
 void ggml_cuda_gdn_set_state_src(const ggml_tensor * gdn, const ggml_cuda_gdn_state_src & src) {
@@ -61,13 +70,15 @@ gated_delta_net_cuda(const float * q,
                                      int           beta_sigmoid,
                                      const int32_t * s_ids,
                                      int64_t       s_row_stride,
-                                     float *       state_pre) {
+                                     float *       state_pre,
+                                     const mk_gdn_prefix prefix) {
     mk_gdn_step_params p = {
         q, k, v, g, beta, curr_state, dst, state, H, n_tokens, n_seqs, gridDim.z,
         sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale,
         state_slot_stride, K, s_ids, s_row_stride, state_pre, nullptr,
     };
     p.beta_sigmoid = beta_sigmoid;
+    p.prefix       = prefix;
     ggml_cuda_pdl_sync();
     mk_gdn_step_tile<S_v, KDA, keep_rs_t, gdn_cols_per_warp(S_v)>(p, blockIdx.x, blockIdx.z, blockIdx.y, threadIdx.y*blockDim.x + threadIdx.x);
 }
@@ -83,7 +94,8 @@ static void launch_gated_delta_net(
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K, int beta_sigmoid,
-        const int32_t * s_ids, int64_t s_row_stride, float * state_pre, cudaStream_t stream) {
+        const int32_t * s_ids, int64_t s_row_stride, float * state_pre, cudaStream_t stream,
+        const mk_gdn_prefix & prefix = {}) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = mk_gdn_step_warps;
@@ -100,26 +112,26 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid, s_ids, s_row_stride, state_pre);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid, s_ids, s_row_stride, state_pre, prefix);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid, s_ids, s_row_stride, state_pre);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid, s_ids, s_row_stride, state_pre, prefix);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid, s_ids, s_row_stride, state_pre);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid, s_ids, s_row_stride, state_pre, prefix);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid, s_ids, s_row_stride, state_pre);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, beta_sigmoid, s_ids, s_row_stride, state_pre, prefix);
             break;
         }
         default:
@@ -174,6 +186,26 @@ static void ggml_cuda_op_gated_delta_net_impl(
     ggml_tensor * src_g     = dst->src[3];
     ggml_tensor * src_beta  = dst->src[4];
     ggml_tensor * src_state = dst->src[5];
+
+    // a folded replay: its tokens go first, from its own input state, and the state after them goes to `out`
+    const auto prefix_it = gdn_prefix_srcs.find(dst);
+    const ggml_tensor * replay = prefix_it != gdn_prefix_srcs.end() ? prefix_it->second.replay : nullptr;
+    mk_gdn_prefix prefix = {};
+    if (replay != nullptr) {
+        src_state = replay->src[5];
+        const ggml_tensor * kv = replay->src[2]->view_src;
+        const ggml_tensor * gb = replay->src[4]->view_src;
+        prefix = {
+            (const float *) kv->src[0]->data, (const float *) gb->src[0]->data,
+            (const int32_t *) kv->src[1]->data, (const int32_t *) gb->src[1]->data,
+            (int64_t) (kv->src[0]->nb[1]/sizeof(float)), (int64_t) (gb->src[0]->nb[1]/sizeof(float)),
+            (int64_t) (replay->src[1]->nb[1]/sizeof(float)),
+            (int64_t) (((const char *) replay->src[2]->data - (const char *) kv->data)/sizeof(float)),
+            (int64_t) (replay->src[2]->nb[1]/sizeof(float)),
+            (int) replay->src[2]->ne[2], prefix_it->second.out,
+        };
+    }
+    const ggml_tensor * state_owner = replay != nullptr ? replay : dst;
 
     GGML_TENSOR_LOCALS(int64_t, neq, src_q, ne);
     GGML_TENSOR_LOCALS(size_t , nbq, src_q, nb);
@@ -230,7 +262,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     }
     float *         state_pre    = nullptr;
     ggml_cuda_gdn_state_src redirect;
-    if (ggml_cuda_gdn_get_state_src(dst, redirect)) {
+    if (ggml_cuda_gdn_get_state_src(state_owner, redirect)) {
         GGML_ASSERT(n_seqs == 1 && s_ids == nullptr);
         s_d          = redirect.base;
         s_ids        = redirect.ids;
@@ -313,7 +345,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // hipErrorIllegalState, llama-cpp-rdna-boosts#2); a rejected launch has no side effects, so we
     // recompute with the sequential kernel below, bit-identical to GGML_CUDA_GDN_CHUNKED=0.  An
     // async fault inside a launched kernel is NOT caught here and surfaces at the next sync point.
-    if (!kda && n_tokens > 1 &&
+    GGML_ASSERT(replay == nullptr || (!kda && !keep_rs && state_pre == nullptr && n_seqs == 1 && n_tokens <= 16));
+    if (replay == nullptr && !kda && n_tokens > 1 &&
         (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
         // read once as a value: a cached getenv() pointer is unsafe on Windows (the CRT buffer is reused)
         static const bool chunked_on = [] {
@@ -433,7 +466,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
-    {
+    if (replay == nullptr) {
         ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
         args.state_out = state_d;
         if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {
@@ -458,7 +491,8 @@ static void ggml_cuda_op_gated_delta_net_impl(
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, beta_sigmoid, s_ids, s_row_stride, state_pre, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, beta_sigmoid, s_ids, s_row_stride, state_pre, stream,
+                prefix);
         }
     }
 }
@@ -590,4 +624,131 @@ int ggml_cuda_gdn_cache_cpy_try_fuse(ggml_backend_cuda_context & ctx, const ggml
         return nodes_to_skip;
     }
     return 0;
+}
+
+// GDN lazy commit: a replay GDN A (state update only; its attention is never read) followed by the batch's GDN B, whose
+// input state is A's output state, runs as one launch: B's kernel folds A's tokens into the state first, reading them
+// straight from the record tensors through the GET_ROWS indices (the gathered copies are skipped; their bytes may be
+// B's output), and writes the state after them where A's state copy to the cache would have.  Saves A's launch, its
+// state read and write, the copy and the two record gathers.  Both K == 1, single sequence, at most 16 tokens (the
+// sequential kernel).  GGML_CUDA_GDN_PREFIX=0 turns it off.
+struct gdn_prefix_plan {
+    const ggml_tensor * b;
+    const ggml_tensor * cpy;
+    const ggml_tensor * kv;
+    const ggml_tensor * gb;
+};
+
+// a view of an F32 GET_ROWS of a cache tensor (I32 indices), read by nothing but views and `gdn`
+static const ggml_tensor * gdn_prefix_gather(const ggml_cgraph * cgraph, int ia, const ggml_tensor * view) {
+    const ggml_tensor * gr = view->view_src;
+    if (view->op != GGML_OP_VIEW || gr == nullptr || gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 ||
+            gr->src[0]->type != GGML_TYPE_F32 || gr->src[0]->op != GGML_OP_NONE || gr->src[1]->type != GGML_TYPE_I32 ||
+            gr->src[0]->ne[2] != 1 || gr->src[1]->ne[1] != 1 || !ggml_is_contiguous(gr->src[1]) || (gr->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return nullptr;
+    }
+    const ggml_tensor * a = cgraph->nodes[ia];
+    for (int k = 0; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (n == a || n == gr || ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (n->src[s] != nullptr && ggml_cuda_view_root(n->src[s]) == gr) {
+                return nullptr;
+            }
+        }
+    }
+    return gr;
+}
+
+static bool gdn_prefix_match(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i, gdn_prefix_plan & plan) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_GDN_PREFIX"); return e == nullptr || atoi(e) != 0; }();
+    const ggml_tensor * a = cgraph->nodes[i];
+    auto band_ok = [](const ggml_tensor * gdn) {
+        return gdn->op == GGML_OP_GATED_DELTA_NET && ggml_get_op_params_i32(gdn, 0) == 1 && gdn->src[2]->ne[0] == 128 &&
+               gdn->src[2]->ne[3] == 1 && gdn->src[2]->ne[2] <= 16 && gdn->src[3]->ne[0] == 1;
+    };
+    if (!enabled || !band_ok(a) || (a->flags & GGML_TENSOR_FLAG_OUTPUT) || a->src[0] != a->src[1]) {
+        return false;
+    }
+    int j = i + 1;
+    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+        ++j;
+    }
+    if (j >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * b = cgraph->nodes[j];
+    if (!band_ok(b) || ggml_cuda_view_root(b->src[5]) != a || b->src[2]->ne[1] != a->src[2]->ne[1] || b->src[1]->ne[1] != a->src[1]->ne[1]) {
+        return false;
+    }
+    const ggml_tensor * kv = gdn_prefix_gather(cgraph, i, a->src[1]);
+    const ggml_tensor * gb = gdn_prefix_gather(cgraph, i, a->src[3]);
+    const int64_t n = a->src[2]->ne[2];
+    if (kv == nullptr || gb == nullptr || kv == gb || gdn_prefix_gather(cgraph, i, a->src[2]) != kv ||
+            gdn_prefix_gather(cgraph, i, a->src[4]) != gb || kv->src[1]->ne[0] != n || gb->src[1]->ne[0] != 2*n ||
+            a->src[1]->data != kv->data || a->src[1]->nb[2] != kv->nb[1] || a->src[2]->nb[2] != kv->nb[1] ||
+            a->src[3]->data != gb->data || a->src[3]->nb[2] != gb->nb[1] || a->src[3]->nb[1] != sizeof(float) ||
+            (const char *) a->src[4]->data != (const char *) gb->data + n*gb->nb[1] || a->src[4]->nb[2] != gb->nb[1]) {
+        return false;
+    }
+    // A's input state, unless it is read in place from the cache, is dead after A: B's output may overlay it
+    const ggml_tensor * s_root = ggml_cuda_view_root(a->src[5]);
+    ggml_cuda_gdn_state_src redirect;
+    const bool in_place = ggml_cuda_gdn_get_state_src(a, redirect) ||
+        std::find(ctx.gdn_deferred_gathers.begin(), ctx.gdn_deferred_gathers.end(), s_root) != ctx.gdn_deferred_gathers.end();
+    if (!in_place) {
+        const char * i0 = (const char *) a->src[5]->data;
+        const char * b0 = (const char *) b->data;
+        if (i0 < b0 + ggml_nbytes(b) && b0 < i0 + ggml_nbytes(a->src[5])) {
+            return false;
+        }
+    }
+    // A's state region: what B reads, and what the copy to the cache reads
+    const int64_t S_v = a->src[2]->ne[0], H = a->src[2]->ne[1];
+    const char *  state = (const char *) a->data + S_v*H*n*sizeof(float);
+    const size_t  D     = (size_t) S_v*S_v*H*sizeof(float);
+    const ggml_tensor * cpy = nullptr;
+    for (int k = j + 1; k < cgraph->n_nodes; ++k) {
+        const ggml_tensor * nd = cgraph->nodes[k];
+        if (ggml_cuda_is_view_or_noop(nd)) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (nd->src[s] == nullptr || ggml_cuda_view_root(nd->src[s]) != a) {
+                continue;
+            }
+            if (cpy != nullptr || nd->op != GGML_OP_CPY || s != 0 || nd->src[0]->data != state || ggml_nbytes(nd->src[0]) != D ||
+                    !ggml_is_contiguous(nd->src[0]) || nd->type != GGML_TYPE_F32 || !ggml_is_contiguous(nd) ||
+                    g_precomputed_nodes.count(nd) != 0) {
+                return false;
+            }
+            cpy = nd;
+        }
+    }
+    plan = { b, cpy, kv, gb };
+    return true;
+}
+
+int ggml_cuda_gdn_prefix_try_fuse(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * node = cgraph->nodes[i];
+    gdn_prefix_plan plan;
+    if (node->op == GGML_OP_GET_ROWS) {
+        // a record gather a folded replay will not read
+        for (int k = i + 1; k < std::min(cgraph->n_nodes, i + 16); ++k) {
+            if (cgraph->nodes[k]->op == GGML_OP_GATED_DELTA_NET) {
+                return gdn_prefix_match(ctx, cgraph, k, plan) && (plan.kv == node || plan.gb == node) ? -1 : 0;
+            }
+        }
+        return 0;
+    }
+    if (node->op != GGML_OP_GATED_DELTA_NET || !gdn_prefix_match(ctx, cgraph, i, plan)) {
+        return 0;
+    }
+    gdn_prefix_srcs[plan.b] = { node, plan.cpy != nullptr ? (float *) plan.cpy->data : nullptr };
+    if (plan.cpy != nullptr) {
+        g_precomputed_nodes.insert(plan.cpy);
+    }
+    return -1;
 }
