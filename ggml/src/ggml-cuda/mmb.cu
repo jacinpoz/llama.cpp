@@ -1506,7 +1506,7 @@ struct mmb_arch_cfg {
     int  bf16w          = 1;     // BF16 dense weights
     int  routed         = 1;     // the routed MoE (MUL_MAT_ID) path + its fused GLU
     int  dense_geom     = MMB_GEOM_GFX11_SPLIT;  // see mmb_geom_id
-    int  big_q4k_only   = 0;     // 128x256 dense tile only for Q4_K weights (others take 128x128)
+    int  big_q4k_only   = 0;     // 128x256 dense tile only for weight types it does not spill on (Q4_K, IQ4_XS, Q8_0)
 };
 
 static mmb_arch_cfg mmb_arch_defaults(const int cc) {
@@ -1562,7 +1562,8 @@ static mmb_arch_cfg mmb_arch_defaults(const int cc) {
         // runs, 0/4 with this rule; on r59 a server soak also had 0/8 with GGML_CUDA_MMB=0 and 0/8
         // with GGML_CUDA_FA_WMMA_256=0).  The 128x128 tile
         // does not spill; keeping Q4_K on 128x256 is +4.5 % / +3.8 % pp2048 at d0 / d16384 over
-        // 128x128 for every type (Qwen3.8-27B Q4_K_M).
+        // 128x128 for every type (Qwen3.8-27B Q4_K_M).  IQ4_XS and Q8_0 do not spill either (scratch 0
+        // in rocprofv3); IQ4_XS on 128x256 is +2.2 % pp512 (Swift-1.5-Qwen3.8-27B-IQ4_XS).
         c.big_q4k_only  = 1;
     }
     // TODO(S12): the routed/GLU thresholds, `tall_mode`, `tiny_m*`, `f32split_*` and `cache_max` are
@@ -2205,7 +2206,8 @@ void ggml_cuda_mul_mat_mmb(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     }
     const uint16_t * shadow_pre = ((src0->type == GGML_TYPE_IQ4_NL && mmb_shadow()) || src0->type == GGML_TYPE_Q6_K) ? mmb_shadow_lookup(src0) : nullptr;
     static const int tile_ov = [] { const char * e = getenv("GGML_CUDA_MMB_TILE"); return e ? atoi(e) : -1; }();
-    const bool big_ok = !mmb_cfg().big_q4k_only || (!shadow_pre && src0->type == GGML_TYPE_Q4_K);
+    const bool big_ok = !mmb_cfg().big_q4k_only ||
+        (!shadow_pre && (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_IQ4_XS || src0->type == GGML_TYPE_Q8_0));
     const bool big = tile_ov >= 0 ? (tile_ov != 0) : big_ok && ((M >= 6144 && K >= 2560) || (shadow_pre && K >= 2560 && T >= 4096));
     // HC gate (K=320, M=10240).  "producer slots ... 1 = HC gate" -- when the graph marks this
     // output BF16-only, the gate is written ONCE into the pinned slot 1 and the dsv4_hc_pre
