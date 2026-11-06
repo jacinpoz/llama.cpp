@@ -2379,6 +2379,13 @@ static int ggml_cuda_try_fuse_gdn_out_gate(ggml_backend_cuda_context & ctx, ggml
     if (mm == nullptr) {
         return 0;
     }
+    // z runs before the norm here, but the allocator may have given z the bytes of the norm input (dead after the norm)
+    const ggml_tensor * x = norm->src[0];
+    const char * x0 = (const char *) x->data;
+    const char * z0 = (const char *) zmm->data;
+    if (g_precomputed_nodes.count(zmm) == 0 && z0 < x0 + ggml_nbytes(x) && x0 < z0 + ggml_nbytes(zmm)) {
+        return 0;
+    }
     // z may already have run, paired with the qkv projection
     if (g_precomputed_nodes.erase(zmm) == 0 && !ggml_cuda_compute_forward(ctx, zmm)) {
         GGML_ABORT("gdn out gate: z MUL_MAT dispatch failed");
