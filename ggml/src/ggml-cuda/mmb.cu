@@ -899,9 +899,8 @@ __device__ __forceinline__ void mmb_tile_gemm(const uint8_t * __restrict__ Wbase
     }
 }
 
-template <int BM, int BN, int WTM, int WTN, int WTYPE, bool DBUF = false, bool DBUF2 = false>
-__global__ void __launch_bounds__(MMB_NT, 2)
-mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ Xh, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, const int K, const int T) {
+template <int BM, int BN, int WTM, int WTN, int WTYPE, bool DBUF, bool DBUF2>
+static __device__ __forceinline__ void mmb_dense_body(const uint8_t * __restrict__ W, const uint16_t * __restrict__ Xh, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, const int K, const int T) {
     __shared__ __align__(16) uint16_t As[(DBUF ? 2 : 1) * BM * MMB_LDS_STRIDE];
     __shared__ __align__(16) uint16_t Bs[(DBUF2 ? 2 : 1) * BN * MMB_LDS_STRIDE];
     const int m0 = blockIdx.x * BM, t0 = blockIdx.y * BN;
@@ -926,6 +925,35 @@ mmb_dense_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__ X
     mmb_tile_gemm<BM, BN, WTM, WTN, WTYPE, false, DBUF, DBUF2>(W + (size_t)m0 * wrow_bytes, wrow_bytes, M - m0, Xh, K,
         [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, D, Dh, store_f32, M, [&](int i) { return (t0 + i < T) ? t0 + i : -1; }, m0, T - t0, As, Bs);
 }
+
+template <int BM, int BN, int WTM, int WTN, int WTYPE, bool DBUF, bool DBUF2>
+__global__ void __launch_bounds__(MMB_NT, 2)
+mmb_dense_kernel_lb2(const uint8_t * __restrict__ W, const uint16_t * __restrict__ Xh, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, const int K, const int T) {
+    mmb_dense_body<BM, BN, WTM, WTN, WTYPE, DBUF, DBUF2>(W, Xh, D, Dh, store_f32, M, K, T);
+}
+
+#if defined(__HIP_PLATFORM_AMD__)
+// The min-blocks launch-bounds hint overrides amdgpu_waves_per_eu, dropping the 128x128 tile from 6 to 5 waves on Clang 24.
+#if defined(RDNA3_0)
+#define MMB_W6_BOUNDS __launch_bounds__(MMB_NT) __attribute__((amdgpu_waves_per_eu(6)))
+#else
+#define MMB_W6_BOUNDS __launch_bounds__(MMB_NT, 2)
+#endif
+template <int BM, int BN, int WTM, int WTN, int WTYPE, bool DBUF, bool DBUF2>
+__global__ void MMB_W6_BOUNDS
+mmb_dense_kernel_w6(const uint8_t * __restrict__ W, const uint16_t * __restrict__ Xh, float * __restrict__ D, uint16_t * __restrict__ Dh, const bool store_f32, const int M, const int K, const int T) {
+    mmb_dense_body<BM, BN, WTM, WTN, WTYPE, DBUF, DBUF2>(W, Xh, D, Dh, store_f32, M, K, T);
+}
+
+template <int BM, int BN, int WTM, int WTN, int WTYPE, bool DBUF = false, bool DBUF2 = false>
+static constexpr auto mmb_dense_kernel = [] {
+    if constexpr (BM == 128 && BN == 128) return mmb_dense_kernel_w6<BM, BN, WTM, WTN, WTYPE, DBUF, DBUF2>;
+    else                                  return mmb_dense_kernel_lb2<BM, BN, WTM, WTN, WTYPE, DBUF, DBUF2>;
+}();
+#else
+template <int BM, int BN, int WTM, int WTN, int WTYPE, bool DBUF = false, bool DBUF2 = false>
+static constexpr auto mmb_dense_kernel = mmb_dense_kernel_lb2<BM, BN, WTM, WTN, WTYPE, DBUF, DBUF2>;
+#endif
 
 #if defined(__HIP_PLATFORM_AMD__)
 __device__ __forceinline__ float gm_mul_rn(const float a, const float b) { float r; asm("v_mul_f32_e32 %0, %1, %2" : "=v"(r) : "v"(a), "v"(b)); return r; }
