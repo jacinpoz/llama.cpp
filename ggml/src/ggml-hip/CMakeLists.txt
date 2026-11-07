@@ -159,6 +159,15 @@ else()
     set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE HIP)
 endif()
 
+# Clang 24 schedules the mmvq kernels for an occupancy they never reach.
+if (GPU_TARGETS MATCHES "gfx11")
+    include(CheckCompilerFlag)
+    check_compiler_flag(HIP "-mllvm -amdgpu-schedule-relaxed-occupancy" GGML_HIP_HAS_RELAXED_OCCUPANCY)
+    if (GGML_HIP_HAS_RELAXED_OCCUPANCY)
+        set_source_files_properties(../ggml-cuda/mmvq.cu PROPERTIES COMPILE_OPTIONS "-mllvm;-amdgpu-schedule-relaxed-occupancy")
+    endif()
+endif()
+
 if (GGML_STATIC)
     message(FATAL_ERROR "Static linking not supported for HIP/ROCm")
 endif()
